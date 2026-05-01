@@ -245,7 +245,7 @@ class TrackerEncoder(nn.Module):
         cadd = repeat(centers, 'cams r -> cams 1 1 1 r')
         points_3d_all_rays = cadd + einsum(rays_world, depth_pred_scaled,
                                       'cams b t n r, cams b t n -> cams b t n r')
-        points_3d_rays = einsum(points_3d_all_rays, conf_pred_2d,
+        points_3d_rays = einsum(points_3d_all_rays, conf_pred_2d[..., 0],
                                 'cams b t n r, cams b t n -> b t n r')
 
 
