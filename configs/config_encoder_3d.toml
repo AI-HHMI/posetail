@@ -80,7 +80,7 @@ n_heads = 8
 n_time_space_blocks = 8
 embedding_factor = 4
 use_camera_self_attention = true
-output_mode = "direct" # direct, residual, grid
+output_mode = "grid" # direct, residual, grid
 scene_encoder_proj = false
 head_3d_grid_size = 16
 head_3d_grid_radius = 1.0
@@ -91,7 +91,7 @@ seed = 3
 n_iterations = 500000
 # scheduler_type = 'multisteplr'
 scheduler_type = 'schedulefree'
-max_grad_norm = 50.0
+max_grad_norm = 200.0
 checkpoint_freq = 10240 # in iterations
 eval_metric_freq = 4 # in iterations
 val_freq = 64 # in iterations
@@ -127,7 +127,7 @@ use_huber_loss = false
 # weights for calculating total loss (use 0 to not compute a specific loss)
 vis_loss_weight = 4
 conf_loss_weight = 0.0
-conf_2d_loss_weight = 1.0
+conf_2d_loss_weight = 0.0
 occluded_coords_loss_weight = 0.01
 feature_loss_weight = 0.0
 
