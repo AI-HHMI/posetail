@@ -20,7 +20,7 @@ n_frames = 16
 min_res = 256
 max_res = 256
 cams_to_sample = [1, 8] 
-kpts_to_sample = [256, 256]
+kpts_to_sample = [416, 416]
 aug_prob = 0.25
 enable_kpt_filtering = false
 cam_thresh_for_vis = 1
@@ -80,7 +80,7 @@ n_heads = 8
 n_time_space_blocks = 8
 embedding_factor = 4
 use_camera_self_attention = true
-output_mode = "grid" # direct, residual, grid
+output_mode = "direct" # direct, residual, grid
 scene_encoder_proj = false
 head_3d_grid_size = 16
 head_3d_grid_radius = 1.0
@@ -99,7 +99,7 @@ print_freq = 1 # in iterations
 debug_ix = -1 # only works for val 
 
 [training.optimizer]
-learning_rate = 3e-4
+learning_rate = 1e-3
 weight_decay = 0.01
 # weight_decay = 0
 warmup_steps = 200
