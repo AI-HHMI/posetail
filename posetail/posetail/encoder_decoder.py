@@ -580,7 +580,7 @@ class SceneRepresentation(nn.Module):
         self.encoder = vjepa_encoder
 
         self.encoder.return_hierarchical = hierarchical_features
-        self.encoder.use_activation_checkpointing = not freeze_encoder
+        self.encoder.use_activation_checkpointing = True # not freeze_encoder
 
         if hierarchical_features:
             self.embed_dim = self.encoder.embed_dim * 4
@@ -624,25 +624,17 @@ class SceneRepresentation(nn.Module):
         Returns:
             encoded_views: [C, B, N_tokens, embed_dim] tensor
         """
-        if self.freeze_encoder:
-            self.encoder.eval()
 
-        views_stacked = torch.stack(views)
-
-        xr = rearrange(views_stacked, 'cams b t c h w -> (cams b) c t h w')
-
-        with torch.set_grad_enabled(not self.freeze_encoder):
-            feat = self.encoder(xr) # [(cams b), n_tokens, embed_dim]
-
-        feat = feat + self.pos_embed
-
-        if self.kv_proj is not None:
-            feat = self.kv_proj(feat)
-            feat = self.kv_norm(feat)
-
-        encoded = rearrange(feat,
-                            '(cams b) tokens embed -> cams b tokens embed',
-                            cams=len(views))
+        encoded_list = []
+        for view in views:
+            xr = rearrange(view, 'b t c h w -> b c t h w')
+            feat = self.encoder(xr)  # [B, n_tokens, embed_dim]
+            feat = feat + self.pos_embed
+            if self.kv_proj is not None:
+                feat = self.kv_proj(feat)
+                feat = self.kv_norm(feat)
+            encoded_list.append(feat)
+        encoded = torch.stack(encoded_list)  # [cams, B, n_tokens, embed_dim]
 
         return encoded
 
