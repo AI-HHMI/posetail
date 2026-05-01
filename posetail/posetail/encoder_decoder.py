@@ -604,6 +604,7 @@ class SceneRepresentation(nn.Module):
         self.pos_embed = nn.Parameter(
             torch.zeros(1, n_tokens, self.embed_dim)
         )
+        nn.init.trunc_normal_(self.pos_embed, mean=0.0, std=0.02, a=-2 * 0.02, b=2 * 0.02)
 
         if decoder_dim is not None:
             self.kv_proj = nn.Linear(self.embed_dim, decoder_dim)
