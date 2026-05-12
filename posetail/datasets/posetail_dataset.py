@@ -371,6 +371,36 @@ class PosetailDataset(Dataset):
         if vis is not None:
             vis = vis.sum(dim = -1) >= self.cam_thresh_for_vis # (time, n_kpts)                
 
+  
+        # load cameras
+        cgroup, offset_dict, cam_type = self._load_cameras(row['camera_metadata_path']) 
+        cgroup = cgroup.subset_cameras_names(cam_names)
+        cgroup = format_camera_group(cgroup, offset_dict, cam_type, device = 'cpu')
+
+
+        # per-camera image-plane rotation augmentation (before cropping)
+        if should_augment:
+            cgroup, rotation_info = self.augment_image_rotation(cgroup)
+            # Mark keypoints cropped out by the rotation as not visible.
+            if vis_2d is not None:
+                s, n, _ = coords.shape
+                coords_flat = rearrange(coords, 's n r -> (s n) r')
+                for cnum, cam in enumerate(cgroup):
+                    if rotation_info[cnum] is None:
+                        continue
+                    visible = rearrange(is_point_visible(cam, coords_flat),
+                                        '(s n) -> s n', s=s, n=n)
+                    vis_2d[:, :, cnum][~visible] = 0
+                # Re-aggregate vis across cameras (NaN treated as visible, matching the
+                # initial collapse at the top of this method).
+                if vis is not None:
+                    per_cam = vis_2d.clone()
+                    per_cam[torch.isnan(per_cam)] = 1
+                    vis = per_cam.bool().sum(dim=-1) >= self.cam_thresh_for_vis
+        else:
+            rotation_info = [None] * len(cam_names)
+
+
         # filter coords based on which coords are visible enough times
         if self.query_anytime:
             valid_mask = torch.isfinite(coords[..., 0])  # (time, n_kpts)
@@ -401,12 +431,8 @@ class PosetailDataset(Dataset):
             if vis is not None: 
                 vis = vis[:, mask]
                 vis_2d = vis_2d[:, mask]
+                        
             
-        # load cameras
-        cgroup, offset_dict, cam_type = self._load_cameras(row['camera_metadata_path']) 
-        cgroup = cgroup.subset_cameras_names(cam_names)
-        cgroup = format_camera_group(cgroup, offset_dict, cam_type, device = 'cpu')
-        
         # filter points that are visible in enough views
         if self.enable_kpt_filtering:
             coords, vis, vis_2d = self.filter_keypoints(coords, vis, vis_2d, cgroup)
@@ -434,27 +460,6 @@ class PosetailDataset(Dataset):
         if coords.shape[1] < 2:
             return None
 
-        # per-camera image-plane rotation augmentation (before cropping)
-        if should_augment:
-            cgroup, rotation_info = self.augment_image_rotation(cgroup)
-            # Mark keypoints cropped out by the rotation as not visible.
-            if vis_2d is not None:
-                s, n, _ = coords.shape
-                coords_flat = rearrange(coords, 's n r -> (s n) r')
-                for cnum, cam in enumerate(cgroup):
-                    if rotation_info[cnum] is None:
-                        continue
-                    visible = rearrange(is_point_visible(cam, coords_flat),
-                                        '(s n) -> s n', s=s, n=n)
-                    vis_2d[:, :, cnum][~visible] = 0
-                # Re-aggregate vis across cameras (NaN treated as visible, matching the
-                # initial collapse at the top of this method).
-                if vis is not None:
-                    per_cam = vis_2d.clone()
-                    per_cam[torch.isnan(per_cam)] = 1
-                    vis = per_cam.bool().sum(dim=-1) >= self.cam_thresh_for_vis
-        else:
-            rotation_info = [None] * len(cam_names)
 
         # cropping around coordinates
         # helps for small animals in large arenas
