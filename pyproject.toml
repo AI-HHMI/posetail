@@ -63,7 +63,7 @@ vjepa2 = { path = "/groups/karashchuk/home/karashchukl/builds/vjepa2", editable 
 [tool.pixi.environments]
 default = { solve-group = "default" }
 # gpu = { features = ["gpu"], solve-group = "default" }
-dev = {features = ["dev"], solve-group = "default"}
+# dev = {features = ["dev"], solve-group = "default"}
 
 [tool.pixi.tasks]
 
@@ -74,7 +74,7 @@ numpy = "==1.26"
 setuptools = "<81"
 pip = "*"
 
-[tool.pixi.feature.dev.dependencies]
+# [tool.pixi.feature.dev.dependencies]
 matplotlib = "*"
 ipython = "*"
 notebook = "*"
