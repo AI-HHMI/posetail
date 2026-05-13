@@ -1,7 +1,6 @@
 [wandb]
-project_name = 'posetail-vjepa-new'
-# path = '/data/results/lili/posetail'
-path = '/groups/karashchuk/home/karashchukl/results/posetail-vjepa-new'
+project_name = 'posetail-odyssey-pretrain'
+path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain'
 mode = 'online' # 'online', 'offline', 'disabled'
 
 [dataset]
