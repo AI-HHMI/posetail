@@ -46,12 +46,16 @@ def sample_feature_cubes_time(feature_planes, camera_group,
     B, K, _ = cube_centers.shape
     
     # get coordinates of each cube
-    row = (torch.arange(cube_size) - corr_radius) * cube_interval
-    xyz_s = torch.stack(torch.meshgrid(row, row, row, indexing='ij'))
-    xyz = rearrange(xyz_s, 'r x y z -> (x y z) r')
-    xyz = xyz.contiguous().to(device=cube_centers.device, dtype=cube_centers.dtype)
-
-    cube_coords = cube_centers[..., None, :] + xyz
+    offsets = (torch.arange(cube_size, device=cube_centers.device, dtype=cube_centers.dtype) - corr_radius)
+    xs, ys, zs = torch.meshgrid(offsets, offsets, offsets, indexing='ij')
+    xyz_unit = torch.stack([xs, ys, zs], dim=-1).reshape(-1, 3)  # (total, 3) unit offsets
+    if torch.is_tensor(cube_interval) and cube_interval.ndim >= 1:
+        # per-batch interval: (B,) → (B, total, 3)
+        xyz = xyz_unit[None] * cube_interval[:, None, None]
+        cube_coords = cube_centers[:, :, None, :] + xyz[:, None, :, :]  # (B, K, total, 3)
+    else:
+        xyz = xyz_unit * cube_interval  # (total, 3)
+        cube_coords = cube_centers[..., None, :] + xyz  # (B, K, total, 3)
     cube_coords_flat = rearrange(cube_coords, 'b k total r -> (b k total) r')
     p2d_flat = project_points_torch(
         camera_group=camera_group, 
@@ -331,7 +335,8 @@ class QueryEncoder(nn.Module):
             # Depth
             centers = torch.stack([cam['center'] for cam in camera_group]).to(query_coords.dtype)
             qc = rearrange(query_coords, 'b t r -> b t 1 r')
-            raw_depths = torch.linalg.norm(qc - centers, dim=-1) / cube_scale
+            cs_bnc = rearrange(cube_scale, 'cams b -> b 1 cams')
+            raw_depths = torch.linalg.norm(qc - centers, dim=-1) / cs_bnc
             depths = torch.log(raw_depths + 1e-6) * self.depth_norm_scale
             dr = rearrange(depths, 'b t ncams -> b t ncams 1')
             fourier_depth = get_fourier_encoding(dr, min_freq=0, max_freq=self.max_freq)
@@ -347,9 +352,10 @@ class QueryEncoder(nn.Module):
 
             # Volume (optional)
             if self.use_volume_embedding:
+                cube_scale_shared = torch.median(cube_scale, dim=0).values  # (B,)
                 volumes = sample_feature_cubes_time(
                     preprocessed_views, camera_group, query_coords, query_time,
-                    cube_scale * 2, corr_radius=self.corr_radius, v2v=self.v2v)
+                    cube_scale_shared * 2, corr_radius=self.corr_radius, v2v=self.v2v)
                 volumes = rearrange(volumes, 'b d t total -> b t 1 (d total)')
                 embed_volume = self.linear_volume(volumes)
                 embed_volume = repeat(embed_volume, 'b t 1 d -> b t cams d', cams=n_cams)

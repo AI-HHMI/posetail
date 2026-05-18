@@ -193,17 +193,18 @@ class TotalLoss(nn.Module):
             vis_true_cams = rearrange(vis_true_cams, 'b t n cams 1 -> cams b t n 1')
             
 
-        scale = get_camera_scale(cgroup, coords_true.reshape(-1, 3))
+        scale = get_camera_scale(cgroup, coords_true.reshape(B, -1, 3))  # (cams, B)
 
         if p2d is not None:
-            # for 2d prediction, the cube_scale is 1 
-            depths_true = depths_true / scale
-            
+            # for 2d prediction, the cube_scale is 1
+            scale_cb = rearrange(scale, 'cams b -> cams b 1 1 1')
+            depths_true = depths_true / scale_cb
+
             # Scale 3D targets down relative to the camera center
             # Since R=2 implies len(cgroup) == 1, we use the single camera center
             C = centers[0]
-            coords_true_cams = C + (coords_true_cams - C) / scale
-            coords_true = C + (coords_true - C) / scale
+            coords_true_cams = C + (coords_true_cams - C) / scale_cb
+            coords_true = C + (coords_true - C) / scale[0].reshape(B, 1, 1, 1)
             
         occluded_true = ~vis_true
 
@@ -245,7 +246,7 @@ class TotalLoss(nn.Module):
                 coords_pred = outputs['3d_pred_cams_direct'],
                 coords_true = coords_true_cams,
                 vis_true = vis_true_cams,
-                scale = scale,
+                scale = rearrange(scale, 'cams b -> cams b 1 1'),
                 device = device
             )
         else:
@@ -254,7 +255,7 @@ class TotalLoss(nn.Module):
                 coords_pred = coords_pred_iters if training_iters else coords_pred,
                 coords_true = coords_true_unrolled if training_iters else coords_true,
                 vis_true = vis_true_unrolled if training_iters else vis_true,
-                scale = scale,
+                scale = scale.mean(dim=0).reshape(B, 1, 1),
                 device = device
             )
 
@@ -375,12 +376,13 @@ class TotalLoss(nn.Module):
 
         if p2d is None:
             # Only divide by scale if we are in 3D mode (where targets are absolute)
-            coords_loss = coords_loss / scale
-            occluded_coords_loss = occluded_coords_loss / scale
-            coords_loss_depth = coords_loss_depth / scale
-            coords_loss_direct = coords_loss_direct / scale
-            coords_loss_rays = coords_loss_rays / scale
-            coords_loss_triangulate = coords_loss_triangulate / scale
+            scale_mean = scale.mean()
+            coords_loss = coords_loss / scale_mean
+            occluded_coords_loss = occluded_coords_loss / scale_mean
+            coords_loss_depth = coords_loss_depth / scale_mean
+            coords_loss_direct = coords_loss_direct / scale_mean
+            coords_loss_rays = coords_loss_rays / scale_mean
+            coords_loss_triangulate = coords_loss_triangulate / scale_mean
         
         losses = [
             coords_loss, occluded_coords_loss,
@@ -426,7 +428,7 @@ class TotalLoss(nn.Module):
         self.loss_history['feature_loss'].append(feature_loss.item())
         self.loss_history['bad_feature_loss'].append(bad_feature_loss.item())
 
-        self.loss_history['cube_scale'].append(scale)
+        self.loss_history['cube_scale'].append(scale.detach().mean().item())
         
         return total_loss
 

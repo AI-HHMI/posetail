@@ -275,28 +275,39 @@ def is_point_visible(cam, p3d, margin=0):
 
     return in_bounds & in_front
 
+def fill_nan_with_batch_median(scale):
+    """Fill NaN cells of a (cams, B) scale tensor with the per-batch median
+    over finite cells along the cams axis. Falls back to 1.0 if all cameras
+    for a batch element are NaN."""
+    finite = torch.isfinite(scale)
+    per_batch = torch.nanmedian(scale, dim=0).values  # (B,)
+    per_batch = torch.nan_to_num(per_batch, nan=1.0)
+    return torch.where(finite, scale, per_batch[None, :].expand_as(scale))
+
+
 def get_camera_scale(camera_group, p):
+    """
+    Args:
+        camera_group: list of camera dicts
+        p: (B, N, 3) 3D points
+    Returns:
+        scale: (n_cams, B) tensor; NaN cells filled with per-batch median
+    """
+    B, N, _ = p.shape
+    n_cams = len(camera_group)
+    sensitivity = p.new_full((n_cams, B), float('nan'))
 
-    ps = []
+    for ci, cam in enumerate(camera_group):
+        for b in range(B):
+            visible = is_point_visible(cam, p[b])
+            if torch.sum(visible) > 0:
+                with torch.autocast(device_type=p.device.type, enabled=False):
+                    J = projection_sensitivity(cam, p[b][visible])
+                    s = torch.linalg.svdvals(J.float())[:, 0]
+                sensitivity[ci, b] = torch.median(s)
 
-    for cam in camera_group:
-        visible = is_point_visible(cam, p)
-
-        if torch.sum(visible) > 0:
-
-            with torch.autocast(device_type = p.device.type, enabled = False):
-                J = projection_sensitivity(cam, p[visible])
-                s = torch.linalg.svdvals(J.float())[:, 0]
-                
-            ps.append(torch.median(s))
-
-    if len(ps) == 0:
-        return torch.nan
-    
-    sensitivity = torch.median(torch.as_tensor(ps))
-    scale = 1 / sensitivity
-
-    return scale.item()
+    scale = 1.0 / sensitivity
+    return fill_nan_with_batch_median(scale)
 
 class UnprojectViews:
 

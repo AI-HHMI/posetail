@@ -146,9 +146,9 @@ class TrackerEncoder(nn.Module):
         # assert self.n_frames == T
 
         if R == 3:
-            cube_scale = get_camera_scale(camera_group, coords.reshape(-1, 3))
+            cube_scale = get_camera_scale(camera_group, coords)  # (n_cams, B)
         else:
-            cube_scale = 1.0
+            cube_scale = torch.ones((n_cams, B), device=device)
 
         if query_times is None:
             query_times = torch.zeros((B, N), dtype=torch.int32, device=device)
@@ -187,12 +187,15 @@ class TrackerEncoder(nn.Module):
         else:
             p2d_query = rearrange(query_coords, 'b (t n) r -> 1 b t n r', t=T, n=N)
 
-        query_rays_flat = torch.stack([
-            points_to_rays(camera_group[i], rearrange(p2d_query[i], 'b t n r -> (b t n) r'),
-                           cube_scale)
-            for i in range(len(camera_group))
-        ])
-        query_rays = rearrange(query_rays_flat, 'cams (b t n) d e -> b (t n) cams d e', b=B, t=T, n=N)
+        query_rays_per_cam = []
+        for i in range(len(camera_group)):
+            rays_per_b = []
+            for b in range(B):
+                p2d_ib = rearrange(p2d_query[i, b], 't n r -> (t n) r')
+                rays_per_b.append(points_to_rays(camera_group[i], p2d_ib, cube_scale[i, b]))
+            query_rays_per_cam.append(torch.stack(rays_per_b, dim=0))  # (B, T*N, 4, 4)
+        query_rays_flat = torch.stack(query_rays_per_cam, dim=0)  # (cams, B, T*N, 4, 4)
+        query_rays = rearrange(query_rays_flat, 'cams b (t n) d e -> b (t n) cams d e', t=T, n=N)
 
         mode_idx = torch.tensor([1 if R == 3 else 0], dtype=torch.long, device=query_embeds.device)
         outputs = self.decoder(scene_features, query_embeds, query_rays, mode_idx)
@@ -218,7 +221,7 @@ class TrackerEncoder(nn.Module):
         # depth_pred_scaled = depths_query_shaped + depth_pred[..., 0] * cube_scale * self.depth_scale
 
         # Softplus for depth prediction
-        depth_pred_scaled = F.softplus(depth_pred[..., 0]) * cube_scale
+        depth_pred_scaled = F.softplus(depth_pred[..., 0]) * rearrange(cube_scale, 'cams b -> cams b 1 1')
 
 
         if self.output_mode == 'residual':
@@ -270,7 +273,7 @@ class TrackerEncoder(nn.Module):
         rays_c = torch.stack([points_to_rays(cam, center, normalize_t=False)[0] for cam in camera_group])
         rays_c_inv = _invert_SE3(rays_c)  # [cams, 4, 4], ray-local → world
         
-        p3d_cams = points_3d_raw * cube_scale
+        p3d_cams = points_3d_raw * rearrange(cube_scale, 'cams b -> cams b 1 1 1')
 
         if self.output_mode == 'residual':
             if R == 3:
