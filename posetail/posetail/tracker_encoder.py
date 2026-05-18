@@ -266,7 +266,7 @@ class TrackerEncoder(nn.Module):
         else:
             points_3d_tri = None
 
-
+        
         # direct residual predictions
         center = torch.tensor([self.image_size // 2, self.image_size//2],
                               device=device, dtype=torch.float32).reshape(1, 2)
