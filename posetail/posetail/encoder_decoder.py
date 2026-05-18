@@ -219,7 +219,8 @@ class PatchProcessor(nn.Module):
 class QueryEncoder(nn.Module):
     def __init__(self, embed_dim=256, decoder_dim=256,
                  n_frames=16, corr_radius=2, max_freq=10,
-                 patch_size=9, use_volume_embedding=True):
+                 patch_size=9, use_volume_embedding=True,
+                 principal_point_embedding=False):
         super().__init__()
         self.embed_dim = embed_dim
         self.decoder_dim = decoder_dim
@@ -228,6 +229,7 @@ class QueryEncoder(nn.Module):
         self.patch_size = patch_size
         self.n_frames = n_frames
         self.use_volume_embedding = use_volume_embedding
+        self.principal_point_embedding = principal_point_embedding
 
         self.t_query_embed = nn.Embedding(n_frames, embed_dim)
         self.t_target_embed = nn.Embedding(n_frames, embed_dim)
@@ -242,7 +244,8 @@ class QueryEncoder(nn.Module):
 
         self.linear_pos = nn.Linear(4 * max_freq + 2, embed_dim)
         self.linear_depth = nn.Linear(2 * max_freq + 1, embed_dim)
-        self.linear_pp = nn.Linear(4 * max_freq + 2, embed_dim)
+        if self.principal_point_embedding:
+            self.linear_pp = nn.Linear(4 * max_freq + 2, embed_dim)
 
         self.patch_processor = PatchProcessor(
             in_channels=3,
@@ -260,7 +263,7 @@ class QueryEncoder(nn.Module):
             self.missing_volume = nn.Parameter(torch.zeros(embed_dim))
             nn.init.normal_(self.missing_volume, std=0.02)
 
-        self.n_fusion_terms = 8 if self.use_volume_embedding else 7
+        self.n_fusion_terms = 6 + int(self.use_volume_embedding) + int(self.principal_point_embedding)
         self.gate = nn.Sequential(
             nn.Linear(embed_dim * self.n_fusion_terms, self.n_fusion_terms),
             nn.Sigmoid()
@@ -314,19 +317,16 @@ class QueryEncoder(nn.Module):
         fourier_pos = torch.cat([pp, fourier_pos], dim=-1)
         embed_pos = self.linear_pos(fourier_pos)
 
-        # Principal-point-in-image encoding: where the optical axis lands in the current crop.
-        # Gives the decoder a bridge between V-JEPA's image-grid features and the
-        # optical-axis-aligned ray-local frame used in the residual head.
-        principal_pt = torch.stack([
-            (cam['mat'][:2, 2] - cam['offset']).to(query_coords.dtype)
-            for cam in camera_group
-        ])  # [n_cams, 2]
-        principal_pt_norm = principal_pt / sizes * 2.0 - 1.0       # [n_cams, 2]
-        # Broadcast to 4D before fourier — get_fourier_encoding requires (b, s, n, r).
-        principal_pt_norm = repeat(principal_pt_norm, 'cams r -> b t cams r', b=B, t=T_query)
-        fourier_pp = get_fourier_encoding(principal_pt_norm, min_freq=0, max_freq=self.max_freq)
-        fourier_pp = torch.cat([principal_pt_norm, fourier_pp], dim=-1)
-        embed_pp = self.linear_pp(fourier_pp)                       # [B, T_query, n_cams, embed_dim]
+        if self.principal_point_embedding:
+            principal_pt = torch.stack([
+                (cam['mat'][:2, 2] - cam['offset']).to(query_coords.dtype)
+                for cam in camera_group
+            ])  # [n_cams, 2]
+            principal_pt_norm = principal_pt / sizes * 2.0 - 1.0       # [n_cams, 2]
+            principal_pt_norm = repeat(principal_pt_norm, 'cams r -> b t cams r', b=B, t=T_query)
+            fourier_pp = get_fourier_encoding(principal_pt_norm, min_freq=0, max_freq=self.max_freq)
+            fourier_pp = torch.cat([principal_pt_norm, fourier_pp], dim=-1)
+            embed_pp = self.linear_pp(fourier_pp)                       # [B, T_query, n_cams, embed_dim]
 
         # Patch embeddings (shared)
         patches = torch.stack([
@@ -387,7 +387,9 @@ class QueryEncoder(nn.Module):
 
         # Gated fusion (shared)
         embed_terms = [embed_patch, embed_query_time, embed_target_time,
-                       embed_pos, embed_depth, embed_vis, embed_pp]
+                       embed_pos, embed_depth, embed_vis]
+        if self.principal_point_embedding:
+            embed_terms.append(embed_pp)
         if self.use_volume_embedding:
             embed_terms.append(embed_volume)
 

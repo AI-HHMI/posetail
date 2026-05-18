@@ -21,7 +21,8 @@ class TotalLoss(nn.Module):
                  coords_loss_triangulate_weight = 0.1,
                  coords_loss_2d_weight = 1,
                  coords_loss_depth_weight = 1,
-                 conf_2d_loss_weight = 0):
+                 conf_2d_loss_weight = 0,
+                 per_camera_cube_scale = False):
         super().__init__()
 
         self.gamma = gamma
@@ -44,6 +45,7 @@ class TotalLoss(nn.Module):
         self.coords_loss_triangulate_weight = coords_loss_triangulate_weight
         self.coords_loss_2d_weight = coords_loss_2d_weight
         self.coords_loss_depth_weight = coords_loss_depth_weight
+        self.per_camera_cube_scale = per_camera_cube_scale
 
         self.bce_loss_vis = BCELossVis(
             gamma = self.gamma, 
@@ -194,6 +196,9 @@ class TotalLoss(nn.Module):
             
 
         scale = get_camera_scale(cgroup, coords_true.reshape(B, -1, 3))  # (cams, B)
+        if not self.per_camera_cube_scale:
+            med = scale.median(dim=0).values  # (B,)
+            scale = med[None, :].expand_as(scale).contiguous()
 
         if p2d is not None:
             # for 2d prediction, the cube_scale is 1

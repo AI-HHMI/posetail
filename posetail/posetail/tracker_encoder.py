@@ -27,7 +27,9 @@ class TrackerEncoder(nn.Module):
                  max_freq = 10, n_iters = 4, embedding_dim = 256,
                  query_patch_size = 9,
                  use_volume_embedding = False,
-                 latent_dim = 1024, n_heads = 8, 
+                 per_camera_cube_scale = False,
+                 principal_point_embedding = False,
+                 latent_dim = 1024, n_heads = 8,
                  n_time_space_blocks = 6, embedding_factor = 4,
                  use_camera_self_attention = False,
                  mode_3d = 'encoder',
@@ -62,6 +64,8 @@ class TrackerEncoder(nn.Module):
         self.max_freq = max_freq     
         self.embedding_dim = embedding_dim
         self.use_volume_embedding = use_volume_embedding
+        self.per_camera_cube_scale = per_camera_cube_scale
+        self.principal_point_embedding = principal_point_embedding
 
         # decoder params
         self.latent_dim = latent_dim 
@@ -99,6 +103,7 @@ class TrackerEncoder(nn.Module):
             max_freq=max_freq,
             patch_size=query_patch_size,
             use_volume_embedding=use_volume_embedding,
+            principal_point_embedding=principal_point_embedding,
         )
         self.decoder = Decoder(
             embed_dim=latent_dim,
@@ -149,6 +154,9 @@ class TrackerEncoder(nn.Module):
             cube_scale = get_camera_scale(camera_group, coords)  # (n_cams, B)
         else:
             cube_scale = torch.ones((n_cams, B), device=device)
+        if not self.per_camera_cube_scale:
+            med = torch.median(cube_scale, dim=0).values  # (B,)
+            cube_scale = med[None, :].expand(n_cams, B).contiguous()
 
         if query_times is None:
             query_times = torch.zeros((B, N), dtype=torch.int32, device=device)

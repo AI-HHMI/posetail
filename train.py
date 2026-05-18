@@ -256,8 +256,9 @@ def run(config_path, fabric):
             optimizer = optimizer, 
             **config.training.scheduler)
 
-    train_loss = TotalLoss(**config.training.losses)
-    val_loss = TotalLoss(**config.training.losses)
+    pccs = config.model.get('per_camera_cube_scale', False)
+    train_loss = TotalLoss(**config.training.losses, per_camera_cube_scale=pccs)
+    val_loss   = TotalLoss(**config.training.losses, per_camera_cube_scale=pccs)
     
     # total_params = sum(p.numel() for p in model.parameters())
     # print(total_params)
