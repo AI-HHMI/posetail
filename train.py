@@ -1,11 +1,39 @@
 #!/usr/bin/env python3
 
+import warnings
+warnings.filterwarnings('ignore')
+
+import logging
+for _name in (
+    'torch._dynamo',
+    'torch._dynamo.convert_frame',
+    'torch._dynamo.symbolic_convert',
+    'torch._dynamo.guards',
+    'torch._dynamo.utils',
+    'torch._inductor',
+    'torch._inductor.compile_fx',
+):
+    logging.getLogger(_name).setLevel(logging.ERROR)
+
 import argparse
 import os
 import wandb
 import time
+import signal
 
 import torch
+# Re-assert child logger levels after torch import, since torch may install
+# its own handlers / reset levels during initialization.
+for _name in (
+    'torch._dynamo',
+    'torch._dynamo.convert_frame',
+    'torch._dynamo.symbolic_convert',
+    'torch._dynamo.guards',
+    'torch._dynamo.utils',
+    'torch._inductor',
+    'torch._inductor.compile_fx',
+):
+    logging.getLogger(_name).setLevel(logging.ERROR)
 import torch.multiprocessing as mp
 import torch.optim as optim
 # from torch.cuda.amp import GradScaler
@@ -78,7 +106,16 @@ def run(config_path, fabric):
     config = load_config(config_path)
     set_seeds(config.training.seed)
 
-    # set up training dataloader    
+    # signal handler for graceful interrupt
+    interrupted = False
+    def signal_handler(sig, frame):
+        nonlocal interrupted
+        interrupted = True
+        print(f"\n[rank {fabric.global_rank}] Received signal {sig}, finishing after current iteration...")
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # set up training dataloader
     train_dataset = PosetailDataset(config, split = 'train')
 
     sampler = DistributedSampler(
@@ -129,12 +166,15 @@ def run(config_path, fabric):
     
     if fabric.is_global_zero:
         wandb.init(
-            project = config.wandb.project_name,  
-            dir = config.wandb.path, 
-            mode = config.wandb.mode, 
+            project = config.wandb.project_name,
+            dir = config.wandb.path,
+            mode = config.wandb.mode,
             config = config)
 
+    exp_dir = ''
+    if fabric.is_global_zero and wandb.run is not None:
         exp_dir = wandb.run.dir
+    if fabric.is_global_zero:
         json_path = os.path.join(exp_dir, 'results.json')
 
         wandb_config_path = os.path.join(exp_dir, 'config.toml')
@@ -266,7 +306,11 @@ def run(config_path, fabric):
     train_iter = iter(train_loader)
 
     iter_time = time.time()
+    global_i = start_iteration
     for i in range(iters_per_gpu):
+
+        if interrupted:
+            break
 
         try:
             batch = next(train_iter)
@@ -332,7 +376,12 @@ def run(config_path, fabric):
         train_loss.reset_history()
         val_loss.reset_history()
 
-    wandb.finish()
+    # save checkpoint on interrupt
+    if interrupted and fabric.is_global_zero:
+        save_checkpoint(model, optimizer, prefix = exp_dir, i = global_i)
+
+    if fabric.is_global_zero:
+        wandb.finish()
 
 
 if __name__ == '__main__':
