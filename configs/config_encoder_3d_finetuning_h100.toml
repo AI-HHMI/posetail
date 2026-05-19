@@ -29,7 +29,7 @@ n_samples_per_dataset = -1
 crop_to_points = true
 speed_thresh = 1.0
 query_anytime = true
-query_edge_bias = 100.0
+query_edge_bias = 25.0
 prop_dynamic_kpts_to_sample = 0.95
 prob_2d_only = 0.0
 no_nan_coords = false
@@ -68,7 +68,7 @@ video_encoder_hierarchical = true
 stride_length = 16
 image_size = 256
 query_patch_size = 9
-per_camera_cube_scale = false
+per_camera_cube_scale = true
 
 # query encoder
 max_freq = 10
@@ -111,7 +111,7 @@ finetune = true
 n_iterations = 800000
 # scheduler_type = 'multisteplr'
 scheduler_type = 'schedulefree'
-max_grad_norm = 25.0
+max_grad_norm = 5.0
 checkpoint_freq = 10240 # in iterations
 eval_metric_freq = 16 # in iterations
 val_freq = 64 # in iterations
