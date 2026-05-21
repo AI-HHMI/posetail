@@ -244,7 +244,12 @@ class PosetailDataset(Dataset):
         self.query_anytime = config.dataset[split].get('query_anytime', False)
         self.query_edge_bias = config.dataset[split].get('query_edge_bias', 3.0)
         self.no_nan_coords = config.dataset[split].get('no_nan_coords', True)
-        
+
+        # 3D sphere subvolume crop augmentation
+        self.crop_3d_enabled = config.dataset[split].get('crop_3d_enabled', False)
+        self.crop_3d_fraction = config.dataset[split].get('crop_3d_fraction', [0.3, 0.7])
+        self.crop_3d_min_kpts = config.dataset[split].get('crop_3d_min_kpts', 4)
+
         # for balancing datasets
         self.balance_datasets = config.dataset[split].get('balance_datasets', True)
         self.n_samples_per_dataset = config.dataset[split].get('n_samples_per_dataset', -1) # default balances based on dataset with the most samples
@@ -450,8 +455,14 @@ class PosetailDataset(Dataset):
         if torch.sum(good) < 2: # not enough points with movement
             return None
 
-        # sample a random number of keypoints from available tracks 
-        if self.kpts_to_sample: 
+        # sample a random number of keypoints from available tracks
+        fire_3d = self.crop_3d_enabled and (np.random.rand() < self.aug_prob)
+        if fire_3d:
+            coords, vis, vis_2d = self.sample_keypoints_sphere(
+                coords, vis, vis_2d, total_movement, avg_speed)
+            if coords.shape[1] < self.crop_3d_min_kpts:
+                return None
+        elif self.kpts_to_sample:
             coords, vis, vis_2d = self.sample_keypoints(coords, vis, vis_2d, total_movement, avg_speed)
 
         # failed to sample coordinates, just get another random sample
@@ -708,6 +719,61 @@ class PosetailDataset(Dataset):
             if vis is not None: 
                 vis = vis[:, ix_p]
                 vis_2d = vis_2d[:, ix_p]
+
+        return coords, vis, vis_2d
+
+
+    def sample_keypoints_sphere(self, coords, vis, vis_2d, total_movement, avg_speed):
+        T, N, _ = coords.shape
+
+        valid = torch.isfinite(coords).all(dim=-1)   # (T, N)
+        has_any = valid.any(dim=0)                   # (N,)
+        if has_any.sum() < 2:
+            return coords, vis, vis_2d
+
+        first_valid_t = valid.float().argmax(dim=0)              # (N,)
+        kpt_coords = coords[first_valid_t, torch.arange(N)]     # (N, 3)
+
+        # pick center kpt from dynamic subset, fall back to movement-weighted
+        if self.speed_thresh is not None:
+            dynamic = (avg_speed >= self.speed_thresh) & has_any
+            if dynamic.any():
+                cand = torch.where(dynamic)[0]
+                center_kpt = int(cand[np.random.randint(len(cand))])
+            else:
+                cand = torch.where(has_any)[0]
+                probs = (total_movement[cand] + 2)
+                probs = probs / probs.sum()
+                center_kpt = int(cand[torch.multinomial(probs, 1).item()])
+        else:
+            cand = torch.where(has_any)[0]
+            probs = (total_movement[cand] + 2)
+            probs = probs / probs.sum()
+            center_kpt = int(cand[torch.multinomial(probs, 1).item()])
+
+        center = kpt_coords[center_kpt]   # (3,)
+
+        # compute distances; treat kpts with no valid time as inf
+        dists = torch.linalg.norm(kpt_coords - center, dim=-1)
+        dists = torch.where(has_any, dists, torch.full_like(dists, float('inf')))
+        finite_d = dists[torch.isfinite(dists)]
+        if finite_d.numel() < 2 or finite_d.max() == 0:
+            return coords, vis, vis_2d
+
+        f_lo, f_hi = self.crop_3d_fraction
+        fraction = float(np.random.uniform(f_lo, f_hi))
+        radius = finite_d.max() * fraction
+        in_sphere = dists <= radius
+
+        coords = coords[:, in_sphere]
+        if vis is not None:
+            vis = vis[:, in_sphere]
+            vis_2d = vis_2d[:, in_sphere]
+        tm_s = total_movement[in_sphere]
+        sp_s = avg_speed[in_sphere]
+
+        if self.kpts_to_sample:
+            coords, vis, vis_2d = self.sample_keypoints(coords, vis, vis_2d, tm_s, sp_s)
 
         return coords, vis, vis_2d
 

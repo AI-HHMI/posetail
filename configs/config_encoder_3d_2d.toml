@@ -32,6 +32,9 @@ query_anytime = true
 query_edge_bias = 100.0
 prop_dynamic_kpts_to_sample = 0.95
 prob_2d_only = 0.25
+crop_3d_enabled = true
+crop_3d_fraction = [0.3, 0.7]
+
 
 [dataset.val]
 split_dir = 'val'
