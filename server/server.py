@@ -24,7 +24,7 @@ from fastapi.responses import Response
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from inference_video import load_model_from_base_folder
+from inference_video import load_model_from_base_folder, resize_camera_group
 from posetail.posetail.tracker_encoder import TrackerEncoder
 from train_utils import load_checkpoint, load_config
 
@@ -152,31 +152,19 @@ async def predict(
 
         cam_frames.setdefault(cam_name, {})[frame_idx] = img
 
-    # Build per-camera view tensors in cameras_meta order
-    views = []
+    # Build camera group dicts first (needed to compute resize scales before loading views).
+    # Image size is read from the actual decoded frames — client need not send 'size'.
+    camera_group = []
     for cam_info in cameras_meta:
         cam_name = cam_info['name']
         if cam_name not in cam_frames:
             raise HTTPException(400, detail=f'No images uploaded for camera: {cam_name}')
-        frame_dict = cam_frames[cam_name]
-        if len(frame_dict) != n_frames:
-            raise HTTPException(
-                400,
-                detail=f'Camera {cam_name}: expected {n_frames} frames, got {len(frame_dict)}',
-            )
-        frames = np.stack([frame_dict[i] for i in sorted(frame_dict)], axis=0)  # (T, H, W, 3)
-        view_tensor = (
-            torch.from_numpy(frames).unsqueeze(0).to(device=device, dtype=torch.float32) / 255.0
-        )
-        views.append(view_tensor)
-
-    # Build camera group dicts, computing derived fields from ext
-    camera_group = []
-    for cam_info in cameras_meta:
+        first_frame = next(iter(cam_frames[cam_name].values()))
+        H, W = first_frame.shape[:2]
+        size = torch.tensor([W, H], dtype=torch.int32, device=device)
         ext = torch.tensor(cam_info['ext'], dtype=torch.float32, device=device)
         mat = torch.tensor(cam_info['mat'], dtype=torch.float32, device=device)
         dist = torch.tensor(cam_info['dist'], dtype=torch.float32, device=device)
-        size = torch.tensor(cam_info['size'], dtype=torch.int32, device=device)
         offset = torch.tensor(
             cam_info.get('offset', [0.0, 0.0]), dtype=torch.float32, device=device
         )
@@ -185,7 +173,7 @@ async def predict(
         t = ext[:3, 3]
         center = -R.T @ t
         camera_group.append({
-            'name': cam_info['name'],
+            'name': cam_name,
             'type': cam_info.get('type', 'pinhole'),
             'mat': mat,
             'dist': dist,
@@ -195,6 +183,32 @@ async def predict(
             'ext_inv': ext_inv,
             'center': center,
         })
+
+    # Record per-camera scale factors before resize so we can un-scale 2d_pred later
+    image_size = app.state.image_size
+    scales = [float(image_size) / max(cam['size'].tolist()) for cam in camera_group]
+
+    # Scale so max(H,W) == image_size, matching PosetailDataset / inference_video
+    camera_group = resize_camera_group(camera_group, image_size)
+
+    # Build per-camera view tensors, resizing frames to the scaled camera size
+    views = []
+    for cam_idx, cam_info in enumerate(cameras_meta):
+        cam_name = cam_info['name']
+        frame_dict = cam_frames[cam_name]
+        if len(frame_dict) != n_frames:
+            raise HTTPException(
+                400,
+                detail=f'Camera {cam_name}: expected {n_frames} frames, got {len(frame_dict)}',
+            )
+        target_wh = tuple(camera_group[cam_idx]['size'].tolist())  # (W, H) for cv2.resize
+        frames = np.stack(
+            [cv2.resize(frame_dict[i], target_wh) for i in sorted(frame_dict)], axis=0
+        )  # (T, H, W, 3)
+        view_tensor = (
+            torch.from_numpy(frames).unsqueeze(0).to(device=device, dtype=torch.float32) / 255.0
+        )
+        views.append(view_tensor)
 
     coords = torch.tensor(coords_list, dtype=torch.float32, device=device).unsqueeze(0)
     query_times = None
@@ -211,6 +225,12 @@ async def predict(
                 camera_group=camera_group,
                 query_times=query_times,
             )
+
+    # Un-scale 2d_pred from resized coords back to the client's sent-image resolution.
+    # All other output keys are in 3D world space and are unaffected by image resize.
+    if outputs.get('2d_pred') is not None:
+        scale_t = torch.tensor(scales, device=device).view(-1, 1, 1, 1, 1)
+        outputs['2d_pred'] = outputs['2d_pred'] / scale_t
 
     result = {}
     for key, val in outputs.items():

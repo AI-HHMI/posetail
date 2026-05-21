@@ -63,7 +63,6 @@ Runs one forward pass and returns all model outputs.
       "mat":    [[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
       "dist":   [k1, k2, p1, p2, k3],
       "ext":    [[r00,r01,r02,tx], [r10,r11,r12,ty], [r20,r21,r22,tz], [0,0,0,1]],
-      "size":   [W, H],
       "offset": [ox, oy]
     }
   ],
@@ -77,6 +76,7 @@ Runs one forward pass and returns all model outputs.
 - `query_times` — shape `(N,)`, integer frame index each query point originates from (optional; defaults to zeros).
 - `ext` — 4×4 world-to-camera extrinsic matrix. The server computes `ext_inv` and `center` internally.
 - `offset` — pixel offset applied when the image is a crop of a larger frame; use `[0, 0]` for full-frame images.
+- Image dimensions (`size`) are read from the uploaded pixel data — the client does not need to include them.
 
 **Image files**
 
