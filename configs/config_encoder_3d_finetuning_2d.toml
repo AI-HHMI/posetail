@@ -113,7 +113,10 @@ seed = 3
 # checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260519_232230-5wo436xb/files/checkpoints/checkpoint_00399996.pth'
 
 # direct 3d - with 2d
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260520_165302-iuvydycq/files/checkpoints/checkpoint_00399996.pth'
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260520_165302-iuvydycq/files/checkpoints/checkpoint_00399996.pth'
+
+# direct 3d - with 2d + crop
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260521_145939-4llma99f/files/checkpoints/checkpoint_00399996.pth'
 
 
 finetune = true
