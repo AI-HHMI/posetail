@@ -21,7 +21,7 @@ min_res = 256
 max_res = 256
 cams_to_sample = [1, 8] 
 kpts_to_sample = [128, 128]
-aug_prob = 0.25
+aug_prob = 0.33
 enable_kpt_filtering = false
 cam_thresh_for_vis = 1
 balance_datasets = true
@@ -33,7 +33,7 @@ query_edge_bias = 100.0
 prop_dynamic_kpts_to_sample = 0.95
 prob_2d_only = 0.25
 crop_3d_enabled = true
-crop_3d_fraction = [0.3, 0.7]
+crop_3d_fraction = [0.1, 0.6]
 
 
 [dataset.val]

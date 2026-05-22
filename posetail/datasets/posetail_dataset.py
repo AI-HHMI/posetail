@@ -335,7 +335,7 @@ class PosetailDataset(Dataset):
             vis = vis.bool()
 
         # only augment some of the samples
-        should_augment = np.random.random() < 0.6
+        should_augment = np.random.random() < 0.75
         should_grayscale = self.split == 'train' and np.random.random() < 0.2
             
         # sample a random subject with 0.5 probability if using a 
