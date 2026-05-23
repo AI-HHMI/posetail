@@ -242,7 +242,7 @@ class PosetailDataset(Dataset):
         self.cam_thresh_for_vis = config.dataset[split].get('cam_thresh_for_vis', 1) 
         self.enable_kpt_filtering = config.dataset[split].get('enable_kpt_filtering', False)
         self.query_anytime = config.dataset[split].get('query_anytime', False)
-        self.query_edge_bias = config.dataset[split].get('query_edge_bias', 3.0)
+        self.prob_query_anytime = config.dataset[split].get('prob_query_anytime', 1.0)
         self.no_nan_coords = config.dataset[split].get('no_nan_coords', True)
 
         # 3D sphere subvolume crop augmentation
@@ -419,8 +419,15 @@ class PosetailDataset(Dataset):
 
         # filter coords based on which coords are visible enough times
         if self.query_anytime:
-            mask = valid_mask.sum(dim=0) >= 2
+            use_anytime = np.random.random() < self.prob_query_anytime
+            if use_anytime:
+                mask = valid_mask.sum(dim=0) >= 2
+            else:
+                edge_frame = np.random.choice([0, self.n_frames - 1])
+                mask = valid_mask[edge_frame]
         else:
+            use_anytime = False
+            edge_frame = 0
             mask = valid_mask[0]
 
         coords = coords[:, mask]
@@ -483,18 +490,18 @@ class PosetailDataset(Dataset):
         cgroup, coords = self.rotate_camera_group(cgroup, coords)
 
         # setup possible query_times (n_kpts)
-        if self.query_anytime:
+        if use_anytime:
             query_times = []
             for kpt_idx in range(coords.shape[1]):
                 good = torch.isfinite(coords[:, kpt_idx, 0])
                 if vis is not None:
                     good = good & vis[:, kpt_idx]
                 valid_times = torch.where(good)[0]
-                query_time = self.sample_query_time(valid_times)
+                query_time = valid_times[torch.randint(len(valid_times), (1,))]
                 query_times.append(query_time.item())
-            query_times = torch.tensor(query_times, dtype=torch.int32, device='cpu')            
+            query_times = torch.tensor(query_times, dtype=torch.int32, device='cpu')
         else:
-            query_times = torch.zeros((coords.shape[1],), dtype=torch.int32, device='cpu')
+            query_times = torch.full((coords.shape[1],), edge_frame, dtype=torch.int32)
         
         if is_2d_mode:
             p2d = project_points_torch(cgroup, coords) # (1, t, n_kpts, 2)
@@ -777,26 +784,6 @@ class PosetailDataset(Dataset):
             coords, vis, vis_2d = self.sample_keypoints(coords, vis, vis_2d, tm_s, sp_s)
 
         return coords, vis, vis_2d
-
-
-    def sample_query_time(self, valid_times):
-        valid_times = valid_times.to(torch.long)
-
-        if len(valid_times) == 1:
-            return valid_times[0].to(torch.int32)
-
-        dist_to_start = valid_times
-        dist_to_end = (self.n_frames - 1) - valid_times
-        dist_to_edge = torch.minimum(dist_to_start, dist_to_end).to(torch.float32)
-
-        weights = 1.0 / (dist_to_edge + 1.0)
-        weights[valid_times == 0] *= self.query_edge_bias
-        weights[valid_times == (self.n_frames - 1)] *= self.query_edge_bias
-
-        probs = weights / weights.sum()
-        sample_ix = torch.multinomial(probs, 1)
-
-        return valid_times[sample_ix].squeeze(0).to(torch.int32)
 
 
     def resize_camera_group(self, cgroup): 
