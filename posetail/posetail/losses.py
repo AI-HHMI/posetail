@@ -42,13 +42,17 @@ class TotalLoss(nn.Module):
                  coords_loss_2d_weight = 1,
                  coords_loss_depth_weight = 1,
                  conf_2d_loss_weight = 0,
-                 per_camera_cube_scale = False):
+                 per_camera_cube_scale = False,
+                 smoothness_loss_3d_weight = 0,
+                 smoothness_loss_2d_weight = 0,
+                 smoothness_loss_order = 4,
+                 smoothness_loss_tolerance = 1.0):
         super().__init__()
 
         self.gamma = gamma
         self.pixel_thresh = pixel_thresh
         self.delta = delta
-        
+
         self.use_huber_loss = use_huber_loss
 
         # weight for each loss (0 to not use or compute)
@@ -59,13 +63,18 @@ class TotalLoss(nn.Module):
         self.feature_loss_weight = feature_loss_weight
 
         self.conf_2d_loss_weight = conf_2d_loss_weight
-        
+
         self.coords_loss_direct_weight = coords_loss_direct_weight
         self.coords_loss_rays_weight = coords_loss_rays_weight
         self.coords_loss_triangulate_weight = coords_loss_triangulate_weight
         self.coords_loss_2d_weight = coords_loss_2d_weight
         self.coords_loss_depth_weight = coords_loss_depth_weight
         self.per_camera_cube_scale = per_camera_cube_scale
+
+        self.smoothness_loss_3d_weight = smoothness_loss_3d_weight
+        self.smoothness_loss_2d_weight = smoothness_loss_2d_weight
+        self.smoothness_loss_order = smoothness_loss_order
+        self.smoothness_loss_tolerance = smoothness_loss_tolerance
 
         self.bce_loss_vis = BCELossVis(
             gamma = self.gamma, 
@@ -143,7 +152,19 @@ class TotalLoss(nn.Module):
         self.feature_loss = FeatureLoss(
             weight = self.feature_loss_weight)
 
-        # loss_names = ['vis_loss', 'conf_loss', 
+        self.smoothness_loss_3d = SmoothnessLoss(
+            order = self.smoothness_loss_order,
+            weight = self.smoothness_loss_3d_weight,
+            tolerance = self.smoothness_loss_tolerance
+        )
+
+        self.smoothness_loss_2d = SmoothnessLoss(
+            order = self.smoothness_loss_order,
+            weight = self.smoothness_loss_2d_weight,
+            tolerance = self.smoothness_loss_tolerance
+        )
+
+        # loss_names = ['vis_loss', 'conf_loss',
         #               'occluded_coords_loss', 'coords_loss',
         #               '2d_loss', 'depth_loss',
         #               # 'feature_loss','bad_feature_loss',
@@ -430,6 +451,23 @@ class TotalLoss(nn.Module):
         else:
             coords_loss_depth = torch.tensor(0.0, device=device)
 
+        if p2d is not None:
+            pred_n_smooth, _ = normalize_by_mean_depth(coords_pred, vis_true, centers[0])
+            smoothness_loss_3d = self.smoothness_loss_3d(
+                coords_pred=pred_n_smooth, coords_true=coords_true_n,
+                vis_true=vis_true, time_dim=1, scale=1.0, device=device)
+        else:
+            smoothness_loss_3d = self.smoothness_loss_3d(
+                coords_pred=coords_pred, coords_true=coords_true,
+                vis_true=vis_true, time_dim=1, scale=scale_b, device=device)
+
+        if coords_pred_2d is not None:
+            smoothness_loss_2d = self.smoothness_loss_2d(
+                coords_pred=coords_pred_2d, coords_true=coords_true_2d,
+                vis_true=vis_true_cams, time_dim=2, scale=1.0, device=device)
+        else:
+            smoothness_loss_2d = torch.tensor(float('nan'), device=device)
+
         if valid_vis:
             occluded_coords_loss = self.mae_loss_occluded_coords(
                 coords_pred = coords_pred_iters if training_iters else coords_pred,
@@ -474,6 +512,7 @@ class TotalLoss(nn.Module):
             conf_loss,
             conf_loss_2d,
             coords_loss_2d, coords_loss_depth,
+            smoothness_loss_3d, smoothness_loss_2d,
             # occluded_coords_loss_2d, # too crazy
             feature_loss, bad_feature_loss
         ]
@@ -503,6 +542,9 @@ class TotalLoss(nn.Module):
         self.loss_history['2d_loss'].append(coords_loss_2d.item())
         # self.loss_history['2d_occluded_loss'].append(occluded_coords_loss_2d.item())
         self.loss_history['depth_loss'].append(coords_loss_depth.item())
+
+        self.loss_history['smoothness_3d_loss'].append(smoothness_loss_3d.item())
+        self.loss_history['smoothness_2d_loss'].append(smoothness_loss_2d.item())
 
         # feature loss
         self.loss_history['feature_loss'].append(feature_loss.item())
@@ -665,7 +707,54 @@ class WeightedMAELoss(nn.Module):
         return total_loss
 
 
-class FeatureLoss(nn.Module): 
+class SmoothnessLoss(nn.Module):
+    """One-sided hinge on the k-th temporal derivative magnitude.
+
+    Penalizes pred only when |∂^k pred| > tolerance * |∂^k true|.
+    Zero loss when pred is at or below the GT's wiggle bound.
+    """
+
+    def __init__(self, order=4, weight=1, tolerance=1.0, eps=1e-6):
+        super().__init__()
+        self.order = order
+        self.weight = weight
+        self.tolerance = tolerance
+        self.eps = eps
+
+    def forward(self, coords_pred, coords_true, vis_true, time_dim, scale=1.0, device=None):
+        if self.weight == 0:
+            return torch.tensor(float('nan'), device=device)
+
+        k = self.order
+        T = coords_true.shape[time_dim]
+
+        # Build per-position validity: visible AND finite GT coord.
+        # NaN in vis_true → (NaN > 0.5) is False → excluded automatically.
+        vis_bool = (vis_true > 0.5)
+        true_finite = torch.isfinite(coords_true[..., 0:1])
+        valid = vis_bool & true_finite
+
+        # Stencil-AND mask: all k+1 frames in the derivative window must be valid.
+        mask = valid.narrow(time_dim, 0, T - k)
+        for i in range(1, k + 1):
+            mask = mask & valid.narrow(time_dim, i, T - k)
+
+        d_pred = torch.diff(coords_pred, n=k, dim=time_dim)
+        d_true = torch.diff(coords_true, n=k, dim=time_dim)  # may contain NaN
+
+        # Excise NaN from d_true at one well-defined spot. torch.where short-circuits
+        # the masked branch, so NaN * 0 = NaN is avoided (unlike d_true * mask).
+        d_true_safe = torch.where(mask, d_true, torch.zeros_like(d_true))
+
+        excess = (d_pred.abs() - self.tolerance * d_true_safe.abs()).clamp_min(0)
+
+        R = coords_pred.shape[-1]
+        loss = (excess / scale * mask.float()).sum() / (mask.sum() * R + self.eps)
+
+        return self.weight * loss
+
+
+class FeatureLoss(nn.Module):
 
     def __init__(self, weight):
         super().__init__()
