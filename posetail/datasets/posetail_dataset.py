@@ -249,6 +249,7 @@ class PosetailDataset(Dataset):
         self.crop_3d_enabled = config.dataset[split].get('crop_3d_enabled', False)
         self.crop_3d_fraction = config.dataset[split].get('crop_3d_fraction', [0.3, 0.7])
         self.crop_3d_min_kpts = config.dataset[split].get('crop_3d_min_kpts', 4)
+        self.crop_3d_prob = config.dataset[split].get('crop_3d_prob', self.aug_prob)
 
         # for balancing datasets
         self.balance_datasets = config.dataset[split].get('balance_datasets', True)
@@ -456,7 +457,7 @@ class PosetailDataset(Dataset):
             return None
 
         # sample a random number of keypoints from available tracks
-        fire_3d = self.crop_3d_enabled and (np.random.rand() < self.aug_prob)
+        fire_3d = self.crop_3d_enabled and (np.random.rand() < self.crop_3d_prob)
         if fire_3d:
             coords, vis, vis_2d = self.sample_keypoints_sphere(
                 coords, vis, vis_2d, total_movement, avg_speed)
@@ -761,7 +762,7 @@ class PosetailDataset(Dataset):
             return coords, vis, vis_2d
 
         f_lo, f_hi = self.crop_3d_fraction
-        fraction = float(np.random.uniform(f_lo, f_hi))
+        fraction = float(np.exp(np.random.uniform(np.log(f_lo), np.log(f_hi))))
         radius = finite_d.max() * fraction
         in_sphere = dists <= radius
 
