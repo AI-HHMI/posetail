@@ -145,4 +145,4 @@ coords_loss_depth_weight = 1.0
 smoothness_loss_3d_weight = 1.0
 smoothness_loss_2d_weight = 1.0
 smoothness_loss_order = 4
-smoothness_loss_tolerance = 1.0
+smoothness_loss_tolerance = 1.5
