@@ -132,7 +132,7 @@ max_grad_norm = 5.0
 checkpoint_freq = 10240 # in iterations
 eval_metric_freq = 16 # in iterations
 val_freq = 64 # in iterations
-print_freq = 64 # in iterations
+print_freq = 128 # in iterations
 debug_ix = -1 # only works for val 
 
 [training.optimizer]

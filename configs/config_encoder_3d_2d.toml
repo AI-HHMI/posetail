@@ -39,7 +39,7 @@ crop_3d_prob = 0.4
 [dataset.train.curriculum]
 enabled = true
 ramp_start_frac = 0.0
-ramp_end_frac   = 0.1
+ramp_end_frac   = 0.4
 intensity_floor = 0.0
 
 [dataset.val]
@@ -106,7 +106,7 @@ max_grad_norm = 50.0
 checkpoint_freq = 10240 # in iterations
 eval_metric_freq = 16 # in iterations
 val_freq = 64 # in iterations
-print_freq = 1 # in iterations
+print_freq = 128 # in iterations
 debug_ix = -1 # only works for val 
 
 [training.optimizer]
