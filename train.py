@@ -319,6 +319,7 @@ def run(config_path, fabric):
             batch = next(train_iter)
 
         global_i = start_iteration + i * fabric.world_size + fabric.local_rank
+        train_dataset.set_progress(global_i / max(config.training.n_iterations, 1))
         result_dict = {'iteration': global_i}
         evaluate = i % eval_metric_freq == 0
 
@@ -354,6 +355,7 @@ def run(config_path, fabric):
 
         # log losses and eval metrics to wandb and print to console 
         if fabric.is_global_zero:
+            result_dict['train/curriculum_intensity'] = train_dataset.curriculum_intensity()
             result_dict['train/iter_time'] = time.time() - iter_time
             result_dict['train/loader_time'] = ( result_dict['train/iter_time']
                                                  - result_dict['train/elapsed_time']

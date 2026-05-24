@@ -24,6 +24,7 @@ warnings.filterwarnings('ignore', category=UserWarning, module='imagecorruptions
 import imgaug.augmenters as iaa
 
 from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
 
 
 def _rotated_rect_max_inscribed(w, h, angle_rad):
@@ -230,6 +231,7 @@ class PosetailDataset(Dataset):
         self.min_res = config.dataset[split].get('min_res', self.max_res) # only used when max_res != -1
         self.aug_prob = config.dataset[split].get('aug_prob', 0.25)
         self.per_image_aug_prob = config.dataset[split].get('per_image_aug_prob', self.aug_prob)
+        self.should_augment_prob = config.dataset[split].get('should_augment_prob', 0.75)
         self.prob_2d_only = config.dataset[split].get('prob_2d_only', 0.0)
 
         self.crop_to_points = config.dataset[split].get('crop_to_points', True)
@@ -251,6 +253,14 @@ class PosetailDataset(Dataset):
         self.crop_3d_fraction = config.dataset[split].get('crop_3d_fraction', [0.3, 0.7])
         self.crop_3d_min_kpts = config.dataset[split].get('crop_3d_min_kpts', 4)
         self.crop_3d_prob = config.dataset[split].get('crop_3d_prob', self.aug_prob)
+
+        # augmentation curriculum
+        curriculum_cfg = config.dataset[split].get('curriculum', {})
+        self.curriculum_enabled = curriculum_cfg.get('enabled', False)
+        self.curriculum_ramp_start_frac = curriculum_cfg.get('ramp_start_frac', 0.0)
+        self.curriculum_ramp_end_frac = curriculum_cfg.get('ramp_end_frac', 0.1)
+        self.curriculum_intensity_floor = curriculum_cfg.get('intensity_floor', 0.0)
+        self.progress = multiprocessing.Value('d', 0.0)
 
         # for balancing datasets
         self.balance_datasets = config.dataset[split].get('balance_datasets', True)
@@ -343,7 +353,8 @@ class PosetailDataset(Dataset):
             vis = vis.bool()
 
         # only augment some of the samples
-        should_augment = np.random.random() < 0.75
+        intensity = self.curriculum_intensity()
+        should_augment = np.random.random() < self.should_augment_prob * intensity
         should_grayscale = self.split == 'train' and np.random.random() < 0.2
             
         # sample a random subject with 0.5 probability if using a 
@@ -464,7 +475,7 @@ class PosetailDataset(Dataset):
             return None
 
         # sample a random number of keypoints from available tracks
-        fire_3d = self.crop_3d_enabled and (np.random.rand() < self.crop_3d_prob)
+        fire_3d = self.crop_3d_enabled and (np.random.rand() < self.crop_3d_prob * intensity)
         if fire_3d:
             coords, vis, vis_2d = self.sample_keypoints_sphere(
                 coords, vis, vis_2d, total_movement, avg_speed)
@@ -929,7 +940,22 @@ class PosetailDataset(Dataset):
         return cgroup, coords
 
 
-    def _generate_metadata(self, track_3d = True): 
+    def set_progress(self, fraction):
+        self.progress.value = float(fraction)
+
+    def curriculum_intensity(self):
+        if not self.curriculum_enabled:
+            return 1.0
+        f = self.progress.value
+        lo, hi = self.curriculum_ramp_start_frac, self.curriculum_ramp_end_frac
+        if f <= lo:
+            return self.curriculum_intensity_floor
+        if f >= hi:
+            return 1.0
+        t = (f - lo) / max(hi - lo, 1e-9)
+        return self.curriculum_intensity_floor + (1.0 - self.curriculum_intensity_floor) * t
+
+    def _generate_metadata(self, track_3d = True):
             
         rows = []
         mode = '3d' # if track_3d else '2d' - not yet implemented
