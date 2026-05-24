@@ -770,7 +770,7 @@ class PosetailDataset(Dataset):
             return coords, vis, vis_2d
 
         f_lo, f_hi = self.crop_3d_fraction
-        fraction = float(np.random.uniform(f_lo, f_hi))
+        fraction = float(np.exp(np.random.uniform(np.log(f_lo), np.log(f_hi))))
         radius = finite_d.max() * fraction
         in_sphere = dists <= radius
 
