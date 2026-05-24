@@ -29,7 +29,7 @@ n_samples_per_dataset = -1
 crop_to_points = true
 speed_thresh = 1.0
 query_anytime = true
-prob_query_anytime = 0.5
+prob_query_anytime = 0.25
 prop_dynamic_kpts_to_sample = 0.95
 prob_2d_only = 0.25
 no_nan_coords = false
@@ -119,8 +119,10 @@ seed = 3
 # checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260520_165302-iuvydycq/files/checkpoints/checkpoint_00399996.pth'
 
 # direct 3d - with 2d + crop
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260521_145939-4llma99f/files/checkpoints/checkpoint_00399996.pth'
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260521_145939-4llma99f/files/checkpoints/checkpoint_00399996.pth'
 
+# direct 3d - with more aug and smooth
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260522_232104-k6kvynm9/files/checkpoints/checkpoint_00399996.pth'
 
 finetune = true
 n_iterations = 800000
@@ -175,4 +177,4 @@ coords_loss_depth_weight = 0.1
 smoothness_loss_3d_weight = 1.0
 smoothness_loss_2d_weight = 1.0
 smoothness_loss_order = 4
-smoothness_loss_tolerance = 1.0
+smoothness_loss_tolerance = 1.5

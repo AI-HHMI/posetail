@@ -29,12 +29,12 @@ n_samples_per_dataset = -1
 crop_to_points = true
 speed_thresh = 1.0
 query_anytime = true
-prob_query_anytime = 0.5
+prob_query_anytime = 0.05
 prop_dynamic_kpts_to_sample = 0.95
 prob_2d_only = 0.25
 crop_3d_enabled = true
-crop_3d_fraction = [0.025, 0.6]
-crop_3d_prob = 0.6
+crop_3d_fraction = [0.04, 0.6]
+crop_3d_prob = 0.5
 
 
 [dataset.val]
@@ -143,7 +143,7 @@ coords_loss_triangulate_weight = 0.0
 coords_loss_2d_weight = 1.0
 coords_loss_depth_weight = 1.0
 
-smoothness_loss_3d_weight = 1.0
-smoothness_loss_2d_weight = 1.0
+smoothness_loss_3d_weight = 0.0
+smoothness_loss_2d_weight = 0.0
 smoothness_loss_order = 4
 smoothness_loss_tolerance = 1.5
