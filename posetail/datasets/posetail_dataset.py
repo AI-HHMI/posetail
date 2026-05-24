@@ -229,6 +229,7 @@ class PosetailDataset(Dataset):
         self.max_res = config.dataset[split].get('max_res', -1) # -1 means no resizing
         self.min_res = config.dataset[split].get('min_res', self.max_res) # only used when max_res != -1
         self.aug_prob = config.dataset[split].get('aug_prob', 0.25)
+        self.per_image_aug_prob = config.dataset[split].get('per_image_aug_prob', self.aug_prob)
         self.prob_2d_only = config.dataset[split].get('prob_2d_only', 0.0)
 
         self.crop_to_points = config.dataset[split].get('crop_to_points', True)
@@ -256,18 +257,24 @@ class PosetailDataset(Dataset):
         self.n_samples_per_dataset = config.dataset[split].get('n_samples_per_dataset', -1) # default balances based on dataset with the most samples
 
         
-        # augmentation
-        self.aug = iaa.Sequential([
+        # per-camera augmentations: same parameters applied to all frames of one camera
+        self.aug_per_camera = iaa.Sequential([
             iaa.Sometimes(self.aug_prob, iaa.imgcorruptlike.DefocusBlur(severity=(1,2))),
             # iaa.Sometimes(self.aug_prob, iaa.imgcorruptlike.Contrast(severity=(1,2))),
             iaa.Sometimes(self.aug_prob, iaa.GammaContrast((0.5, 1.8))),
             iaa.Sometimes(self.aug_prob, iaa.AddToSaturation((-50, 30))),
             iaa.Sometimes(self.aug_prob, iaa.AddToHue((-10, 10))),
-            iaa.Sometimes(self.aug_prob, iaa.MotionBlur(k=(3,5))),
-            iaa.Sometimes(self.aug_prob, iaa.AdditiveGaussianNoise(scale=(0, 0.07*255))),
             # iaa.Sometimes(self.aug_prob, iaa.UniformColorQuantizationToNBits(nb_bits=(3,7))),
             iaa.Sometimes(self.aug_prob, iaa.JpegCompression(compression=(30, 70))),
             # iaa.Sometimes(self.aug_prob, iaa.imgcorruptlike.Pixelate(severity=(1,2))),
+        ])
+
+        # per-image augmentations: independently resampled for each frame
+        self.aug_per_image = iaa.Sequential([
+            iaa.Sometimes(self.per_image_aug_prob, iaa.MotionBlur(k=(3,5))),
+            iaa.Sometimes(self.per_image_aug_prob, iaa.AdditiveGaussianNoise(scale=(0, 0.07*255))),
+            iaa.Sometimes(self.per_image_aug_prob, iaa.Multiply((0.9, 1.1))),
+            iaa.Sometimes(self.per_image_aug_prob, iaa.SaltAndPepper(0.01)),
         ])
         
         # generate metadata for the provided data path (requires a specific format)
@@ -568,8 +575,9 @@ class PosetailDataset(Dataset):
             for cnum, futures in enumerate(views_unloaded):
                 imgs = [f.result() for f in futures]
                 if should_augment:
-                    aug_det = self.aug.to_deterministic()
-                    imgs = [aug_det(image=img) for img in imgs]
+                    aug_cam_det = self.aug_per_camera.to_deterministic()
+                    imgs = [aug_cam_det(image=img) for img in imgs]
+                    imgs = [self.aug_per_image(image=img) for img in imgs]
 
                 for rect in cutout_rects[cnum]:
                     rx1, ry1, rx2, ry2, fill_color = rect
