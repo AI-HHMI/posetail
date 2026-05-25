@@ -91,6 +91,7 @@ n_heads = 8
 n_time_space_blocks = 8
 embedding_factor = 4
 use_camera_self_attention = true
+use_temporal_self_attention = true
 output_mode = "direct"
 scene_encoder_proj = false
 head_3d_grid_size = 16
