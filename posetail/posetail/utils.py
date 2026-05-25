@@ -2,6 +2,25 @@ import torch
 
 from einops import rearrange
 
+
+def apply_rope_1d(x, positions, base=10000):
+    """
+    Apply 1-D rotary position embeddings to x.
+    x: (..., T, head_dim)  — head_dim must be even
+    positions: (T,) integer positions
+    Rotates consecutive pairs of head_dim dims by position-dependent angles.
+    Applied to Q and K (not V) before scaled_dot_product_attention.
+    """
+    head_dim = x.shape[-1]
+    assert head_dim % 2 == 0
+    half = head_dim // 2
+    freqs = 1.0 / (base ** (torch.arange(half, device=x.device, dtype=x.dtype) * 2 / head_dim))
+    angles = positions.to(x.dtype).unsqueeze(-1) * freqs.unsqueeze(0)  # (T, half)
+    sin = torch.sin(angles)
+    cos = torch.cos(angles)
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters())
 

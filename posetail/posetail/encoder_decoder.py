@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from posetail.posetail.networks import EmbedV2V
 from posetail.posetail.cube import is_point_visible, project_points_torch
 from posetail.posetail.cube import CameraSelfAttention
-from posetail.posetail.utils import get_fourier_encoding
+from posetail.posetail.utils import get_fourier_encoding, apply_rope_1d
 
 from einops import rearrange, repeat, einsum
 
@@ -479,6 +479,40 @@ class SceneRepresentation(nn.Module):
         return encoded
 
 
+class TemporalSelfAttention(nn.Module):
+    """Per-point temporal self-attention with 1-D RoPE.
+
+    Expects input of shape (batch, T, embed_dim) where batch absorbs
+    cams·B·K. Attends across the T (time) axis; out_proj is zero-initialized
+    so the block is a no-op at init.
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        T = x.shape[1]
+        q = rearrange(self.q_proj(x), 'b t (h d) -> b h t d', h=self.num_heads)
+        k = rearrange(self.k_proj(x), 'b t (h d) -> b h t d', h=self.num_heads)
+        v = rearrange(self.v_proj(x), 'b t (h d) -> b h t d', h=self.num_heads)
+        positions = torch.arange(T, device=x.device)
+        q = apply_rope_1d(q, positions)
+        k = apply_rope_1d(k, positions)
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = rearrange(out, 'b h t d -> b t (h d)')
+        return self.out_proj(out)
+
+
 class AdaptiveLayerNorm(nn.Module):
     def __init__(self, dim, num_modes=2):
         super().__init__()
@@ -497,6 +531,7 @@ class Decoder(nn.Module):
                  num_heads=8, num_layers=8,
                  mlp_ratio=4.0, dropout=0.05,
                  use_camera_self_attention=True,
+                 use_temporal_self_attention=False,
                  output_mode="direct",
                  head_3d_grid_size=8,
                  head_3d_grid_radius=1.0):
@@ -506,6 +541,7 @@ class Decoder(nn.Module):
         self.encoder_dim = encoder_dim
         self.num_layers = num_layers
         self.use_camera_self_attention = use_camera_self_attention
+        self.use_temporal_self_attention = use_temporal_self_attention
         self.output_mode = output_mode
         self.head_3d_grid_size = head_3d_grid_size
         self.head_3d_grid_radius = head_3d_grid_radius
@@ -550,6 +586,13 @@ class Decoder(nn.Module):
         self.norm0s = nn.ModuleList([AdaptiveLayerNorm(embed_dim) for _ in range(num_layers)])
         self.norm1s = nn.ModuleList([AdaptiveLayerNorm(embed_dim) for _ in range(num_layers)])
         self.norm2s = nn.ModuleList([AdaptiveLayerNorm(embed_dim) for _ in range(num_layers)])
+
+        if self.use_temporal_self_attention:
+            self.temporal_attns = nn.ModuleList([
+                TemporalSelfAttention(embed_dim=embed_dim, num_heads=num_heads)
+                for _ in range(num_layers)
+            ])
+            self.norm_ts = nn.ModuleList([AdaptiveLayerNorm(embed_dim) for _ in range(num_layers)])
 
         # Per-mode output heads: index 0 = 2D, index 1 = 3D
         head_3d_out = head_3d_grid_size ** 3 if output_mode == 'grid' else 3
@@ -601,25 +644,35 @@ class Decoder(nn.Module):
         """
         Args:
             scene_features: [N_cams, B, N_tokens, encoder_dim] from SceneRepresentation
-            query_embeds: [B, T_query, N_cams, embed_dim] from QueryEncoder
-            rays: [B, T_query, N_cams, 4, 4]
+            query_embeds: [B, T, K, N_cams, embed_dim]  T=frames, K=points
+            rays: [B, T, K, N_cams, 4, 4]
             mode_idx: LongTensor of shape [1] — 0 for 2D queries, 1 for 3D queries
         Returns:
-            outputs: [B, T_query, N_cams, 9]
+            outputs: [B, T, K, N_cams, out_dim]
         """
-        B, T_query, N_cams, embed_dim = query_embeds.shape
+        B, T, K, N_cams, embed_dim = query_embeds.shape
         assert embed_dim == self.embed_dim
 
         kv = rearrange(scene_features, 'cams b tokens dim -> (cams b) tokens dim')
-        x = rearrange(query_embeds, 'b t cams dim -> (cams b) t dim')
-        rays_r = rearrange(rays, 'b t cams d e -> (b t) cams d e')
+        x = rearrange(query_embeds, 'b t k cams dim -> (cams b) (t k) dim')
+        rays_r = rearrange(rays, 'b t k cams d e -> (b t k) cams d e')
 
         for layer_idx in range(self.num_layers):
             if self.use_camera_self_attention:
-                x_cam = rearrange(x, '(cams b) t dim -> (b t) cams dim', b=B, cams=N_cams, t=T_query)
+                x_cam = rearrange(x, '(cams b) (t k) dim -> (b t k) cams dim',
+                                  b=B, cams=N_cams, t=T, k=K)
                 attn_out = self.camera_attns[layer_idx](self.norm0s[layer_idx](x_cam, mode_idx), rays_r)
                 x_cam = x_cam + attn_out
-                x = rearrange(x_cam, '(b t) cams dim -> (cams b) t dim', b=B, cams=N_cams, t=T_query)
+                x = rearrange(x_cam, '(b t k) cams dim -> (cams b) (t k) dim',
+                              b=B, cams=N_cams, t=T, k=K)
+
+            if self.use_temporal_self_attention:
+                x_t = rearrange(x, '(cams b) (t k) dim -> (cams b k) t dim',
+                                cams=N_cams, b=B, t=T, k=K)
+                attn_out = self.temporal_attns[layer_idx](self.norm_ts[layer_idx](x_t, mode_idx))
+                x_t = x_t + attn_out
+                x = rearrange(x_t, '(cams b k) t dim -> (cams b) (t k) dim',
+                              cams=N_cams, b=B, t=T, k=K)
 
             x_normed = self.norm1s[layer_idx](x, mode_idx)
             attn_out, _ = self.cross_attns[layer_idx](
@@ -643,4 +696,5 @@ class Decoder(nn.Module):
         out_conf_3d = self.heads_conf_3d[m](x)
         output = torch.cat([out_3d, out_2d, out_vis, out_conf, out_depth, out_conf_3d], dim=-1)
 
-        return rearrange(output, '(cams b) t dim -> b t cams dim', cams=N_cams, b=B)
+        return rearrange(output, '(cams b) (t k) dim -> b t k cams dim',
+                         cams=N_cams, b=B, t=T, k=K)

@@ -32,6 +32,7 @@ class TrackerEncoder(nn.Module):
                  latent_dim = 1024, n_heads = 8,
                  n_time_space_blocks = 6, embedding_factor = 4,
                  use_camera_self_attention = False,
+                 use_temporal_self_attention = False,
                  mode_3d = 'encoder',
                  output_mode = 'direct',
                  scene_encoder_proj = False,
@@ -74,6 +75,7 @@ class TrackerEncoder(nn.Module):
         self.n_time_space_blocks = n_time_space_blocks
         self.embedding_factor = embedding_factor
         self.use_camera_self_attention = use_camera_self_attention
+        self.use_temporal_self_attention = use_temporal_self_attention
         self.output_mode = output_mode
         self.scene_encoder_proj = scene_encoder_proj
 
@@ -112,6 +114,7 @@ class TrackerEncoder(nn.Module):
             num_layers=n_time_space_blocks,
             mlp_ratio=embedding_factor,
             use_camera_self_attention=self.use_camera_self_attention,
+            use_temporal_self_attention=self.use_temporal_self_attention,
             output_mode=self.output_mode,
             head_3d_grid_size=head_3d_grid_size,
             head_3d_grid_radius=head_3d_grid_radius,
@@ -192,6 +195,8 @@ class TrackerEncoder(nn.Module):
             target_time = target_time,
             cube_scale = cube_scale
         )
+        # Reshape from flat (b, t*n, cams, d) → explicit (b, t, n, cams, d) for Decoder
+        query_embeds = rearrange(query_embeds, 'b (t n) cams d -> b t n cams d', t=T, n=N)
 
         if R == 3:
             p2d_query = project_points_torch(camera_group, query_coords) # [cams, b, (t n), 2]
@@ -207,13 +212,11 @@ class TrackerEncoder(nn.Module):
                 rays_per_b.append(points_to_rays(camera_group[i], p2d_ib, cube_scale_shared[b]))
             query_rays_per_cam.append(torch.stack(rays_per_b, dim=0))  # (B, T*N, 4, 4)
         query_rays_flat = torch.stack(query_rays_per_cam, dim=0)  # (cams, B, T*N, 4, 4)
-        query_rays = rearrange(query_rays_flat, 'cams b (t n) d e -> b (t n) cams d e', t=T, n=N)
+        query_rays = rearrange(query_rays_flat, 'cams b (t n) d e -> b t n cams d e', t=T, n=N)
 
         mode_idx = torch.tensor([1 if R == 3 else 0], dtype=torch.long, device=query_embeds.device)
         outputs = self.decoder(scene_features, query_embeds, query_rays, mode_idx)
-        outputs = rearrange(outputs,
-                            'b (t n) cams outdim -> cams b t n outdim',
-                            t=T, n=N)
+        outputs = rearrange(outputs, 'b t n cams outdim -> cams b t n outdim')
 
         points_3d_raw, points_pred, vis_pred_2d_logits, conf_pred_2d_logits, depth_pred, conf_3d_logits = torch.split(
             outputs, [3, 2, 1, 1, 1, 1], dim=-1
