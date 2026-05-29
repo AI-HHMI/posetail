@@ -634,6 +634,10 @@ class Decoder(nn.Module):
         elif self.output_mode == 'residual':
             self.scale_3d = nn.Parameter(torch.tensor([1.0]))
             self.scale_2d = nn.Parameter(torch.tensor([1.0]))
+        elif self.output_mode == 'resdirect':
+            # Per-mode: index 0 = 2D-query head (direct), index 1 = 3D-query head (residual)
+            self.scale_3d = nn.Parameter(torch.tensor([500.0, 1.0]))
+            self.scale_2d = nn.Parameter(torch.tensor([1.0]))
         else:  # grid
             self.scale_3d = nn.Parameter(torch.tensor([500.0]))
             self.scale_2d = nn.Parameter(torch.tensor([128.0]))
@@ -688,7 +692,8 @@ class Decoder(nn.Module):
             prob_3d = F.softmax(logits_3d, dim=-1)
             out_3d = (prob_3d @ self.grid_offsets_3d) * self.scale_3d
         else:
-            out_3d = self.heads_3d[m](x) * self.scale_3d
+            scale_3d = self.scale_3d[m] if self.output_mode == 'resdirect' else self.scale_3d
+            out_3d = self.heads_3d[m](x) * scale_3d
         out_2d      = self.heads_2d[m](x) * self.scale_2d
         out_vis     = self.heads_vis[m](x)
         out_conf    = self.heads_conf[m](x)

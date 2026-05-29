@@ -79,7 +79,7 @@ class TrackerEncoder(nn.Module):
         self.output_mode = output_mode
         self.scene_encoder_proj = scene_encoder_proj
 
-        assert output_mode in ['direct', 'residual', 'grid'], 'output_mode should be "direct", "residual", or "grid"'
+        assert output_mode in ['direct', 'residual', 'grid', 'resdirect'], 'output_mode should be "direct", "residual", "grid", or "resdirect"'
         
         # self.transform_norm = transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)
         self.transform_norm = transforms.Compose([
@@ -239,7 +239,7 @@ class TrackerEncoder(nn.Module):
         depth_pred_scaled = F.softplus(depth_pred[..., 0]) * rearrange(cube_scale, 'cams b -> cams b 1 1')
 
 
-        if self.output_mode == 'residual':
+        if self.output_mode in ('residual', 'resdirect'):
             # Predict offsets instead of absolute bounded coordinates
             points_pred_scaled = p2d_query + points_pred
         elif self.output_mode == 'direct' or self.output_mode == 'grid':
@@ -290,13 +290,15 @@ class TrackerEncoder(nn.Module):
         
         p3d_cams = points_3d_raw * rearrange(cube_scale, 'cams b -> cams b 1 1 1')
 
-        if self.output_mode == 'residual':
+        add_residual = (self.output_mode == 'residual') or \
+                       (self.output_mode == 'resdirect' and R == 3)
+        if add_residual:
             if R == 3:
                 query_world = repeat(
                     rearrange(query_coords, 'b (t n) r -> b t n r', t=T, n=N),
                     'b t n r -> cams b t n r', cams=n_cams)
             elif R == 2:
-                # index points_3d_rays using query_times to get predicted 3d query points
+                # only reachable for output_mode == 'residual'
                 t_idx = repeat(query_times, 'b n -> b 1 n r', r=3)
                 query_3d = torch.gather(points_3d_rays, dim=1, index=t_idx)  # (b, 1, n, 3)
                 query_world = repeat(query_3d, 'b 1 n r -> cams b t n r', t=T, cams=n_cams)
