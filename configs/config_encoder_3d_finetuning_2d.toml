@@ -33,9 +33,16 @@ query_edge_bias = 100.0
 prop_dynamic_kpts_to_sample = 0.95
 prob_2d_only = 0.25
 no_nan_coords = false
+
 crop_3d_enabled = true
-crop_3d_fraction = [0.025, 0.6]
-crop_3d_prob = 0.5
+crop_3d_fraction = [0.05, 0.75]
+crop_3d_prob = 0.4
+
+[dataset.train.curriculum]
+enabled = true
+ramp_start_frac = 0.0
+ramp_end_frac   = 0.05
+intensity_floor = 0.0
 
 [dataset.val]
 split_dir = 'val'
@@ -86,6 +93,7 @@ n_heads = 8
 n_time_space_blocks = 8
 embedding_factor = 4
 use_camera_self_attention = true
+use_temporal_self_attention = true
 output_mode = "direct" # direct, residual, grid
 scene_encoder_proj = false
 head_3d_grid_size = 16
@@ -121,8 +129,14 @@ seed = 3
 # direct 3d - with 2d + crop
 # checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260521_145939-4llma99f/files/checkpoints/checkpoint_00399996.pth'
 
-# direct 3d - with more aug and smooth
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260522_232104-k6kvynm9/files/checkpoints/checkpoint_00399996.pth'
+# direct - with more aug and smooth
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260522_232104-k6kvynm9/files/checkpoints/checkpoint_00399996.pth'
+
+# direct - with stronger crop aug
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260524_135448-f6x7atc3/files/checkpoints/checkpoint_00399996.pth'
+
+# direct with temporal attention
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260525_124610-zmxu284i/files/checkpoints/checkpoint_00399996.pth'
 
 finetune = true
 n_iterations = 800000
