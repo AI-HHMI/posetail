@@ -32,7 +32,10 @@ from aniposelib.cameras import CameraGroup, Camera
 from posetail.datasets.utils import disassemble_extrinsics
 from posetail.posetail.cube import project_points_torch
 from posetail.posetail.tracker_encoder import TrackerEncoder
-from train_utils import dict_to_device, load_config, load_checkpoint, format_camera_group, _recompute_ortho_derived
+from train_utils import (
+    dict_to_device, load_config, load_checkpoint, format_camera_group,
+    _recompute_ortho_derived, _orient_ortho_proj_dir,
+)
 
 
 class ImageFolderReader:
@@ -317,6 +320,9 @@ def run_tracker_encoder_on_videos(
     model.eval()
 
     camera_group = camera_group_to_device(camera_group, device)
+
+    # Orient ortho proj_dir so signed depth > 0 for the query points
+    _orient_ortho_proj_dir(camera_group, query_points_3d)
 
     readers, reader_lengths = build_video_readers(video_paths)
 

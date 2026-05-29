@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from inference_video import load_model_from_base_folder, resize_camera_group
 from posetail.posetail.tracker_encoder import TrackerEncoder
-from train_utils import load_checkpoint, load_config
+from train_utils import load_checkpoint, load_config, _orient_ortho_proj_dir
 
 _gpu_lock = asyncio.Lock()
 
@@ -223,6 +223,9 @@ async def predict(
         query_times = torch.tensor(
             query_times_list, dtype=torch.int32, device=device
         ).unsqueeze(0)
+
+    if camera_group and camera_group[0]['type'] == 'orthographic':
+        _orient_ortho_proj_dir(camera_group, coords)
 
     async with _gpu_lock:
         with torch.no_grad():

@@ -147,6 +147,8 @@ class TrackerEncoder(nn.Module):
         n_cams = len(views)
 
         assert len(views) == len(camera_group), "views should match number of cameras"
+        assert all(c['type'] == camera_group[0]['type'] for c in camera_group), \
+            "Mixed camera types within a camera_group are not supported"
         
         if R == 2:
             assert len(views) == 1, "should only have 1 view for 2d input"
@@ -235,12 +237,7 @@ class TrackerEncoder(nn.Module):
         # depths_query_shaped = rearrange(depths_query, 'b t n cams -> cams b t n')
         # depth_pred_scaled = depths_query_shaped + depth_pred[..., 0] * cube_scale * self.depth_scale
 
-        # Softplus for depth prediction (perspective). Orthographic depth is
-        # signed (proj_dir-aligned) so no softplus.
-        if camera_group[0]['type'] == 'orthographic':
-            depth_pred_scaled = depth_pred[..., 0] * rearrange(cube_scale, 'cams b -> cams b 1 1')
-        else:
-            depth_pred_scaled = F.softplus(depth_pred[..., 0]) * rearrange(cube_scale, 'cams b -> cams b 1 1')
+        depth_pred_scaled = F.softplus(depth_pred[..., 0]) * rearrange(cube_scale, 'cams b -> cams b 1 1')
 
 
         if self.output_mode in ('residual', 'resdirect'):

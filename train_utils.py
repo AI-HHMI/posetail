@@ -266,6 +266,27 @@ def format_orthographic_camera(L, cam_name, size, device, offset=None):
     return cam
 
 
+def _orient_ortho_proj_dir(cgroup, coords):
+    """Flip proj_dir per ortho cam so median (coords . proj_dir) > 0.
+
+    coords: tensor of 3D points (any shape with last dim 3). NaN/inf-tolerant.
+    No-op for samples with no finite points or for non-ortho cameras.
+    """
+    coords_flat = coords.reshape(-1, 3)
+    finite = torch.isfinite(coords_flat).all(dim=-1)
+    pts = coords_flat[finite]
+    if pts.shape[0] == 0:
+        return cgroup
+    for cam in cgroup:
+        if cam.get('type') != 'orthographic':
+            continue
+        pd = cam['proj_dir'].to(device=pts.device, dtype=pts.dtype)
+        signed = pts @ pd
+        if torch.median(signed) < 0:
+            cam['proj_dir'] = -cam['proj_dir']
+    return cgroup
+
+
 def format_camera_group(camera_group, offset_dict, cam_type, device):
     if cam_type == 'orthographic':
         out = []

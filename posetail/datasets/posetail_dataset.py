@@ -14,7 +14,10 @@ from einops import rearrange
 
 from posetail.datasets.utils import get_dirs, load_yaml, disassemble_extrinsics, format_sample_input
 from posetail.posetail.cube import project_points_torch, is_point_visible
-from train_utils import format_camera_group, dict_to_device, _recompute_ortho_derived
+from train_utils import (
+    format_camera_group, dict_to_device, _recompute_ortho_derived,
+    _orient_ortho_proj_dir,
+)
 
 from pprint import pprint
 
@@ -397,9 +400,13 @@ class PosetailDataset(Dataset):
 
   
         # load cameras
-        cgroup, offset_dict, cam_type = self._load_cameras(row['camera_metadata_path']) 
-        cgroup = cgroup.subset_cameras_names(cam_names)
-        cgroup = format_camera_group(cgroup, offset_dict, cam_type, device = 'cpu')
+        cgroup, offset_dict, cam_type = self._load_cameras(row['camera_metadata_path'])
+        if cam_type == 'orthographic':
+            name_to_entry = {e['name']: e for e in cgroup}
+            cgroup = [name_to_entry[n] for n in cam_names if n in name_to_entry]
+        else:
+            cgroup = cgroup.subset_cameras_names(cam_names)
+        cgroup = format_camera_group(cgroup, offset_dict, cam_type, device='cpu')
 
 
         # per-camera image-plane rotation augmentation (before cropping)
@@ -598,7 +605,12 @@ class PosetailDataset(Dataset):
 
 
         # p2d = project_points_torch(cgroup, coords) # (cams, t, n_kpts, 2)
-        
+
+        # Orient ortho proj_dir so signed depth > 0 for visible GT points. Done after
+        # all augmentations so the final stored proj_dir matches the final coords frame.
+        if cam_type == 'orthographic':
+            _orient_ortho_proj_dir(cgroup, coords)
+
         return views, coords, vis, fnums, cgroup, row, query_times, vis_2d, p2d
 
 

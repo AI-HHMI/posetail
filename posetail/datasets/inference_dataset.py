@@ -16,7 +16,10 @@ from einops import rearrange
 
 from posetail.datasets.utils import get_dirs, load_yaml, disassemble_extrinsics, format_sample_input
 from posetail.posetail.cube import project_points_torch, is_point_visible
-from train_utils import format_camera_group, dict_to_device, _recompute_ortho_derived
+from train_utils import (
+    format_camera_group, dict_to_device, _recompute_ortho_derived,
+    _orient_ortho_proj_dir,
+)
 
 
 
@@ -106,13 +109,20 @@ class PosetailInferenceDataset(Dataset):
             vis = rearrange(vis, 's t n c -> t (s n) c') # (time, n_kpts, cams)
 
         # load camera group and optionally sample camera views
-        cgroup, offset_dict, cam_type = self._load_cameras(row['camera_metadata_path']) 
-        cam_names = sorted([cam.name for cam in cgroup.cameras]) 
+        cgroup, offset_dict, cam_type = self._load_cameras(row['camera_metadata_path'])
+        if cam_type == 'orthographic':
+            cam_names = sorted([e['name'] for e in cgroup])
+        else:
+            cam_names = sorted([cam.name for cam in cgroup.cameras])
 
-        if self.cams_to_sample: 
+        if self.cams_to_sample:
             coords, vis, cam_names = self.sample_cameras(coords, vis, cam_names)
 
-        cgroup = cgroup.subset_cameras_names(cam_names)
+        if cam_type == 'orthographic':
+            name_to_entry = {e['name']: e for e in cgroup}
+            cgroup = [name_to_entry[n] for n in cam_names if n in name_to_entry]
+        else:
+            cgroup = cgroup.subset_cameras_names(cam_names)
         cgroup = format_camera_group(cgroup, offset_dict, cam_type, device = 'cpu')
 
         # if there is no vis provided, a point is considered visible
@@ -144,18 +154,21 @@ class PosetailInferenceDataset(Dataset):
 
         # resize cameras
         cgroup = self.resize_camera_group(cgroup)
-        
-        # load image/video data 
+
+        # load image/video data
         img_path = row['img_path']
         video_paths = glob.glob(os.path.join(img_path, '*.mp4'))
 
-        # data is in image format 
-        if len(video_paths) == 0: 
+        # data is in image format
+        if len(video_paths) == 0:
             views = self.load_images(img_path, cgroup, start_ix, end_ix, interval)
 
         # data is in video format
         else:
             views = self.load_videos(video_paths, cgroup, start_ix, end_ix, interval)
+
+        if cam_type == 'orthographic':
+            _orient_ortho_proj_dir(cgroup, coords)
 
         return views, coords, vis, fnums, cgroup, row
     

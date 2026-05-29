@@ -354,12 +354,11 @@ class QueryEncoder(nn.Module):
             cs_bnc = rearrange(cube_scale, 'cams b -> b 1 cams')
             if camera_group[0]['type'] == 'orthographic':
                 proj_dirs = torch.stack([cam['proj_dir'] for cam in camera_group]).to(query_coords.dtype)
-                signed = einsum(qc, proj_dirs, 'b t cams r, cams r -> b t cams')
-                depths = (signed / cs_bnc) * self.depth_norm_scale
+                raw_depths = einsum(qc, proj_dirs, 'b t cams r, cams r -> b t cams') / cs_bnc
             else:
                 centers = torch.stack([cam['center'] for cam in camera_group]).to(query_coords.dtype)
                 raw_depths = torch.linalg.norm(qc - centers, dim=-1) / cs_bnc
-                depths = torch.log(raw_depths + 1e-6) * self.depth_norm_scale
+            depths = torch.log(raw_depths.clamp_min(1e-6)) * self.depth_norm_scale
             dr = rearrange(depths, 'b t ncams -> b t ncams 1')
             fourier_depth = get_fourier_encoding(dr, min_freq=0, max_freq=self.max_freq)
             fourier_depth = torch.cat([dr, fourier_depth], dim=-1)
