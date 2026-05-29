@@ -37,6 +37,13 @@ def from_homogeneous(p, eps=1e-10):
 
 # @torch.compile
 def project_cam(cam, p3d_t, downsample_factor = 1, max_normalized = 3.0):
+    if cam['type'] == 'orthographic':
+        P = cam['proj_mat']
+        p2d = to_homogeneous(p3d_t) @ P[:2].T
+        if 'offset' in cam:
+            p2d = p2d - cam['offset'][None, :]
+        return p2d / downsample_factor
+
     # p3d_t = torch.as_tensor(p3d)
     # ext_t = torch.as_tensor(cam.get_extrinsics_mat(), dtype=p3d_t.dtype, device=p3d_t.device)
     # mat_t = torch.as_tensor(cam.get_camera_matrix(), dtype=p3d_t.dtype, device=p3d_t.device)
@@ -197,6 +204,8 @@ def triangulate_simple_batch_reg(points, camera_mats, weights):
 
 
 def undistort_points(cam, points):
+    if cam['type'] == 'orthographic':
+        return points + cam['offset']
     matrix = cam['mat']
     dist = cam['dist']
     offset = cam['offset']
@@ -229,6 +238,9 @@ def undistort_points(cam, points):
 def projection_sensitivity(cam, p):
     p = p.float()
     n_points = p.shape[0]
+    if cam['type'] == 'orthographic':
+        A = cam['proj_mat'][:2, :3].to(torch.float64)
+        return A.unsqueeze(0).expand(n_points, -1, -1)
     fx = cam['mat'][0,0]
     fy = cam['mat'][1,1]
     ext_t = cam['ext'].float()
@@ -263,11 +275,14 @@ def is_point_visible(cam, p3d, margin=0):
 
     # check if in bounds
     in_bounds = (
-        (p2d[:, 0] >= margin) & 
+        (p2d[:, 0] >= margin) &
         (p2d[:, 0] < w - margin) &
-        (p2d[:, 1] >= margin) & 
+        (p2d[:, 1] >= margin) &
         (p2d[:, 1] < h - margin)
     )
+
+    if cam['type'] == 'orthographic':
+        return in_bounds
 
     # check if point is in front of camera
     p_cam = torch.matmul(to_homogeneous(p3d), cam['ext'].T)[:, :3]
@@ -488,6 +503,42 @@ def _invert_SE3(transforms: torch.Tensor) -> torch.Tensor:
 
 
 
+def _points_to_rays_orthographic(cam, p2d, cube_scale=1, normalize_t=True):
+    """Orthographic counterpart to points_to_rays.
+
+    Ray direction is constant (proj_dir); origin is the lifted pixel in world.
+    """
+    B = p2d.shape[0]
+    device = p2d.device
+    dtype = p2d.dtype
+
+    P = cam['proj_mat']
+    A_pinv = cam['A_pinv']
+    proj_dir = cam['proj_dir']
+
+    p_full = undistort_points(cam, p2d)                     # [B, 2] full-image pixels
+    t_proj = P[:2, 3]                                       # [2]
+    origin = einsum(A_pinv, p_full - t_proj, 'i j, b j -> b i')  # [B, 3]
+
+    if normalize_t:
+        origin = origin / (cube_scale * 200.0)
+
+    z_ray = repeat(proj_dir.to(dtype), 'c -> b c', b=B)
+    cam_y = repeat(F.normalize(P[1, :3].to(dtype), dim=-1, eps=1e-8),
+                   'c -> b c', b=B)
+    x_ray = F.normalize(torch.cross(cam_y, z_ray, dim=-1), dim=-1, eps=1e-8)
+    y_ray = F.normalize(torch.cross(z_ray, x_ray, dim=-1), dim=-1, eps=1e-8)
+
+    R_w2r = torch.stack([x_ray, y_ray, z_ray], dim=1)        # [B, 3, 3]
+    t_w2r = -einsum(R_w2r, origin, 'b i j, b j -> b i')      # [B, 3]
+
+    ray_matrices = torch.zeros(B, 4, 4, device=device, dtype=dtype)
+    ray_matrices[:, :3, :3] = R_w2r
+    ray_matrices[:, :3, 3] = t_w2r
+    ray_matrices[:, 3, 3] = 1.0
+    return ray_matrices
+
+
 def points_to_rays(cam, p2d, cube_scale=1, normalize_t=True):
     """Inputs:
     cam: camera dict
@@ -496,6 +547,9 @@ def points_to_rays(cam, p2d, cube_scale=1, normalize_t=True):
     Outputs:
     ray_matrices: [B, 4, 4]
     """
+    if cam['type'] == 'orthographic':
+        return _points_to_rays_orthographic(
+            cam, p2d, cube_scale=cube_scale, normalize_t=normalize_t)
     B = p2d.shape[0]
     device = p2d.device
     dtype = p2d.dtype

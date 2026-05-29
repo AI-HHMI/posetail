@@ -235,8 +235,12 @@ class TrackerEncoder(nn.Module):
         # depths_query_shaped = rearrange(depths_query, 'b t n cams -> cams b t n')
         # depth_pred_scaled = depths_query_shaped + depth_pred[..., 0] * cube_scale * self.depth_scale
 
-        # Softplus for depth prediction
-        depth_pred_scaled = F.softplus(depth_pred[..., 0]) * rearrange(cube_scale, 'cams b -> cams b 1 1')
+        # Softplus for depth prediction (perspective). Orthographic depth is
+        # signed (proj_dir-aligned) so no softplus.
+        if camera_group[0]['type'] == 'orthographic':
+            depth_pred_scaled = depth_pred[..., 0] * rearrange(cube_scale, 'cams b -> cams b 1 1')
+        else:
+            depth_pred_scaled = F.softplus(depth_pred[..., 0]) * rearrange(cube_scale, 'cams b -> cams b 1 1')
 
 
         if self.output_mode in ('residual', 'resdirect'):
@@ -249,37 +253,73 @@ class TrackerEncoder(nn.Module):
   
       
         
-        points_und = torch.stack([
-            undistort_points(camera_group[i], points_pred_scaled[i])
-            for i in range(len(camera_group))
-        ])
+        if camera_group[0]['type'] == 'orthographic':
+            points_und = torch.stack([
+                undistort_points(camera_group[i], points_pred_scaled[i])
+                for i in range(len(camera_group))
+            ])  # cams b t n 2, full-image pixels
 
-        # # get 3d points from each cameras using rays
-        rays_norm = to_homogeneous(points_und)
-        rot_mats = torch.stack([cam['ext'][:3,:3] for cam in camera_group])
-        rays_world = einsum(rays_norm, rot_mats, 'cams b t n r, cams r x -> cams b t n x')
-        rays_world = F.normalize(rays_world, dim=-1)
+            A_pinvs = torch.stack([cam['A_pinv'] for cam in camera_group])      # cams 3 2
+            t_projs = torch.stack([cam['proj_mat'][:2, 3] for cam in camera_group])  # cams 2
+            proj_dirs = torch.stack([cam['proj_dir'] for cam in camera_group])  # cams 3
 
-        centers = torch.stack([cam['center'] for cam in camera_group])
-        cadd = repeat(centers, 'cams r -> cams 1 1 1 r')
-        points_3d_all_rays = cadd + einsum(rays_world, depth_pred_scaled,
-                                      'cams b t n r, cams b t n -> cams b t n r')
-        points_3d_rays = einsum(points_3d_all_rays, conf_pred_2d[..., 0],
-                                'cams b t n r, cams b t n -> b t n r')
+            offset = points_und - rearrange(t_projs, 'cams r -> cams 1 1 1 r')
+            origins = einsum(A_pinvs, offset, 'cams r i, cams b t n i -> cams b t n r')
+            pd = rearrange(proj_dirs, 'cams r -> cams 1 1 1 r')
+            points_3d_all_rays = origins + pd * rearrange(
+                depth_pred_scaled, 'cams b t n -> cams b t n 1')
+            points_3d_rays = einsum(points_3d_all_rays, conf_pred_2d[..., 0],
+                                    'cams b t n r, cams b t n -> b t n r')
 
-
-        # triangulate points
-        if n_cams > 1:
-            points_und_flat = rearrange(points_und, 'cams b t n r -> cams (b t n) r')
-            camera_mats = torch.stack([cam['ext'] for cam in camera_group])
-            weights = rearrange(conf_pred_2d, 'cams b t n 1 -> cams (b t n)')
-            points_und_flat = torch.clip(points_und_flat, -2, 2)
-            points_3d_flat = triangulate_simple_batch(points_und_flat.to(torch.float32),
-                                                      camera_mats.to(torch.float32),
-                                                      weights.to(torch.float32)).to(points_und_flat.dtype)
-            points_3d_tri = rearrange(points_3d_flat, '(b t n) r -> b t n r', b=B, t=T, n=N)
+            # triangulate using 4x4-padded proj_mat with full-pixel coords (no clip)
+            if n_cams > 1:
+                points_und_flat = rearrange(points_und, 'cams b t n r -> cams (b t n) r')
+                proj_mats = torch.stack([cam['proj_mat'] for cam in camera_group])
+                camera_mats = torch.zeros(
+                    (proj_mats.shape[0], 4, 4),
+                    device=proj_mats.device, dtype=proj_mats.dtype)
+                camera_mats[:, :3, :] = proj_mats
+                camera_mats[:, 3, 3] = 1.0
+                weights = rearrange(conf_pred_2d, 'cams b t n 1 -> cams (b t n)')
+                points_3d_flat = triangulate_simple_batch(
+                    points_und_flat.to(torch.float32),
+                    camera_mats.to(torch.float32),
+                    weights.to(torch.float32)).to(points_und_flat.dtype)
+                points_3d_tri = rearrange(points_3d_flat, '(b t n) r -> b t n r', b=B, t=T, n=N)
+            else:
+                points_3d_tri = None
         else:
-            points_3d_tri = None
+            points_und = torch.stack([
+                undistort_points(camera_group[i], points_pred_scaled[i])
+                for i in range(len(camera_group))
+            ])
+
+            # # get 3d points from each cameras using rays
+            rays_norm = to_homogeneous(points_und)
+            rot_mats = torch.stack([cam['ext'][:3,:3] for cam in camera_group])
+            rays_world = einsum(rays_norm, rot_mats, 'cams b t n r, cams r x -> cams b t n x')
+            rays_world = F.normalize(rays_world, dim=-1)
+
+            centers = torch.stack([cam['center'] for cam in camera_group])
+            cadd = repeat(centers, 'cams r -> cams 1 1 1 r')
+            points_3d_all_rays = cadd + einsum(rays_world, depth_pred_scaled,
+                                          'cams b t n r, cams b t n -> cams b t n r')
+            points_3d_rays = einsum(points_3d_all_rays, conf_pred_2d[..., 0],
+                                    'cams b t n r, cams b t n -> b t n r')
+
+
+            # triangulate points
+            if n_cams > 1:
+                points_und_flat = rearrange(points_und, 'cams b t n r -> cams (b t n) r')
+                camera_mats = torch.stack([cam['ext'] for cam in camera_group])
+                weights = rearrange(conf_pred_2d, 'cams b t n 1 -> cams (b t n)')
+                points_und_flat = torch.clip(points_und_flat, -2, 2)
+                points_3d_flat = triangulate_simple_batch(points_und_flat.to(torch.float32),
+                                                          camera_mats.to(torch.float32),
+                                                          weights.to(torch.float32)).to(points_und_flat.dtype)
+                points_3d_tri = rearrange(points_3d_flat, '(b t n) r -> b t n r', b=B, t=T, n=N)
+            else:
+                points_3d_tri = None
 
         
         # direct residual predictions

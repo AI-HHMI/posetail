@@ -319,7 +319,9 @@ class QueryEncoder(nn.Module):
 
         if self.principal_point_embedding:
             principal_pt = torch.stack([
-                (cam['mat'][:2, 2] - cam['offset']).to(query_coords.dtype)
+                (cam['size'].to(query_coords.dtype) * 0.5
+                 if cam['type'] == 'orthographic'
+                 else (cam['mat'][:2, 2] - cam['offset']).to(query_coords.dtype))
                 for cam in camera_group
             ])  # [n_cams, 2]
             principal_pt_norm = principal_pt / sizes * 2.0 - 1.0       # [n_cams, 2]
@@ -348,11 +350,16 @@ class QueryEncoder(nn.Module):
         # Depth, visibility, volume: computed for 3D; missing tokens for 2D
         if coord_dim == 3:
             # Depth
-            centers = torch.stack([cam['center'] for cam in camera_group]).to(query_coords.dtype)
             qc = rearrange(query_coords, 'b t r -> b t 1 r')
             cs_bnc = rearrange(cube_scale, 'cams b -> b 1 cams')
-            raw_depths = torch.linalg.norm(qc - centers, dim=-1) / cs_bnc
-            depths = torch.log(raw_depths + 1e-6) * self.depth_norm_scale
+            if camera_group[0]['type'] == 'orthographic':
+                proj_dirs = torch.stack([cam['proj_dir'] for cam in camera_group]).to(query_coords.dtype)
+                signed = einsum(qc, proj_dirs, 'b t cams r, cams r -> b t cams')
+                depths = (signed / cs_bnc) * self.depth_norm_scale
+            else:
+                centers = torch.stack([cam['center'] for cam in camera_group]).to(query_coords.dtype)
+                raw_depths = torch.linalg.norm(qc - centers, dim=-1) / cs_bnc
+                depths = torch.log(raw_depths + 1e-6) * self.depth_norm_scale
             dr = rearrange(depths, 'b t ncams -> b t ncams 1')
             fourier_depth = get_fourier_encoding(dr, min_freq=0, max_freq=self.max_freq)
             fourier_depth = torch.cat([dr, fourier_depth], dim=-1)

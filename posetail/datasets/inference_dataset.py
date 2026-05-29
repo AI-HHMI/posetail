@@ -16,7 +16,7 @@ from einops import rearrange
 
 from posetail.datasets.utils import get_dirs, load_yaml, disassemble_extrinsics, format_sample_input
 from posetail.posetail.cube import project_points_torch, is_point_visible
-from train_utils import format_camera_group, dict_to_device
+from train_utils import format_camera_group, dict_to_device, _recompute_ortho_derived
 
 
 
@@ -224,7 +224,7 @@ class PosetailInferenceDataset(Dataset):
         return views
 
 
-    def resize_camera_group(self, cgroup): 
+    def resize_camera_group(self, cgroup):
 
         # resize cameras
         if self.max_res != -1:
@@ -239,8 +239,15 @@ class PosetailInferenceDataset(Dataset):
                 size = cam['size']
                 scale = float(target_res) / max(size)
                 cam['size'] = torch.round(size * scale).to(torch.int32)
-                cam['mat'] = cam['mat'] * scale
-                cam['mat'][2, 2] = 1
+
+                if cam['type'] == 'orthographic':
+                    P = cam['proj_mat'].clone()
+                    P[:2, :] = P[:2, :] * scale
+                    cam['proj_mat'] = P
+                    _recompute_ortho_derived(cam)
+                else:
+                    cam['mat'] = cam['mat'] * scale
+                    cam['mat'][2, 2] = 1
 
                 if 'offset' in cam:
                     cam['offset'] = cam['offset'] * scale
@@ -402,17 +409,33 @@ class PosetailInferenceDataset(Dataset):
         offset_dict = None
         cam_type = 'pinhole'
 
+        if 'cam_type' in cam_metadata:
+            cam_type = cam_metadata['cam_type']
+
+        if cam_type == 'orthographic':
+            dlt_dict = cam_metadata['dlt_coefficients']
+            heights_dict = cam_metadata['camera_heights']
+            widths_dict = cam_metadata['camera_widths']
+            if 'offset_dict' in cam_metadata:
+                offset_dict = cam_metadata['offset_dict']
+            cam_names = list(dlt_dict.keys())
+            cam_names = sorted(cam_names, key=int) if all(n.isdigit() for n in cam_names) else sorted(cam_names)
+            cgroup = [
+                {'name': n,
+                 'L': list(dlt_dict[n]),
+                 'size': [widths_dict[n], heights_dict[n]]}
+                for n in cam_names
+            ]
+            return cgroup, offset_dict, cam_type
+
         intrinsics_dict = cam_metadata['intrinsic_matrices']
         extrinsics_dict = cam_metadata['extrinsic_matrices']
         distortions_dict = cam_metadata['distortion_matrices']
         heights_dict = cam_metadata['camera_heights']
         widths_dict = cam_metadata['camera_widths']
 
-        if 'offset_dict' in cam_metadata: 
+        if 'offset_dict' in cam_metadata:
             offset_dict = cam_metadata['offset_dict']
-
-        if 'cam_type' in cam_metadata: 
-            cam_type = cam_metadata['cam_type']
 
         # sort camera names either numerically or alphabetically
         cam_names = list(intrinsics_dict.keys())

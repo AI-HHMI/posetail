@@ -14,7 +14,7 @@ from einops import rearrange
 
 from posetail.datasets.utils import get_dirs, load_yaml, disassemble_extrinsics, format_sample_input
 from posetail.posetail.cube import project_points_torch, is_point_visible
-from train_utils import format_camera_group, dict_to_device
+from train_utils import format_camera_group, dict_to_device, _recompute_ortho_derived
 
 from pprint import pprint
 
@@ -829,8 +829,15 @@ class PosetailDataset(Dataset):
             size = cam['size']
             scale = float(target_res) / max(size)
             cam['size'] = torch.round(size * scale).to(torch.int32)
-            cam['mat'] = cam['mat'] * scale
-            cam['mat'][2, 2] = 1
+
+            if cam['type'] == 'orthographic':
+                P = cam['proj_mat'].clone()
+                P[:2, :] = P[:2, :] * scale
+                cam['proj_mat'] = P
+                _recompute_ortho_derived(cam)
+            else:
+                cam['mat'] = cam['mat'] * scale
+                cam['mat'][2, 2] = 1
 
             if 'offset' in cam:
                 cam['offset'] = cam['offset'] * scale
@@ -855,15 +862,20 @@ class PosetailDataset(Dataset):
             cos_a = np.cos(angle_rad)
             sin_a = np.sin(angle_rad)
             w, h = cam['size'].tolist()
-            cx = float(cam['mat'][0, 2].item())
-            cy = float(cam['mat'][1, 2].item())
             off_x = float(cam['offset'][0].item())
             off_y = float(cam['offset'][1].item())
 
-            # rotate around the cropped principal point so the image rotation
-            # matches the extrinsic Z-roll. equals (cx, cy) when offset is 0.
-            center_x = cx - off_x
-            center_y = cy - off_y
+            if cam['type'] == 'orthographic':
+                # rotate around the image center; with offset=0 in practice
+                center_x = w / 2 - off_x
+                center_y = h / 2 - off_y
+            else:
+                cx = float(cam['mat'][0, 2].item())
+                cy = float(cam['mat'][1, 2].item())
+                # rotate around the cropped principal point so the image rotation
+                # matches the extrinsic Z-roll. equals (cx, cy) when offset is 0.
+                center_x = cx - off_x
+                center_y = cy - off_y
             M_2x3 = cv2.getRotationMatrix2D((center_x, center_y), angle, 1.0)
 
             corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float64)
@@ -886,21 +898,31 @@ class PosetailDataset(Dataset):
 
             cam_rot = dict(cam)
 
-            # OpenCV y-down sign convention: R_roll[:2,:2] = [[c, s], [-s, c]]
-            R_roll = torch.eye(4, dtype=cam['ext'].dtype, device=cam['ext'].device)
-            R_roll[0, 0] = cos_a
-            R_roll[0, 1] = sin_a
-            R_roll[1, 0] = -sin_a
-            R_roll[1, 1] = cos_a
-            cam_rot['ext'] = R_roll @ cam['ext']
-            cam_rot['ext_inv'] = torch.linalg.inv(cam_rot['ext'])
-            cam_rot['center'] = -cam_rot['ext'][:3, :3].T @ cam_rot['ext'][:3, 3]
+            if cam['type'] == 'orthographic':
+                M = torch.as_tensor(M_2x3, dtype=cam['proj_mat'].dtype,
+                                    device=cam['proj_mat'].device)
+                P = cam['proj_mat'].clone()
+                P_new = P.clone()
+                P_new[:2, :] = M[:, :2] @ P[:2, :]
+                P_new[:2, 3] = P_new[:2, 3] + M[:, 2]
+                cam_rot['proj_mat'] = P_new
+                _recompute_ortho_derived(cam_rot)
+            else:
+                # OpenCV y-down sign convention: R_roll[:2,:2] = [[c, s], [-s, c]]
+                R_roll = torch.eye(4, dtype=cam['ext'].dtype, device=cam['ext'].device)
+                R_roll[0, 0] = cos_a
+                R_roll[0, 1] = sin_a
+                R_roll[1, 0] = -sin_a
+                R_roll[1, 1] = cos_a
+                cam_rot['ext'] = R_roll @ cam['ext']
+                cam_rot['ext_inv'] = torch.linalg.inv(cam_rot['ext'])
+                cam_rot['center'] = -cam_rot['ext'][:3, :3].T @ cam_rot['ext'][:3, 3]
 
-            # mat[:2,:2] is unchanged (stays diagonal); principal point tracks the
-            # canvas expansion (tx, ty) and the crop offset (x1, y1). offset unchanged.
-            cam_rot['mat'] = cam['mat'].clone()
-            cam_rot['mat'][0, 2] = cam['mat'][0, 2] + tx - x1
-            cam_rot['mat'][1, 2] = cam['mat'][1, 2] + ty - y1
+                # mat[:2,:2] is unchanged (stays diagonal); principal point tracks the
+                # canvas expansion (tx, ty) and the crop offset (x1, y1). offset unchanged.
+                cam_rot['mat'] = cam['mat'].clone()
+                cam_rot['mat'][0, 2] = cam['mat'][0, 2] + tx - x1
+                cam_rot['mat'][1, 2] = cam['mat'][1, 2] + ty - y1
 
             cam_rot['offset'] = cam['offset'].clone()
 
@@ -914,7 +936,7 @@ class PosetailDataset(Dataset):
 
 
     def rotate_camera_group(self, cgroup, coords):
-                
+
         rvec = np.random.uniform(-2*np.pi, 2*np.pi, size=3)
         rotmat, _ = cv2.Rodrigues(np.array(rvec))
         rotmat = torch.as_tensor(rotmat, device=coords.device, dtype=coords.dtype)
@@ -926,16 +948,21 @@ class PosetailDataset(Dataset):
 
         for cam in cgroup:
             cam_rot = dict(cam)
-            cam_rot['ext'] = torch.matmul(cam['ext'], rmat)
-            cam_rot['ext_inv'] = torch.linalg.inv(cam_rot['ext'])
+            if cam['type'] == 'orthographic':
+                rmat_p = rmat.to(cam['proj_mat'].dtype).to(cam['proj_mat'].device)
+                cam_rot['proj_mat'] = cam['proj_mat'] @ rmat_p
+                _recompute_ortho_derived(cam_rot)
+            else:
+                cam_rot['ext'] = torch.matmul(cam['ext'], rmat)
+                cam_rot['ext_inv'] = torch.linalg.inv(cam_rot['ext'])
 
-            R = cam_rot['ext'][:3,:3]
-            t = cam_rot['ext'][:3, 3]
-            cam_rot['center'] = -R.T @ t
+                R = cam_rot['ext'][:3,:3]
+                t = cam_rot['ext'][:3, 3]
+                cam_rot['center'] = -R.T @ t
 
             camera_group_rotated.append(cam_rot)
 
-        cgroup = camera_group_rotated 
+        cgroup = camera_group_rotated
 
         return cgroup, coords
 
@@ -1070,17 +1097,33 @@ class PosetailDataset(Dataset):
         offset_dict = None
         cam_type = 'pinhole'
 
+        if 'cam_type' in cam_metadata:
+            cam_type = cam_metadata['cam_type']
+
+        if cam_type == 'orthographic':
+            dlt_dict = cam_metadata['dlt_coefficients']
+            heights_dict = cam_metadata['camera_heights']
+            widths_dict = cam_metadata['camera_widths']
+            if 'offset_dict' in cam_metadata:
+                offset_dict = cam_metadata['offset_dict']
+            cam_names = list(dlt_dict.keys())
+            cam_names = sorted(cam_names, key=int) if all(n.isdigit() for n in cam_names) else sorted(cam_names)
+            cgroup = [
+                {'name': n,
+                 'L': list(dlt_dict[n]),
+                 'size': [widths_dict[n], heights_dict[n]]}
+                for n in cam_names
+            ]
+            return cgroup, offset_dict, cam_type
+
         intrinsics_dict = cam_metadata['intrinsic_matrices']
         extrinsics_dict = cam_metadata['extrinsic_matrices']
         distortions_dict = cam_metadata['distortion_matrices']
         heights_dict = cam_metadata['camera_heights']
         widths_dict = cam_metadata['camera_widths']
 
-        if 'offset_dict' in cam_metadata: 
+        if 'offset_dict' in cam_metadata:
             offset_dict = cam_metadata['offset_dict']
-
-        if 'cam_type' in cam_metadata: 
-            cam_type = cam_metadata['cam_type']
 
         # sort camera names either numerically or alphabetically
         cam_names = list(intrinsics_dict.keys())

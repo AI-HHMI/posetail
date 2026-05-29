@@ -234,7 +234,47 @@ def format_camera(cam, offset_dict, cam_type, device):
         
     return cam_dict
 
+def _recompute_ortho_derived(cam):
+    P = cam['proj_mat']
+    A = P[:2, :3]
+    pd = torch.linalg.cross(A[0], A[1])
+    pd = pd / torch.linalg.norm(pd)
+    cam['proj_dir'] = pd
+    AAT = A @ A.T
+    cam['A_pinv'] = A.T @ torch.linalg.inv(AAT)
+    return cam
+
+
+def format_orthographic_camera(L, cam_name, size, device, offset=None):
+    L = torch.as_tensor(L, device=device, dtype=torch.float)
+    P = torch.zeros((3, 4), device=device, dtype=torch.float)
+    P[0] = L[0:4]
+    P[1] = L[4:8]
+    P[2, 3] = 1.0
+    cam = {
+        'name': cam_name,
+        'type': 'orthographic',
+        'proj_mat': P,
+        'size': torch.as_tensor(size, device=device, dtype=torch.int),
+        'center': torch.zeros(3, device=device, dtype=torch.float),
+    }
+    if offset is not None:
+        cam['offset'] = torch.as_tensor(offset[:2], device=device, dtype=torch.float)
+    else:
+        cam['offset'] = torch.zeros(2, device=device, dtype=torch.float)
+    _recompute_ortho_derived(cam)
+    return cam
+
+
 def format_camera_group(camera_group, offset_dict, cam_type, device):
+    if cam_type == 'orthographic':
+        out = []
+        for entry in camera_group:
+            name = entry['name']
+            off = offset_dict[name][:2] if offset_dict else None
+            out.append(format_orthographic_camera(
+                entry['L'], name, entry['size'], device, offset=off))
+        return out
     return [format_camera(cam, offset_dict, cam_type, device)
             for cam in camera_group.cameras]
 

@@ -32,7 +32,7 @@ from aniposelib.cameras import CameraGroup, Camera
 from posetail.datasets.utils import disassemble_extrinsics
 from posetail.posetail.cube import project_points_torch
 from posetail.posetail.tracker_encoder import TrackerEncoder
-from train_utils import dict_to_device, load_config, load_checkpoint, format_camera_group
+from train_utils import dict_to_device, load_config, load_checkpoint, format_camera_group, _recompute_ortho_derived
 
 
 class ImageFolderReader:
@@ -186,8 +186,15 @@ def resize_camera_group(camera_group, target_res):
         size = cam['size']
         scale = float(target_res) / max(size)
         cam['size'] = torch.round(size * scale).to(torch.int32)
-        cam['mat'] = cam['mat'] * scale
-        cam['mat'][2, 2] = 1
+
+        if cam['type'] == 'orthographic':
+            P = cam['proj_mat'].clone()
+            P[:2, :] = P[:2, :] * scale
+            cam['proj_mat'] = P
+            _recompute_ortho_derived(cam)
+        else:
+            cam['mat'] = cam['mat'] * scale
+            cam['mat'][2, 2] = 1
 
         if 'offset' in cam:
             cam['offset'] = torch.round(cam['offset'] * scale).to(torch.int32)
@@ -224,6 +231,19 @@ def load_camera_group_from_metadata(metadata_path, device='cpu'):
 
     offset_dict = cam_metadata.get('offset_dict', None)
     cam_type = cam_metadata.get('cam_type', 'pinhole')
+
+    if cam_type == 'orthographic':
+        dlt_dict = cam_metadata['dlt_coefficients']
+        heights_dict = cam_metadata['camera_heights']
+        widths_dict = cam_metadata['camera_widths']
+        cam_names = list(dlt_dict.keys())
+        cam_names = sorted(cam_names, key=int) if all(n.isdigit() for n in cam_names) else sorted(cam_names)
+        cgroup = [
+            {'name': n, 'L': list(dlt_dict[n]),
+             'size': [widths_dict[n], heights_dict[n]]}
+            for n in cam_names
+        ]
+        return format_camera_group(cgroup, offset_dict, cam_type, device=device)
 
     intrinsics_dict = cam_metadata['intrinsic_matrices']
     extrinsics_dict = cam_metadata['extrinsic_matrices']
@@ -510,7 +530,10 @@ def load_trial(trial_path, start_frame=0):
     # Load camera names from metadata to ensure proper ordering
     with open(metadata_path, 'r') as f:
         cam_metadata = yaml.safe_load(f)
-    cam_names = list(cam_metadata['intrinsic_matrices'].keys())
+    name_source = (cam_metadata['dlt_coefficients']
+                   if cam_metadata.get('cam_type') == 'orthographic'
+                   else cam_metadata['intrinsic_matrices'])
+    cam_names = list(name_source.keys())
     if all(n.isdigit() for n in cam_names):
         cam_names = sorted(cam_names, key=int)
     else:

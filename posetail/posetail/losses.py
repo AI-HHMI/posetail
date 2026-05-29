@@ -4,7 +4,7 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 
-from einops import rearrange, repeat
+from einops import rearrange, repeat, einsum
 from posetail.posetail.cube import get_camera_scale, project_points_torch, is_point_visible
 
 from collections import defaultdict
@@ -216,8 +216,14 @@ class TotalLoss(nn.Module):
 
         centers = rearrange(torch.stack([cam['center'] for cam in cgroup]),
                             'cams r -> cams 1 1 1 r')
-        
-        depths_true = torch.linalg.norm(coords_true_cams - centers, dim=-1)[..., None]
+
+        if cgroup[0]['type'] == 'orthographic':
+            proj_dirs = rearrange(torch.stack([cam['proj_dir'] for cam in cgroup]),
+                                  'cams r -> cams 1 1 1 r')
+            depths_true = einsum(coords_true_cams, proj_dirs,
+                                 'cams b t n r, cams b t n r -> cams b t n')[..., None]
+        else:
+            depths_true = torch.linalg.norm(coords_true_cams - centers, dim=-1)[..., None]
         
         if vis_true is None:
             valid_vis = False
@@ -252,7 +258,7 @@ class TotalLoss(nn.Module):
             scale_cb = 1.0
             scale_b  = 1.0
 
-        if p2d is not None:
+        if p2d is not None and cgroup[0]['type'] != 'orthographic':
             coords_true_n, _ = normalize_by_mean_depth(coords_true, vis_true, centers[0])
             coords_true_cams_n, _ = normalize_by_mean_depth(coords_true_cams, vis_true_cams, centers)
             depths_true_n, _ = normalize_by_mean_depth(depths_true, vis_true_cams, 0.0)
@@ -435,7 +441,7 @@ class TotalLoss(nn.Module):
             coords_loss_2d = torch.tensor(0.0, device=device)
 
         if depth_pred is not None:
-            if p2d is not None:
+            if p2d is not None and cgroup[0]['type'] != 'orthographic':
                 pred_n, _ = normalize_by_mean_depth(depth_pred, vis_true_cams, 0.0)
                 coords_loss_depth = self.mae_loss_coords_depth(
                     coords_pred=pred_n, coords_true=depths_true_n,
@@ -451,7 +457,7 @@ class TotalLoss(nn.Module):
         else:
             coords_loss_depth = torch.tensor(0.0, device=device)
 
-        if p2d is not None:
+        if p2d is not None and cgroup[0]['type'] != 'orthographic':
             pred_n_smooth, _ = normalize_by_mean_depth(coords_pred, vis_true, centers[0])
             smoothness_loss_3d = self.smoothness_loss_3d(
                 coords_pred=pred_n_smooth, coords_true=coords_true_n,

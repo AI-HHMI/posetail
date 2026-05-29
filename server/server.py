@@ -154,6 +154,7 @@ async def predict(
 
     # Build camera group dicts first (needed to compute resize scales before loading views).
     # Image size is read from the actual decoded frames — client need not send 'size'.
+    from train_utils import format_orthographic_camera
     camera_group = []
     for cam_info in cameras_meta:
         cam_name = cam_info['name']
@@ -161,20 +162,26 @@ async def predict(
             raise HTTPException(400, detail=f'No images uploaded for camera: {cam_name}')
         first_frame = next(iter(cam_frames[cam_name].values()))
         H, W = first_frame.shape[:2]
+        cam_type = cam_info.get('type', 'pinhole')
+        offset = cam_info.get('offset', [0.0, 0.0])
+
+        if cam_type == 'orthographic':
+            camera_group.append(format_orthographic_camera(
+                cam_info['L'], cam_name, [W, H], device=device, offset=offset))
+            continue
+
         size = torch.tensor([W, H], dtype=torch.int32, device=device)
         ext = torch.tensor(cam_info['ext'], dtype=torch.float32, device=device)
         mat = torch.tensor(cam_info['mat'], dtype=torch.float32, device=device)
         dist = torch.tensor(cam_info['dist'], dtype=torch.float32, device=device)
-        offset = torch.tensor(
-            cam_info.get('offset', [0.0, 0.0]), dtype=torch.float32, device=device
-        )
+        offset = torch.tensor(offset, dtype=torch.float32, device=device)
         ext_inv = torch.linalg.inv(ext)
         R = ext[:3, :3]
         t = ext[:3, 3]
         center = -R.T @ t
         camera_group.append({
             'name': cam_name,
-            'type': cam_info.get('type', 'pinhole'),
+            'type': cam_type,
             'mat': mat,
             'dist': dist,
             'ext': ext,
