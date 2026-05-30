@@ -48,6 +48,8 @@ def _rotated_rect_max_inscribed(w, h, angle_rad):
 
 def load_image(cam_img_path, crop_coords=None, target_size=None, rotation=None):
     img = cv2.imread(cam_img_path)
+    if img is None:
+        return None
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
     if rotation is not None:
@@ -314,7 +316,10 @@ class PosetailDataset(Dataset):
         out = None
         while True:
             if self.good_index[start]:
-                out = self.get_item_actual(start)
+                try:
+                    out = self.get_item_actual(start)
+                except Exception:
+                    out = None
             if out is not None:
                 return out
             
@@ -578,6 +583,8 @@ class PosetailDataset(Dataset):
             views = []
             for cnum, futures in enumerate(views_unloaded):
                 imgs = [f.result() for f in futures]
+                if any(img is None for img in imgs):
+                    return None
                 if should_augment:
                     aug_cam_det = self.aug_per_camera.to_deterministic()
                     imgs = [aug_cam_det(image=img) for img in imgs]
