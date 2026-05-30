@@ -488,10 +488,16 @@ def _invert_SE3(transforms: torch.Tensor) -> torch.Tensor:
 
 
 
-def points_to_rays(cam, p2d, cube_scale=1, normalize_t=True):
+def points_to_rays(cam, p2d, cube_scale=1, normalize_t=True,
+                   scene_center=None, scene_radius=None):
     """Inputs:
     cam: camera dict
     p2d: [B, 2]
+    scene_center: [3] world-space reference point (scene centroid). When provided
+        together with scene_radius and normalize_t=True, the camera origin is encoded
+        in metric, origin- and focal-invariant units instead of the legacy
+        cube_scale/200 normalization.
+    scene_radius: scalar shared metric scale (median camera-to-centroid distance).
 
     Outputs:
     ray_matrices: [B, 4, 4]
@@ -509,10 +515,18 @@ def points_to_rays(cam, p2d, cube_scale=1, normalize_t=True):
     ext = cam['ext'].clone()                              # [4, 4] world-to-camera
     R_c2w = ext[:3, :3].T # [3, 3], transpose = invert rotation
     if normalize_t:
-        t_c2w = -einsum(R_c2w, ext[:3, 3] / cube_scale / 200.0, 'i j, j -> i')
+        if scene_center is not None:
+            # Metric mode: world camera center recentered to the scene centroid and
+            # divided by a shared metric radius -> origin- and focal-invariant, O(1).
+            center = -einsum(R_c2w, ext[:3, 3], 'i j, j -> i')   # world camera center
+            if not torch.is_tensor(scene_radius):
+                scene_radius = torch.tensor(scene_radius, device=device, dtype=dtype)
+            t_c2w = (center - scene_center) / scene_radius.clamp_min(1e-6)
+        else:
+            t_c2w = -einsum(R_c2w, ext[:3, 3] / cube_scale / 200.0, 'i j, j -> i')
     else:
         t_c2w = -einsum(R_c2w, ext[:3, 3], 'i j, j -> i')
-        
+
 
     # Ray directions in world space
     d_world = einsum(R_c2w, d_cam, 'i j, b j -> b i')

@@ -220,7 +220,8 @@ class QueryEncoder(nn.Module):
     def __init__(self, embed_dim=256, decoder_dim=256,
                  n_frames=16, corr_radius=2, max_freq=10,
                  patch_size=9, use_volume_embedding=True,
-                 principal_point_embedding=False):
+                 principal_point_embedding=False,
+                 intrinsic_embedding=False):
         super().__init__()
         self.embed_dim = embed_dim
         self.decoder_dim = decoder_dim
@@ -230,6 +231,7 @@ class QueryEncoder(nn.Module):
         self.n_frames = n_frames
         self.use_volume_embedding = use_volume_embedding
         self.principal_point_embedding = principal_point_embedding
+        self.intrinsic_embedding = intrinsic_embedding
 
         self.t_query_embed = nn.Embedding(n_frames, embed_dim)
         self.t_target_embed = nn.Embedding(n_frames, embed_dim)
@@ -246,6 +248,8 @@ class QueryEncoder(nn.Module):
         self.linear_depth = nn.Linear(2 * max_freq + 1, embed_dim)
         if self.principal_point_embedding:
             self.linear_pp = nn.Linear(4 * max_freq + 2, embed_dim)
+        if self.intrinsic_embedding:
+            self.linear_intrinsic = nn.Linear(4 * max_freq + 2, embed_dim)
 
         self.patch_processor = PatchProcessor(
             in_channels=3,
@@ -262,8 +266,13 @@ class QueryEncoder(nn.Module):
         if self.use_volume_embedding:
             self.missing_volume = nn.Parameter(torch.zeros(embed_dim))
             nn.init.normal_(self.missing_volume, std=0.02)
+        if self.intrinsic_embedding:
+            self.missing_intrinsic = nn.Parameter(torch.zeros(embed_dim))
+            nn.init.normal_(self.missing_intrinsic, std=0.02)
 
-        self.n_fusion_terms = 6 + int(self.use_volume_embedding) + int(self.principal_point_embedding)
+        self.n_fusion_terms = (6 + int(self.use_volume_embedding)
+                               + int(self.principal_point_embedding)
+                               + int(self.intrinsic_embedding))
         self.gate = nn.Sequential(
             nn.Linear(embed_dim * self.n_fusion_terms, self.n_fusion_terms),
             nn.Sigmoid()
@@ -328,6 +337,26 @@ class QueryEncoder(nn.Module):
             fourier_pp = torch.cat([principal_pt_norm, fourier_pp], dim=-1)
             embed_pp = self.linear_pp(fourier_pp)                       # [B, T_query, n_cams, embed_dim]
 
+        # Intrinsic (focal-length) embedding: normalized focal (fx/image_size, fy/image_size)
+        # in the padded-canvas coordinate system the network actually sees. fx/fy and the
+        # canvas are co-transformed by crop+resize, so this grows for tight crops (resize
+        # scales fx up) -> a clean, dimensionless scale-regime signal. 2D queries get the
+        # learnable missing_intrinsic token (mirrors missing_depth).
+        if self.intrinsic_embedding:
+            if coord_dim == 3:
+                focal = torch.stack([
+                    torch.stack([cam['mat'][0, 0], cam['mat'][1, 1]]).to(query_coords.dtype)
+                    for cam in camera_group
+                ])  # [n_cams, 2]  (fx, fy)
+                focal_norm = focal / sizes                              # [n_cams, 2]  (fx/W, fy/H)
+                focal_norm = repeat(focal_norm, 'cams r -> b t cams r', b=B, t=T_query)
+                fourier_intr = get_fourier_encoding(focal_norm, min_freq=0, max_freq=self.max_freq)
+                fourier_intr = torch.cat([focal_norm, fourier_intr], dim=-1)
+                embed_intrinsic = self.linear_intrinsic(fourier_intr)   # [B, T_query, n_cams, embed_dim]
+            else:
+                embed_intrinsic = repeat(self.missing_intrinsic,
+                                         'd -> b t c d', b=B, t=T_query, c=n_cams)
+
         # Patch embeddings (shared)
         patches = torch.stack([
             sample_patches(preprocessed_views[i], p2d_full[i],
@@ -390,6 +419,8 @@ class QueryEncoder(nn.Module):
                        embed_pos, embed_depth, embed_vis]
         if self.principal_point_embedding:
             embed_terms.append(embed_pp)
+        if self.intrinsic_embedding:
+            embed_terms.append(embed_intrinsic)
         if self.use_volume_embedding:
             embed_terms.append(embed_volume)
 

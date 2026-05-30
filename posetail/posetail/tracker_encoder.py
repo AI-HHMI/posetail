@@ -29,6 +29,8 @@ class TrackerEncoder(nn.Module):
                  use_volume_embedding = False,
                  per_camera_cube_scale = False,
                  principal_point_embedding = False,
+                 intrinsic_embedding = False,
+                 metric_ray_translation = False,
                  latent_dim = 1024, n_heads = 8,
                  n_time_space_blocks = 6, embedding_factor = 4,
                  use_camera_self_attention = False,
@@ -67,6 +69,8 @@ class TrackerEncoder(nn.Module):
         self.use_volume_embedding = use_volume_embedding
         self.per_camera_cube_scale = per_camera_cube_scale
         self.principal_point_embedding = principal_point_embedding
+        self.intrinsic_embedding = intrinsic_embedding
+        self.metric_ray_translation = metric_ray_translation
 
         # decoder params
         self.latent_dim = latent_dim 
@@ -106,6 +110,7 @@ class TrackerEncoder(nn.Module):
             patch_size=query_patch_size,
             use_volume_embedding=use_volume_embedding,
             principal_point_embedding=principal_point_embedding,
+            intrinsic_embedding=intrinsic_embedding,
         )
         self.decoder = Decoder(
             embed_dim=latent_dim,
@@ -165,6 +170,22 @@ class TrackerEncoder(nn.Module):
         # CameraSelfAttention sees consistent inter-camera geometry.
         cube_scale_shared = torch.median(cube_scale, dim=0).values  # (B,)
 
+        # Metric ray-translation: recenter camera origins to the scene centroid and
+        # divide by a shared metric radius (median cam->centroid distance). This makes
+        # the encoded camera positions origin- and focal-invariant and O(1) across
+        # datasets, while preserving relative camera-rig geometry. Gated by config;
+        # default off keeps the legacy cube_scale/200 normalization bit-identical.
+        if self.metric_ray_translation:
+            centers_w = torch.stack([cam['center'] for cam in camera_group])  # (cams, 3)
+            if R == 3:
+                scene_center = torch.nanmean(coords.to(torch.float32), dim=1)  # (B, 3)
+                dist = (centers_w[:, None, :] - scene_center[None, :, :]).norm(dim=-1)  # (cams, B)
+                scene_radius = torch.median(dist, dim=0).values  # (B,)
+            else:
+                # single-camera 2d: translation is irrelevant to self-attention.
+                scene_center = centers_w[0][None].expand(B, 3)  # (B, 3) -> origin 0
+                scene_radius = torch.ones(B, device=device)
+
         if query_times is None:
             query_times = torch.zeros((B, N), dtype=torch.int32, device=device)
         
@@ -209,7 +230,12 @@ class TrackerEncoder(nn.Module):
             rays_per_b = []
             for b in range(B):
                 p2d_ib = rearrange(p2d_query[i, b], 't n r -> (t n) r')
-                rays_per_b.append(points_to_rays(camera_group[i], p2d_ib, cube_scale_shared[b]))
+                if self.metric_ray_translation:
+                    rays_per_b.append(points_to_rays(
+                        camera_group[i], p2d_ib, cube_scale_shared[b],
+                        scene_center=scene_center[b], scene_radius=scene_radius[b]))
+                else:
+                    rays_per_b.append(points_to_rays(camera_group[i], p2d_ib, cube_scale_shared[b]))
             query_rays_per_cam.append(torch.stack(rays_per_b, dim=0))  # (B, T*N, 4, 4)
         query_rays_flat = torch.stack(query_rays_per_cam, dim=0)  # (cams, B, T*N, 4, 4)
         query_rays = rearrange(query_rays_flat, 'cams b (t n) d e -> b t n cams d e', t=T, n=N)

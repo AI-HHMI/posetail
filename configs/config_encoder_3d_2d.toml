@@ -84,6 +84,8 @@ embedding_dim = 256
 use_volume_embedding = false
 corr_radius = 2
 principal_point_embedding = false
+intrinsic_embedding = true
+metric_ray_translation = true
 
 # decoder
 latent_dim = 512
