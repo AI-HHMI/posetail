@@ -333,7 +333,7 @@ def train_iteration(config, model, fabric, batch,
         
     optimizer.zero_grad()
  
-    if evaluate:
+    if evaluate and coords.shape[-1] == 3:
         if p2d is not None:
             C = cgroup[0]['center']
             vis_for_norm = vis.to(coords.device) if vis is not None else get_vis_true(coords)
@@ -368,16 +368,16 @@ def train_iteration(config, model, fabric, batch,
     train_dict.update(loss_dict)
 
     # average evaluation metrics if we evaluated
-    if evaluate: 
+    if evaluate and metric_dicts:
 
         avg_metrics_dict = {}
         metrics = list(metric_dicts[0].keys())
 
-        for metric in metrics: 
+        for metric in metrics:
             metric_list = [float(metric_dict[metric]) for metric_dict in metric_dicts]
             avg_metrics_dict[f'{metric}_avg'] = float(np.mean(metric_list))
             avg_metrics_dict[f'{metric}_std'] = float(np.std(metric_list))
-            
+
         train_dict.update(avg_metrics_dict)
 
     return train_dict
@@ -472,7 +472,7 @@ def train_epoch(config, model, fabric, dataloader,
         # else:
         #     print('WARNING: nan loss')
         
-        if evaluate:
+        if evaluate and coords.shape[-1] == 3:
             if p2d is not None:
                 C = cgroup[0]['center']
                 vis_for_norm = vis.to(coords.device) if vis is not None else get_vis_true(coords)
@@ -494,7 +494,7 @@ def train_epoch(config, model, fabric, dataloader,
 
     # print_memory(device)
 
-    if scheduler: 
+    if scheduler:
         scheduler.step()
         learning_rate = scheduler.get_last_lr()[0]
 
@@ -508,22 +508,22 @@ def train_epoch(config, model, fabric, dataloader,
                   f'{prefix}elapsed_time': elapsed_time,
                   f'{prefix}elapsed_time_hms': elapsed_time_hms,
                   f'{prefix}batches_per_epoch': n_batches,
-                  f'{prefix}frames_per_epoch': n_frames, 
+                  f'{prefix}frames_per_epoch': n_frames,
                   f'{prefix}learning_rate': learning_rate,
                   f'{prefix}grad_norm_avg': float(np.mean(grad_norms))}
     train_dict.update(loss_dict)
 
     # average evaluation metrics if we evaluated
-    if evaluate: 
+    if evaluate and metric_dicts:
 
         avg_metrics_dict = {}
         metrics = list(metric_dicts[0].keys())
 
-        for metric in metrics: 
+        for metric in metrics:
             metric_list = [float(metric_dict[metric]) for metric_dict in metric_dicts]
             avg_metrics_dict[f'{metric}_avg'] = float(np.mean(metric_list))
             avg_metrics_dict[f'{metric}_std'] = float(np.std(metric_list))
-            
+
         train_dict.update(avg_metrics_dict)
 
     return train_dict
@@ -590,7 +590,7 @@ def test_epoch(config, model, dataloader, loss = None,
                 p2d = p2d, 
                 device = coords_pred.device)
 
-        if evaluate:
+        if evaluate and coords.shape[-1] == 3:
             if p2d is not None:
                 C = cgroup[0]['center']
                 vis_for_norm = vis.to(coords.device) if vis is not None else get_vis_true(coords)
@@ -625,17 +625,16 @@ def test_epoch(config, model, dataloader, loss = None,
         val_dict.update(loss_dict)
 
     # average evaluation metrics if we evaluated
-    if evaluate: 
+    if evaluate and metric_dicts:
 
         avg_metrics_dict = {}
         metrics = list(metric_dicts[0].keys())
 
-        for metric in metrics: 
+        for metric in metrics:
             metric_list = [float(metric_dict[metric]) for metric_dict in metric_dicts]
             avg_metrics_dict[f'{metric}_avg'] = float(np.mean(metric_list))
             avg_metrics_dict[f'{metric}_std'] = float(np.std(metric_list))
-            
-        val_dict.update(avg_metrics_dict)
 
+        val_dict.update(avg_metrics_dict)
 
     return val_dict

@@ -65,45 +65,91 @@ def load_image(cam_img_path, crop_coords=None, target_size=None, rotation=None):
 
     return img
 
-def get_rows_trial(trial_path, n_frames, split, context,
-                   mode='3d'):
+def get_rows_trial(trial_path, n_frames, split, context):
     dataset, session, trial = context
-    
-    metadata_path = os.path.join(trial_path, 'metadata.yaml')
-    assert os.path.exists(metadata_path)
-    # cam_metadata = load_yaml(metadata_path)
-    # camera_height_dict = cam_metadata['camera_heights']
-    # camera_width_dict = cam_metadata['camera_widths']
 
     img_path = os.path.join(trial_path, 'img')
     cams = os.listdir(img_path)
     assert len(cams) > 0
 
-    pose_path = os.path.join(trial_path, f'pose{mode}.npz')
-    assert os.path.exists(pose_path)
+    # detect mode from which pose file is present
+    pose3d_path = os.path.join(trial_path, 'pose3d.npz')
+    pose2d_path = os.path.join(trial_path, 'pose2d.npz')
+    if os.path.exists(pose3d_path):
+        mode = '3d'
+        pose_path = pose3d_path
+    elif os.path.exists(pose2d_path):
+        mode = '2d'
+        pose_path = pose2d_path
+    else:
+        raise FileNotFoundError(f'No pose3d.npz or pose2d.npz found in {trial_path}')
 
-    # get starting indices 
+    # metadata.yaml required for 3d; optional for 2d
+    metadata_path = os.path.join(trial_path, 'metadata.yaml')
+    if mode == '3d':
+        assert os.path.exists(metadata_path), f'metadata.yaml missing for 3D trial: {trial_path}'
+    else:
+        # store None so get_item_actual can detect absence
+        metadata_path = metadata_path if os.path.exists(metadata_path) else None
+
+    # get starting indices
     data = np.load(pose_path)
     coords = torch.as_tensor(data['pose'])
 
-    coords = rearrange(coords, 's t n r -> t (s n) r') # (time, n_kpts, 3)
+    coords = rearrange(coords, 's t n r -> t (s n) r') # (time, n_kpts, r)
     start_ixs, intervals = get_start_ixs(coords, n_frames, split)
 
-    # n_batches = len(imgs) // self.n_frames
-    # start_ixs = np.arange(0, len(imgs), self.n_frames)[:n_batches]
-    # end_ixs = start_ixs + self.n_frames
-
-    # add a row to the metadata that will correspond
-    # to each sample within a batch
     rows = []
-    for start_ix, interval in zip(start_ixs, intervals): 
+    for start_ix, interval in zip(start_ixs, intervals):
         row = [dataset, session, trial, metadata_path,
-               pose_path, img_path, start_ix, interval, 
-               # camera_height_dict, camera_width_dict
-               ]
+               pose_path, img_path, start_ix, interval, mode]
         rows.append(row)
 
     return rows
+
+
+def _make_nominal_2d_camera(width, height):
+    """Return a single-camera cgroup dict with a nominal pinhole + identity extrinsic.
+
+    focal length ≈ max(w, h) so normalized coords are ~[-0.5, 0.5]; the value
+    is irrelevant to the intrinsic embedding (missing_intrinsic token is used).
+    size must equal the real image so that pp = p2d / sizes is pixel-normalised.
+    """
+    f = float(max(width, height))
+    cx = width / 2.0
+    cy = height / 2.0
+    mat = torch.tensor([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=torch.float32)
+    ext = torch.eye(4, dtype=torch.float32)
+    dist = torch.zeros(5, dtype=torch.float32)
+    size = torch.tensor([width, height], dtype=torch.int32)
+    offset = torch.zeros(2, dtype=torch.float32)
+    cam = {
+        'name': 'cam0',
+        'type': 'pinhole',
+        'mat': mat,
+        'ext': ext,
+        'ext_inv': ext.clone(),
+        'dist': dist,
+        'size': size,
+        'offset': offset,
+        'center': torch.zeros(3, dtype=torch.float32),
+    }
+    return [cam]
+
+
+def _vis_2d_bounds(coords, size):
+    """Validity mask for 2D pixel coords: finite AND inside image bounds.
+
+    Args:
+        coords: (T, N, 2) pixel coords
+        size:   (2,) tensor [width, height]
+    Returns:
+        valid: (T, N) bool tensor
+    """
+    finite = torch.isfinite(coords[..., 0])
+    in_x = (coords[..., 0] >= 0) & (coords[..., 0] < size[0])
+    in_y = (coords[..., 1] >= 0) & (coords[..., 1] < size[1])
+    return finite & in_x & in_y
 
 
 def get_start_ixs(coords, n_frames, split):
@@ -178,8 +224,13 @@ def custom_collate(batch):
     fnums = torch.stack(batch[3], axis = 0)
     cgroup = batch[4][0]
 
-    # # mask nan coordinates in the first frame
-    coords = torch.stack(batch[1], axis = 0) # (b, t, n_kpts, 3)
+    # all items in the batch must share the same coord dimensionality (R)
+    coord_dims = [b.shape[-1] for b in batch[1]]
+    assert len(set(coord_dims)) == 1, (
+        f'Mixed 2D/3D in a single batch: {coord_dims}. '
+        'Ensure batch_size=1 or use a mode-aware batch sampler.')
+
+    coords = torch.stack(batch[1], axis=0)  # (b, t, n_kpts, r)
     # mask = torch.isfinite(coords).all(dim = -1).all(dim = 1).all(dim = 0)
     # coords_masked = coords[:, :, mask, :]
     #
@@ -333,26 +384,25 @@ class PosetailDataset(Dataset):
                 
         
     def get_item_actual(self, idx):
-        # print(idx, "started")
-        
         row = self.metadata.loc[idx].to_dict()
         start_ix = row['start_ix']
-        # end_ix = row['end_ix']
         interval = row['interval']
-        end_ix = start_ix + self.n_frames * interval 
+        end_ix = start_ix + self.n_frames * interval
         fnums = torch.arange(start_ix, end_ix, interval)
-        
-        # load keypoints 
-        data = np.load(row['pose_path'])
-        coords = data['pose'][:, start_ix:end_ix:interval, :, :] 
-        coords = torch.tensor(coords, dtype = torch.float32, device = 'cpu')
 
-        # load visibilities (if present)
+        is_true_2d = (row['mode'] == '2d')
+
+        # load keypoints
+        data = np.load(row['pose_path'])
+        coords = data['pose'][:, start_ix:end_ix:interval, :, :]
+        coords = torch.tensor(coords, dtype=torch.float32, device='cpu')
+
+        # load visibilities (if present; 2D datasets never have vis)
         vis = None
         vis_2d = None
-        if 'vis' in data: 
+        if not is_true_2d and 'vis' in data:
             vis = data['vis'][:, start_ix:end_ix:interval, :, :]
-            vis = torch.tensor(vis, dtype = torch.float32, device = 'cpu')
+            vis = torch.tensor(vis, dtype=torch.float32, device='cpu')
             vis_2d = vis.clone()
             vis[torch.isnan(vis)] = 1
             vis = vis.bool()
@@ -361,194 +411,272 @@ class PosetailDataset(Dataset):
         intensity = self.curriculum_intensity()
         should_augment = np.random.random() < self.should_augment_prob * intensity
         should_grayscale = self.split == 'train' and np.random.random() < 0.2
-            
-        # sample a random subject with 0.5 probability if using a 
-        # multi-subject dataset
+
+        # sample a random subject with 0.5 probability if using a multi-subject dataset
         if np.random.random() < 0.5:
             ix_sample = np.random.randint(coords.shape[0])
             coords = coords[ix_sample, None]
             if vis is not None:
                 vis = vis[ix_sample, None]
                 vis_2d = vis_2d[ix_sample, None]
-            
-        coords = rearrange(coords, 's t n r -> t (s n) r') # (time, n_kpts, 3)
+
+        coords = rearrange(coords, 's t n r -> t (s n) r')  # (time, n_kpts, r)
         if vis is not None:
-            vis = rearrange(vis, 's t n c -> t (s n) c') # (time, n_kpts, cams)
+            vis = rearrange(vis, 's t n c -> t (s n) c')
             vis_2d = rearrange(vis_2d, 's t n c -> t (s n) c')
-        
-        # load camera resolutions for resizing
-        # res_dict = json.loads(row['res_dict'])
-        # new_res_dict = json.loads(row['new_res_dict'])
-        # scale_dict = json.loads(row['scale_dict'])
 
         img_path = row['img_path']
         cam_names = get_dirs(img_path)
         img_fnames = sorted(os.listdir(os.path.join(img_path, cam_names[0])))[start_ix:end_ix:interval]
 
-        is_2d_mode = self.prob_2d_only > 0 and np.random.random() < self.prob_2d_only
+        # ── 2D-only path ──────────────────────────────────────────────────────
+        if is_true_2d:
+            # always exactly one camera; ignore cams_to_sample
+            cam_names = cam_names[:1]
 
-        if is_2d_mode:
-            # Force sample 1 camera
-            ix_cams = [np.random.randint(len(cam_names))]
-            cam_names = [cam_names[i] for i in ix_cams]
-            if vis is not None: 
-                vis = vis[:, :, ix_cams]
-                vis_2d = vis_2d[:, :, ix_cams]
-        elif self.cams_to_sample: 
-            coords, vis, vis_2d, cam_names = self.sample_cameras(coords, vis, vis_2d, cam_names)
+            cgroup = self._build_2d_cgroup(row, img_path, cam_names)
 
-        if vis is not None:
-            vis = vis.sum(dim = -1) >= self.cam_thresh_for_vis # (time, n_kpts)                
+            # validity: finite coords inside image bounds
+            size_tensor = cgroup[0]['size']
+            valid_mask = _vis_2d_bounds(coords, size_tensor)
 
-  
-        # load cameras
-        cgroup, offset_dict, cam_type = self._load_cameras(row['camera_metadata_path']) 
-        cgroup = cgroup.subset_cameras_names(cam_names)
-        cgroup = format_camera_group(cgroup, offset_dict, cam_type, device = 'cpu')
-
-
-        # per-camera image-plane rotation augmentation (before cropping)
-        if should_augment:
-            cgroup, rotation_info = self.augment_image_rotation(cgroup)
-            # Mark keypoints cropped out by the rotation as not visible.
-            if vis_2d is not None:
-                s, n, _ = coords.shape
-                coords_flat = rearrange(coords, 's n r -> (s n) r')
-                for cnum, cam in enumerate(cgroup):
-                    if rotation_info[cnum] is None:
-                        continue
-                    visible = rearrange(is_point_visible(cam, coords_flat),
-                                        '(s n) -> s n', s=s, n=n)
-                    vis_2d[:, :, cnum][~visible] = 0
-                # Re-aggregate vis across cameras (NaN treated as visible, matching the
-                # initial collapse at the top of this method).
-                if vis is not None:
-                    per_cam = vis_2d.clone()
-                    per_cam[torch.isnan(per_cam)] = 1
-                    vis = per_cam.bool().sum(dim=-1) >= self.cam_thresh_for_vis
-        else:
-            rotation_info = [None] * len(cam_names)
-
-        # compute per-frame validity mask
-        valid_mask = torch.isfinite(coords[..., 0])  # (time, n_kpts)
-        if vis is not None:
-            valid_mask = valid_mask & vis
-        else:
-            t, n, _ = coords.shape
-            coords_flat = rearrange(coords, 't n r -> (t n) r')
-            cam_visible = torch.stack([is_point_visible(cam, coords_flat) for cam in cgroup])
-            proxy_vis = rearrange(cam_visible, 'c (t n) -> t n c', t=t, n=n).sum(dim=-1) >= self.cam_thresh_for_vis
-            valid_mask = valid_mask & proxy_vis
-
-        # filter coords based on which coords are visible enough times
-        if self.query_anytime:
-            mask = valid_mask.sum(dim=0) >= 2
-        else:
-            mask = valid_mask[0]
-
-        coords = coords[:, mask]
-        if vis is not None:
-            vis = vis[:, mask]
-            vis_2d = vis_2d[:, mask]                
-
-        # filter coords that are not nan throughout
-        if self.no_nan_coords:
-            mask = torch.all(torch.isfinite(coords), dim=(0, 2))
+            if self.query_anytime:
+                mask = valid_mask.sum(dim=0) >= 2
+            else:
+                mask = valid_mask[0]
             coords = coords[:, mask]
-            if vis is not None: 
+
+            if self.no_nan_coords:
+                mask = torch.all(torch.isfinite(coords), dim=(0, 2))
+                coords = coords[:, mask]
+
+            if coords.shape[1] < 2:
+                return None
+
+            # movement / speed (pixels already; no projection needed).
+            # p2d_motion is (cams=1, t, n, 2) — same layout as the 3D path, so
+            # diff over the time axis (dim=1), then aggregate over time / cams.
+            p2d_motion = coords[None]  # (1, t, n, 2)
+            movement = torch.linalg.norm(torch.diff(p2d_motion, dim=1), dim=-1)
+            movement = torch.nan_to_num(movement, 0.0)
+            total_movement = torch.mean(torch.sum(movement, dim=1), dim=0)  # (n,)
+            avg_speed = torch.mean(torch.mean(movement, dim=1), dim=0)      # (n,)
+
+            good = total_movement >= 12
+            if torch.sum(good) < 2:
+                return None
+
+            if self.kpts_to_sample:
+                coords, vis, vis_2d = self.sample_keypoints(coords, vis, vis_2d,
+                                                             total_movement, avg_speed)
+
+            if coords.shape[1] < 2:
+                return None
+
+            # crop around points (shifts pixel coords with the crop)
+            if self.crop_to_points:
+                cgroup, crops, coords = self.crop_cgroup_to_points_2d(cgroup, coords)
+
+            # resize: scale camera size AND pixel coords together
+            if self.max_res != -1:
+                old_size = cgroup[0]['size'].clone()
+                cgroup = self.resize_camera_group(cgroup)
+                new_size = cgroup[0]['size']
+                sx = float(new_size[0]) / float(old_size[0])
+                sy = float(new_size[1]) / float(old_size[1])
+                scale_xy = torch.tensor([sx, sy], dtype=coords.dtype)
+                coords = coords * scale_xy
+
+            # skip 3D rotation for 2D
+            rotation_info = [None]
+
+            # query times
+            if self.query_anytime:
+                query_times_list = []
+                for kpt_idx in range(coords.shape[1]):
+                    valid_t = torch.where(torch.isfinite(coords[:, kpt_idx, 0]))[0]
+                    query_time = self.sample_query_time(valid_t)
+                    query_times_list.append(query_time.item())
+                query_times = torch.tensor(query_times_list, dtype=torch.int32, device='cpu')
+            else:
+                query_times = torch.zeros((coords.shape[1],), dtype=torch.int32, device='cpu')
+
+            # p2d output: pixel coords as (1, T, N, 2)
+            p2d = rearrange(coords, 't n r -> 1 t n r')
+
+            # cutout rects for 2D (use pixel coords directly)
+            cutout_rects = []
+            if should_augment:
+                for cnum_r in range(len(cam_names)):
+                    cam_rects = []
+                    if np.random.random() < self.aug_prob:
+                        img_w = cgroup[cnum_r]['size'][0].item()
+                        img_h = cgroup[cnum_r]['size'][1].item()
+                        n_rects = np.random.randint(1, 4)
+                        for _ in range(n_rects):
+                            rw = int(img_w * 0.15)
+                            rh = int(img_h * 0.15)
+                            rx = np.random.randint(0, max(img_w - rw, 1))
+                            ry = np.random.randint(0, max(img_h - rh, 1))
+                            fill_color = np.random.randint(0, 256, size=3).tolist()
+                            cam_rects.append((rx, ry, rx + rw, ry + rh, fill_color))
+                    cutout_rects.append(cam_rects)
+            else:
+                cutout_rects = [[] for _ in cam_names]
+
+            # vis stays None for true 2D (no ground-truth occlusion)
+            vis = None
+            vis_2d = None
+
+        # ── 3D path (original logic) ──────────────────────────────────────────
+        else:
+            is_2d_mode = self.prob_2d_only > 0 and np.random.random() < self.prob_2d_only
+
+            if is_2d_mode:
+                # Force sample 1 camera
+                ix_cams = [np.random.randint(len(cam_names))]
+                cam_names = [cam_names[i] for i in ix_cams]
+                if vis is not None:
+                    vis = vis[:, :, ix_cams]
+                    vis_2d = vis_2d[:, :, ix_cams]
+            elif self.cams_to_sample:
+                coords, vis, vis_2d, cam_names = self.sample_cameras(coords, vis, vis_2d, cam_names)
+
+            if vis is not None:
+                vis = vis.sum(dim=-1) >= self.cam_thresh_for_vis  # (time, n_kpts)
+
+            # load cameras
+            cgroup, offset_dict, cam_type = self._load_cameras(row['camera_metadata_path'])
+            cgroup = cgroup.subset_cameras_names(cam_names)
+            cgroup = format_camera_group(cgroup, offset_dict, cam_type, device='cpu')
+
+            # per-camera image-plane rotation augmentation (before cropping)
+            if should_augment:
+                cgroup, rotation_info = self.augment_image_rotation(cgroup)
+                if vis_2d is not None:
+                    s, n, _ = coords.shape
+                    coords_flat = rearrange(coords, 's n r -> (s n) r')
+                    for cnum, cam in enumerate(cgroup):
+                        if rotation_info[cnum] is None:
+                            continue
+                        visible = rearrange(is_point_visible(cam, coords_flat),
+                                            '(s n) -> s n', s=s, n=n)
+                        vis_2d[:, :, cnum][~visible] = 0
+                    if vis is not None:
+                        per_cam = vis_2d.clone()
+                        per_cam[torch.isnan(per_cam)] = 1
+                        vis = per_cam.bool().sum(dim=-1) >= self.cam_thresh_for_vis
+            else:
+                rotation_info = [None] * len(cam_names)
+
+            # compute per-frame validity mask
+            valid_mask = torch.isfinite(coords[..., 0])  # (time, n_kpts)
+            if vis is not None:
+                valid_mask = valid_mask & vis
+            else:
+                t, n, _ = coords.shape
+                coords_flat = rearrange(coords, 't n r -> (t n) r')
+                cam_visible = torch.stack([is_point_visible(cam, coords_flat) for cam in cgroup])
+                proxy_vis = rearrange(cam_visible, 'c (t n) -> t n c', t=t, n=n).sum(dim=-1) >= self.cam_thresh_for_vis
+                valid_mask = valid_mask & proxy_vis
+
+            if self.query_anytime:
+                mask = valid_mask.sum(dim=0) >= 2
+            else:
+                mask = valid_mask[0]
+
+            coords = coords[:, mask]
+            if vis is not None:
                 vis = vis[:, mask]
                 vis_2d = vis_2d[:, mask]
-                        
-            
-        # filter points that are visible in enough views
-        if self.enable_kpt_filtering:
-            coords, vis, vis_2d = self.filter_keypoints(coords, vis, vis_2d, cgroup)
 
-        if coords.shape[1] < 2:
-            return None
-                
-        # compute total movement and speed in pixels, averaged across cameras
-        p2d = project_points_torch(cgroup, coords) # (cams, t, n_kpts, 2)
-        movement = torch.linalg.norm(torch.diff(p2d, dim = 1), dim = -1)
-        movement = torch.nan_to_num(movement, 0.0)
-        total_movement = torch.mean(torch.sum(movement, dim = 1), dim = 0)
-        avg_speed = torch.mean(torch.mean(movement, dim = 1), dim = 0) 
-
-        # should have at least 12 pixels of movement over the sampled frames
-        good = total_movement >= 12
-        if torch.sum(good) < 2: # not enough points with movement
-            return None
-
-        # sample a random number of keypoints from available tracks
-        fire_3d = self.crop_3d_enabled and (np.random.rand() < self.crop_3d_prob * intensity)
-        if fire_3d:
-            coords, vis, vis_2d = self.sample_keypoints_sphere(
-                coords, vis, vis_2d, total_movement, avg_speed)
-            if coords.shape[1] < self.crop_3d_min_kpts:
-                return None
-        elif self.kpts_to_sample:
-            coords, vis, vis_2d = self.sample_keypoints(coords, vis, vis_2d, total_movement, avg_speed)
-
-        # failed to sample coordinates, just get another random sample
-        if coords.shape[1] < 2:
-            return None
-
-        # cropping around coordinates
-        # helps for small animals in large arenas
-        if self.crop_to_points:
-            cgroup, crops = self.crop_cgroup_to_points(cgroup, coords)
-
-        # resize cameras
-        if self.max_res != -1:
-            cgroup = self.resize_camera_group(cgroup)
-
-        # arbitrary camera rotation
-        cgroup, coords = self.rotate_camera_group(cgroup, coords)
-
-        # setup possible query_times (n_kpts)
-        if self.query_anytime:
-            query_times = []
-            for kpt_idx in range(coords.shape[1]):
-                good = torch.isfinite(coords[:, kpt_idx, 0])
+            if self.no_nan_coords:
+                mask = torch.all(torch.isfinite(coords), dim=(0, 2))
+                coords = coords[:, mask]
                 if vis is not None:
-                    good = good & vis[:, kpt_idx]
-                valid_times = torch.where(good)[0]
-                query_time = self.sample_query_time(valid_times)
-                query_times.append(query_time.item())
-            query_times = torch.tensor(query_times, dtype=torch.int32, device='cpu')
-        else:
-            query_times = torch.zeros((coords.shape[1],), dtype=torch.int32, device='cpu')
-        
-        if is_2d_mode:
-            p2d = project_points_torch(cgroup, coords) # (1, t, n_kpts, 2)
-        else:
-            p2d = None
+                    vis = vis[:, mask]
+                    vis_2d = vis_2d[:, mask]
 
-        # generate per-camera cutout rectangles for random erasing augmentation
-        cutout_rects = []
-        if should_augment:
-            p2d_aug = project_points_torch(cgroup, coords)  # (cams, t, n_kpts, 2)
-            for cnum_r in range(len(cam_names)):
-                cam_rects = []
-                if np.random.random() < self.aug_prob:
-                    img_w = cgroup[cnum_r]['size'][0].item()
-                    img_h = cgroup[cnum_r]['size'][1].item()
-                    n_rects = np.random.randint(1, 4)
-                    for _ in range(n_rects):
-                        rw = int(img_w * 0.15)
-                        rh = int(img_h * 0.15)
-                        rx = np.random.randint(0, max(img_w - rw, 1))
-                        ry = np.random.randint(0, max(img_h - rh, 1))
-                        fill_color = np.random.randint(0, 256, size=3).tolist()
-                        cam_rects.append((rx, ry, rx + rw, ry + rh, fill_color))
-                        if vis_2d is not None:
-                            pts = p2d_aug[cnum_r]  # (t, n_kpts, 2)
-                            inside = ((pts[..., 0] >= rx) & (pts[..., 0] <= rx + rw) &
-                                      (pts[..., 1] >= ry) & (pts[..., 1] <= ry + rh))
-                            vis_2d[:, :, cnum_r][inside] = 0
-                cutout_rects.append(cam_rects)
-        else:
-            cutout_rects = [[] for _ in cam_names]
+            if self.enable_kpt_filtering:
+                coords, vis, vis_2d = self.filter_keypoints(coords, vis, vis_2d, cgroup)
+
+            if coords.shape[1] < 2:
+                return None
+
+            # compute total movement and speed in pixels, averaged across cameras
+            p2d_proj = project_points_torch(cgroup, coords)  # (cams, t, n_kpts, 2)
+            movement = torch.linalg.norm(torch.diff(p2d_proj, dim=1), dim=-1)
+            movement = torch.nan_to_num(movement, 0.0)
+            total_movement = torch.mean(torch.sum(movement, dim=1), dim=0)
+            avg_speed = torch.mean(torch.mean(movement, dim=1), dim=0)
+
+            good = total_movement >= 12
+            if torch.sum(good) < 2:
+                return None
+
+            fire_3d = self.crop_3d_enabled and (np.random.rand() < self.crop_3d_prob * intensity)
+            if fire_3d:
+                coords, vis, vis_2d = self.sample_keypoints_sphere(
+                    coords, vis, vis_2d, total_movement, avg_speed)
+                if coords.shape[1] < self.crop_3d_min_kpts:
+                    return None
+            elif self.kpts_to_sample:
+                coords, vis, vis_2d = self.sample_keypoints(coords, vis, vis_2d, total_movement, avg_speed)
+
+            if coords.shape[1] < 2:
+                return None
+
+            if self.crop_to_points:
+                cgroup, crops = self.crop_cgroup_to_points(cgroup, coords)
+
+            if self.max_res != -1:
+                cgroup = self.resize_camera_group(cgroup)
+
+            cgroup, coords = self.rotate_camera_group(cgroup, coords)
+
+            if self.query_anytime:
+                query_times = []
+                for kpt_idx in range(coords.shape[1]):
+                    good = torch.isfinite(coords[:, kpt_idx, 0])
+                    if vis is not None:
+                        good = good & vis[:, kpt_idx]
+                    valid_times = torch.where(good)[0]
+                    query_time = self.sample_query_time(valid_times)
+                    query_times.append(query_time.item())
+                query_times = torch.tensor(query_times, dtype=torch.int32, device='cpu')
+            else:
+                query_times = torch.zeros((coords.shape[1],), dtype=torch.int32, device='cpu')
+
+            if is_2d_mode:
+                p2d = project_points_torch(cgroup, coords)  # (1, t, n_kpts, 2)
+            else:
+                p2d = None
+
+            # generate per-camera cutout rectangles for random erasing augmentation
+            cutout_rects = []
+            if should_augment:
+                p2d_aug = project_points_torch(cgroup, coords)  # (cams, t, n_kpts, 2)
+                for cnum_r in range(len(cam_names)):
+                    cam_rects = []
+                    if np.random.random() < self.aug_prob:
+                        img_w = cgroup[cnum_r]['size'][0].item()
+                        img_h = cgroup[cnum_r]['size'][1].item()
+                        n_rects = np.random.randint(1, 4)
+                        for _ in range(n_rects):
+                            rw = int(img_w * 0.15)
+                            rh = int(img_h * 0.15)
+                            rx = np.random.randint(0, max(img_w - rw, 1))
+                            ry = np.random.randint(0, max(img_h - rh, 1))
+                            fill_color = np.random.randint(0, 256, size=3).tolist()
+                            cam_rects.append((rx, ry, rx + rw, ry + rh, fill_color))
+                            if vis_2d is not None:
+                                pts = p2d_aug[cnum_r]  # (t, n_kpts, 2)
+                                inside = ((pts[..., 0] >= rx) & (pts[..., 0] <= rx + rw) &
+                                          (pts[..., 1] >= ry) & (pts[..., 1] <= ry + rh))
+                                vis_2d[:, :, cnum_r][inside] = 0
+                    cutout_rects.append(cam_rects)
+            else:
+                cutout_rects = [[] for _ in cam_names]
 
         # apply augmentation
         with ThreadPoolExecutor(max_workers=24) as executor:
@@ -609,7 +737,87 @@ class PosetailDataset(Dataset):
         return views, coords, vis, fnums, cgroup, row, query_times, vis_2d, p2d
 
 
-    def crop_cgroup_to_points(self, cgroup, coords): 
+    def _build_2d_cgroup(self, row, img_path, cam_names):
+        """Build a single-camera cgroup for a 2D-only trial.
+
+        Priority: (1) fully-calibrated metadata.yaml -> real cameras;
+        (2) metadata.yaml with only camera_widths/heights -> nominal pinhole;
+        (3) no usable metadata -> read one image to get the size.
+        """
+        metadata_path = row['camera_metadata_path']
+        cam_meta = None
+        if metadata_path is not None and os.path.exists(metadata_path):
+            cam_meta = load_yaml(metadata_path)
+
+        if cam_meta is not None and all(
+                k in cam_meta for k in ('intrinsic_matrices', 'extrinsic_matrices',
+                                        'distortion_matrices',
+                                        'camera_heights', 'camera_widths')):
+            # fully calibrated 2D metadata — use the real cameras
+            cgroup_raw, offset_dict, cam_type = self._load_cameras(metadata_path)
+            cgroup_raw = cgroup_raw.subset_cameras_names(cam_names)
+            return format_camera_group(cgroup_raw, offset_dict, cam_type, device='cpu')
+
+        if cam_meta is not None and 'camera_widths' in cam_meta and 'camera_heights' in cam_meta:
+            widths, heights = cam_meta['camera_widths'], cam_meta['camera_heights']
+            key = cam_names[0] if cam_names[0] in widths else next(iter(widths))
+            w, h = int(widths[key]), int(heights[key])
+        else:
+            # fall back to reading one image
+            sample = sorted(os.listdir(os.path.join(img_path, cam_names[0])))[0]
+            from PIL import Image
+            w, h = Image.open(os.path.join(img_path, cam_names[0], sample)).size
+
+        return _make_nominal_2d_camera(w, h)
+
+    def crop_cgroup_to_points_2d(self, cgroup, coords):
+        """Like crop_cgroup_to_points but for 2D pixel coords (no projection needed).
+
+        Also returns coords_shifted with the crop origin subtracted so pixel
+        coords stay aligned with the cropped image.
+        """
+        size = cgroup[0]['size']  # one camera
+        pflat = coords.reshape(-1, 2)
+        good = torch.all(torch.isfinite(pflat), dim=1)
+        pflat = pflat[good]
+        low = torch.clamp(torch.min(pflat, dim=0).values - 20, torch.tensor([0, 0]), size).to(torch.int32)
+        high = torch.clamp(torch.max(pflat, dim=0).values + 20, torch.tensor([0, 0]), size).to(torch.int32)
+
+        current_width = high[0] - low[0]
+        current_height = high[1] - low[1]
+
+        base = max(self.min_crop_dim, int(current_width), int(current_height))
+        min_dim_x = min(base, int(size[0]))
+        min_dim_y = min(base, int(size[1]))
+
+        if current_width < min_dim_x:
+            center_x = (low[0] + high[0]) // 2
+            low[0] = torch.clamp(center_x - min_dim_x // 2, 0, size[0] - min_dim_x)
+            high[0] = low[0] + min_dim_x
+
+        if current_height < min_dim_y:
+            center_y = (low[1] + high[1]) // 2
+            low[1] = torch.clamp(center_y - min_dim_y // 2, 0, size[1] - min_dim_y)
+            high[1] = low[1] + min_dim_y
+
+        crop = torch.cat([low, high])
+        x1, y1, x2, y2 = crop
+
+        # Match the 3D convention (crop_cgroup_to_points): only `offset` tracks the
+        # crop origin; `mat` is left untouched. undistort_points adds `offset` back,
+        # making ray geometry crop-invariant. The pixel coords themselves are shifted
+        # here (replacing project_cam's offset-subtraction, which 2D never runs).
+        cam = dict(cgroup[0])
+        cam['offset'] = cam['offset'] + torch.tensor([x1, y1], dtype=torch.int32, device='cpu')
+        cam['size'] = torch.tensor([x2 - x1, y2 - y1], dtype=torch.int32, device='cpu')
+        cgroup_cropped = [cam]
+
+        # shift pixel coords so they align with the cropped image
+        coords_shifted = coords - torch.tensor([float(x1), float(y1)], device=coords.device)
+
+        return cgroup_cropped, [crop], coords_shifted
+
+    def crop_cgroup_to_points(self, cgroup, coords):
             
         # compute crops locations
         p2d = project_points_torch(cgroup, coords)
@@ -962,52 +1170,48 @@ class PosetailDataset(Dataset):
         t = (f - lo) / max(hi - lo, 1e-9)
         return self.curriculum_intensity_floor + (1.0 - self.curriculum_intensity_floor) * t
 
-    def _generate_metadata(self, track_3d = True):
-            
+    def _generate_metadata(self):
+
         rows = []
-        mode = '3d' # if track_3d else '2d' - not yet implemented
 
         with ThreadPoolExecutor(max_workers=24) as executor:
             futures = []
             for dataset in get_dirs(self.data_path):
 
-                if dataset in self.datasets_to_exclude: 
+                if dataset in self.datasets_to_exclude:
                     continue
 
                 # NOTE: split folder structure must match here
                 dataset_path = os.path.join(self.data_path, dataset, self.split_dir)
 
                 # skip dataset if this particular split doesn't exist
-                if not os.path.exists(dataset_path): 
+                if not os.path.exists(dataset_path):
                     continue
 
-                for session in get_dirs(dataset_path): 
+                for session in get_dirs(dataset_path):
                     session_path = os.path.join(dataset_path, session)
 
                     for trial in get_dirs(session_path):
-                        # get paths to metadata, 3d pose, and images
                         trial_path = os.path.join(session_path, trial)
                         future = executor.submit(
                             get_rows_trial,
                             trial_path, self.n_frames, self.split,
-                            (dataset, session, trial),
-                            mode)
+                            (dataset, session, trial))
                         futures.append(future)
-                        
+
             for future in futures:
-                add_rows = future.result()
-                rows.extend(add_rows)
+                try:
+                    add_rows = future.result()
+                    rows.extend(add_rows)
+                except Exception as e:
+                    print(f'WARNING: skipping trial due to error: {e}')
 
-        columns = ['dataset', 'session', 'trial', 'camera_metadata_path', 
-                   'pose_path', 'img_path', 'start_ix', 'interval', 
-                   # 'camera_heights', 'camera_widths'
-                   ]
+        columns = ['dataset', 'session', 'trial', 'camera_metadata_path',
+                   'pose_path', 'img_path', 'start_ix', 'interval', 'mode']
 
-        df = pd.DataFrame(rows, columns = columns)
-        # df['camera_heights'] = df['camera_heights'].apply(json.dumps)
-        # df['camera_widths'] = df['camera_widths'].apply(json.dumps)
+        df = pd.DataFrame(rows, columns=columns)
 
-        return df 
+        return df
     
     def _balance_group(self, df, n_samples = 1000, random_state = 3): 
 
