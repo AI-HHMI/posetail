@@ -46,6 +46,63 @@ def _rotated_rect_max_inscribed(w, h, angle_rad):
     return cw, ch
 
 
+def rotate_points_image_plane(cam, coords, angle_deg):
+    """In-plane image rotation for the 2D path: rotate pixel coords + camera together.
+
+    Unlike augment_image_rotation (3D), the 2D `coords` ARE pixel coordinates used
+    directly as ground truth, so the SAME affine that cv2.warpAffine applies to the
+    image is applied to the coords (coords @ M[:,:2].T + M[:,2]). No extrinsic Z-roll
+    is performed (that would double-apply the rotation). Only `mat` (principal point),
+    `offset`, and `size` are updated. Canvas-expand + inscribed-crop math is identical
+    to augment_image_rotation.
+
+    Returns (cam_rot, coords_rot, (M_2x3, (cw_i, ch_i))).
+    """
+    angle_rad = np.radians(angle_deg)
+    w, h = cam['size'].tolist()
+    cx = float(cam['mat'][0, 2].item())
+    cy = float(cam['mat'][1, 2].item())
+    off_x = float(cam['offset'][0].item())
+    off_y = float(cam['offset'][1].item())
+
+    # rotate around the cropped principal point (equals image center for the
+    # nominal 2D camera; correct for real-calibrated 2D cameras too).
+    center_x = cx - off_x
+    center_y = cy - off_y
+    M_2x3 = cv2.getRotationMatrix2D((center_x, center_y), angle_deg, 1.0)
+
+    corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float64)
+    corners_rot = corners @ M_2x3[:, :2].T + M_2x3[:, 2]
+    min_x, min_y = corners_rot.min(axis=0)
+    tx, ty = -min_x, -min_y
+    M_2x3[0, 2] += tx
+    M_2x3[1, 2] += ty
+
+    # Crop to the largest axis-aligned border-free rectangle.
+    cw, ch = _rotated_rect_max_inscribed(w, h, angle_rad)
+    cw_i, ch_i = int(np.floor(cw)), int(np.floor(ch))
+    img_ctr = M_2x3[:, :2] @ np.array([w / 2, h / 2]) + M_2x3[:, 2]
+    x1 = img_ctr[0] - cw_i / 2
+    y1 = img_ctr[1] - ch_i / 2
+    M_2x3[0, 2] -= x1
+    M_2x3[1, 2] -= y1
+
+    cam_rot = dict(cam)
+    # principal point tracks canvas expansion (tx, ty) and crop offset (x1, y1);
+    # mat[:2,:2] unchanged. ext/ext_inv/center deliberately untouched (see docstring).
+    cam_rot['mat'] = cam['mat'].clone()
+    cam_rot['mat'][0, 2] = cam['mat'][0, 2] + tx - x1
+    cam_rot['mat'][1, 2] = cam['mat'][1, 2] + ty - y1
+    cam_rot['offset'] = cam['offset'].clone()
+    cam_rot['size'] = torch.tensor([cw_i, ch_i], dtype=torch.int32,
+                                   device=cam['size'].device)
+
+    M_t = torch.as_tensor(M_2x3, dtype=coords.dtype, device=coords.device)
+    coords_rot = coords @ M_t[:, :2].T + M_t[:, 2]
+
+    return cam_rot, coords_rot, (M_2x3, (cw_i, ch_i))
+
+
 def load_image(cam_img_path, crop_coords=None, target_size=None, rotation=None):
     img = cv2.imread(cam_img_path)
     if img is None:
@@ -436,6 +493,14 @@ class PosetailDataset(Dataset):
 
             cgroup = self._build_2d_cgroup(row, img_path, cam_names)
 
+            # per-image rotation augmentation (before validity/crop/resize so the
+            # coord transforms match load_image's warpAffine -> crop -> resize order;
+            # the bounds filter below then drops points rotated outside the new size)
+            if should_augment:
+                cgroup, rotation_info, coords = self.augment_image_rotation_2d(cgroup, coords)
+            else:
+                rotation_info = [None]
+
             # validity: finite coords inside image bounds
             size_tensor = cgroup[0]['size']
             valid_mask = _vis_2d_bounds(coords, size_tensor)
@@ -486,9 +551,6 @@ class PosetailDataset(Dataset):
                 sy = float(new_size[1]) / float(old_size[1])
                 scale_xy = torch.tensor([sx, sy], dtype=coords.dtype)
                 coords = coords * scale_xy
-
-            # skip 3D rotation for 2D
-            rotation_info = [None]
 
             # query times
             if self.query_anytime:
@@ -1126,6 +1188,21 @@ class PosetailDataset(Dataset):
             rotation_info.append((M_2x3, (cw_i, ch_i)))
 
         return cgroup_rotated, rotation_info
+
+
+    def augment_image_rotation_2d(self, cgroup, coords):
+        """Random in-plane rotation for the single-camera 2D path.
+
+        Rolls aug_prob; on skip returns (cgroup, [None], coords) unchanged.
+        Otherwise rotates the lone camera + pixel coords via rotate_points_image_plane.
+        rotation_info is a length-1 list, matching the consumer at the image-load loop.
+        """
+        if np.random.random() >= self.aug_prob:
+            return cgroup, [None], coords
+
+        angle = float(np.random.uniform(-45, 45))
+        cam_rot, coords_rot, rot = rotate_points_image_plane(cgroup[0], coords, angle)
+        return [cam_rot], [rot], coords_rot
 
 
     def rotate_camera_group(self, cgroup, coords):
