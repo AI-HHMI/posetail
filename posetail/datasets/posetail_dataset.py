@@ -411,6 +411,9 @@ class PosetailDataset(Dataset):
 
         print("total length:", len(self.metadata))
         self.good_index = np.ones(len(self.metadata), dtype='bool')
+        # positional indices per dataset, aligned with good_index, for
+        # same-dataset-first resampling when get_item_actual fails
+        self.dataset_indices = self.metadata.groupby('dataset').indices
         # self.metadata_path = os.path.join(data_path, 'posetail_metadata.csv')
         # self.metadata.to_csv(self.metadata_path, index = False)
 
@@ -430,15 +433,21 @@ class PosetailDataset(Dataset):
                     out = None
             if out is not None:
                 return out
-            
+
             self.good_index[start] = False
-            start = np.random.randint(len(self.metadata))
             if np.sum(self.good_index) == 0:
-                return None # no valid samples
-            
-            # if start >= self.__len__():
-            #     start = np.random.randint(self.__len__())
-                
+                return None  # no valid samples anywhere
+
+            # prefer another good sample from the SAME dataset as the failed one
+            dataset = self.metadata['dataset'].values[start]
+            same = self.dataset_indices[dataset]
+            good_same = same[self.good_index[same]]
+            if len(good_same) > 0:
+                start = int(np.random.choice(good_same))
+            else:
+                # this dataset is exhausted of good samples — fall back globally
+                start = np.random.randint(len(self.metadata))
+
         
     def get_item_actual(self, idx):
         row = self.metadata.loc[idx].to_dict()
