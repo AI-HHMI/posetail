@@ -85,7 +85,6 @@ class TrackerEncoder(nn.Module):
             transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
         ])
 
-
         self.scene_encoder = SceneRepresentation(
             version = self.video_encoder_version,
             freeze_encoder = not video_encoder_requires_grad,

@@ -22,7 +22,7 @@ dependencies = [
     "setuptools<81",
     "hiera-transformer", "timm",
     "sam-2 @ git+https://github.com/facebookresearch/sam2.git",
-     # "vjepa2 @ git+https://github.com/facebookresearch/vjepa2.git",
+    # "vjepa2 @ git+https://github.com/facebookresearch/vjepa2.git",
     "schedulefree", "decord", "tqdm"
     ]
 requires-python = ">=3.11"
@@ -54,6 +54,7 @@ channels = ["conda-forge"]
 platforms = ["linux-64"]
 
 [tool.pixi.pypi-dependencies]
+cotracker = { path = "/home/ruppk2@hhmi.org/software/co-tracker", editable = true }
 posetail = { path = ".", editable = true }
 torch = { version = "<3", index="https://download.pytorch.org/whl/cu128"}
 torchvision = {version ="*", index="https://download.pytorch.org/whl/cu128"}
