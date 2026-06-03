@@ -1,0 +1,138 @@
+[wandb]
+project_name = 'posetail-ablations'
+path = '/groups/karashchuk/home/ruppk2/results/posetail-ablations'
+mode = 'online' # 'online', 'offline', 'disabled'
+
+[dataset]
+batch_size = 1
+num_workers = 12
+# prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-tests/kubric-multiview-subset'
+# prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-tests/wrapped'
+# prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-visibility'
+# prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning'
+# prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-test'
+prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-odyssey'
+# datasets_to_exclude = ['anipose-fly', 'allen-mouse']
+
+[dataset.train]
+split_dir = 'train'
+n_frames = 16
+min_res = 256
+max_res = 256
+cams_to_sample = [1, 8] 
+kpts_to_sample = [128, 128]
+aug_prob = 0.25
+enable_kpt_filtering = false
+cam_thresh_for_vis = 1
+balance_datasets = true
+n_samples_per_dataset = -1
+crop_to_points = true
+speed_thresh = 1.0
+query_anytime = true
+query_edge_bias = 100.0
+prop_dynamic_kpts_to_sample = 0.95
+prob_2d_only = 0.0
+
+[dataset.val]
+split_dir = 'val'
+n_frames = 16
+max_res = 256
+cams_to_sample = 5
+kpts_to_sample = 128
+aug_prob = 0.0
+crop_to_points = true
+speed_thresh = 1.0
+prop_dynamic_kpts_to_sample = 0.7
+query_anytime = false
+
+[dataset.test]
+split_dir = 'test'
+max_res = 256
+n_frames = 16
+project_2d = false
+aug_prob = 0.0
+
+[devices]
+device = 'cuda'
+
+
+[model]
+mode_3d = "encoder"
+
+video_encoder_version = 'large'
+video_encoder_requires_grad = false
+video_encoder_hierarchical = true
+
+# processing
+stride_length = 16
+image_size = 256
+query_patch_size = 9
+
+# query encoder
+max_freq = 10
+embedding_dim = 256
+use_volume_embedding = false
+corr_radius = 2
+
+# decoder
+latent_dim = 1024
+n_heads = 8
+n_time_space_blocks = 8
+embedding_factor = 4
+use_camera_self_attention = true
+output_mode = "residual" # direct, residual, grid
+scene_encoder_proj = false
+head_3d_grid_size = 16
+head_3d_grid_radius = 1.0
+
+[training]
+seed = 3
+# checkpoint_path = ''
+n_iterations = 400000
+# scheduler_type = 'multisteplr'
+scheduler_type = 'schedulefree'
+max_grad_norm = 50.0
+checkpoint_freq = 10240 # in iterations
+eval_metric_freq = 16 # in iterations
+val_freq = 64 # in iterations
+print_freq = 1 # in iterations
+debug_ix = -1 # only works for val 
+
+[training.optimizer]
+learning_rate = 3e-4
+weight_decay = 0.01
+warmup_steps = 1500
+beta1 = 0.9
+beta2 = 0.999
+
+[training.scheduler]
+# milestones = [50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550]
+# milestones = []
+# gamma = 0.8
+# milestones = [200]
+# gamma = 0.1
+# steps_per_epoch = 218
+
+# pct_start = 0.025
+# cycle_momentum = false
+
+[training.losses]
+gamma = 0.8
+pixel_thresh = 3
+# delta = 0.1
+delta = 6
+use_huber_loss = false
+
+# weights for calculating total loss (use 0 to not compute a specific loss)
+vis_loss_weight = 4
+conf_loss_weight = 0.0
+conf_2d_loss_weight = 0.0
+occluded_coords_loss_weight = 0.01
+feature_loss_weight = 0.0
+
+coords_loss_weight = 1.0
+coords_loss_direct_weight = 1.0
+coords_loss_rays_weight = 0.1
+coords_loss_triangulate_weight = 0.0
+coords_loss_2d_weight = 1.0
+coords_loss_depth_weight = 1.0
