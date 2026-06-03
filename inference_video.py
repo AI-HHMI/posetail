@@ -288,8 +288,40 @@ def run_tracker_encoder_on_videos(
     start_frame=0,
     n_frames=128,
     n_overlap=2,
+    max_kpts=None,
     device=None,
 ):
+    
+    # --- keypoint chunking (insert here) ---
+    n_kpts = query_points_3d.shape[0] if query_points_3d.ndim == 2 else query_points_3d.shape[1]
+    if max_kpts is not None and n_kpts > max_kpts:
+        chunk_outputs = []
+        for start_k in range(0, n_kpts, max_kpts):
+            end_k = min(start_k + max_kpts, n_kpts)
+            chunk_queries = (query_points_3d[start_k:end_k]
+                             if query_points_3d.ndim == 2
+                             else query_points_3d[:, start_k:end_k])
+            print(f'  keypoint chunk {start_k}:{end_k} of {n_kpts}')
+            chunk_out = run_tracker_encoder_on_videos(
+                model=model,
+                video_paths=video_paths,
+                camera_group=camera_group,
+                query_points_3d=chunk_queries,
+                start_frame=start_frame,
+                n_frames=n_frames,
+                n_overlap=n_overlap,
+                max_kpts=None,
+                device=device,
+            )
+            chunk_outputs.append(chunk_out)
+        return {
+            'coords_pred':   torch.cat([o['coords_pred']  for o in chunk_outputs], dim=2),
+            'vis_pred':      torch.cat([o['vis_pred']     for o in chunk_outputs], dim=2),
+            'conf_pred':     torch.cat([o['conf_pred']    for o in chunk_outputs], dim=2),
+            'frame_numbers': chunk_outputs[0]['frame_numbers'],
+            'crop_history':  [h for o in chunk_outputs for h in o['crop_history']],
+        }
+
     if device is None:
         device = next(model.parameters()).device
 
@@ -363,6 +395,10 @@ def run_tracker_encoder_on_videos(
             if actual_clip_len == 0:
                 break
 
+            for i in range(len(views)):
+                if views[i].shape[0] != actual_clip_len:
+                    raise ValueError('All videos must provide the same number of frames')
+
             # Model requires exactly model.n_frames; pad if we got fewer
             if actual_clip_len < model.n_frames:
                 pad_len = model.n_frames - actual_clip_len
@@ -373,10 +409,6 @@ def run_tracker_encoder_on_videos(
 
             # Only keep predictions for frames we actually need
             keep_len = min(actual_clip_len, remaining)
-
-            for i in range(len(views)):
-                if views[i].shape[0] != actual_clip_len:
-                    raise ValueError('All videos must provide the same number of frames')
 
             crop_history.append({
                 'start_frame': current_frame,
@@ -531,36 +563,37 @@ def load_trial(trial_path, start_frame=0):
     else:
         raise FileNotFoundError(f'Neither img/ nor vid/ folder found in {trial_path}')
 
-    # load query points from pose3d.npz at start_frame
+
     data = np.load(pose_path)
     coords = data['pose']  # (subjects, time, n_kpts, 3)
+    vis_gt = data['vis'] if 'vis' in data else None  # (subjects, time, n_kpts) or None
+
     n_subjects = coords.shape[0]
     n_kpts = coords.shape[2]
 
     coords_at_start = coords[:, start_frame, :, :]  # (subjects, n_kpts, 3)
 
-    # Build per-subject query points (list of tensors, each (n_valid_kpts, 3))
     per_subject_queries = []
     per_subject_valid_masks = []
     for s in range(n_subjects):
-        subject_coords = coords_at_start[s]  # (n_kpts, 3)
+        subject_coords = coords_at_start[s]
         valid = np.all(np.isfinite(subject_coords), axis=1)
         per_subject_valid_masks.append(valid)
         per_subject_queries.append(
             torch.as_tensor(subject_coords[valid], dtype=torch.float32)
         )
 
-    # Also build the concatenated version (original behavior)
-    coords_flat = coords_at_start.reshape(-1, 3)  # (subjects * n_kpts, 3)
-    valid = np.all(np.isfinite(coords_flat), axis=1)
-    coords_flat = coords_flat[valid]
+    coords_flat = coords_at_start.reshape(-1, 3)
+    valid_flat = np.all(np.isfinite(coords_flat), axis=1)  
+    coords_flat = coords_flat[valid_flat]
 
     if coords_flat.shape[0] == 0:
         raise ValueError(f'No valid (non-NaN) query points at frame {start_frame}')
 
     query_points_3d = torch.as_tensor(coords_flat, dtype=torch.float32)
 
-    return metadata_path, video_paths, query_points_3d, per_subject_queries
+    return (metadata_path, cam_names, video_paths, query_points_3d, per_subject_queries,
+            coords, vis_gt, valid_flat, per_subject_valid_masks)
 
 
 def parse_args():
@@ -574,6 +607,9 @@ def parse_args():
     parser.add_argument('--start-frame', type=int, default=0)
     parser.add_argument('--n-frames', type=int, default=128)
     parser.add_argument('--n-overlap', type=int, default=2)
+    parser.add_argument('--n-views', type=int, default=None, help='Evaluate on a random subset of the cameras')
+    parser.add_argument('--view-seed', type=int, default=None, help='Random seed for subsampling cameras')
+    parser.add_argument('--max-kpts', type=int, default=None, help='Max keypoints per model forward pass.')
     parser.add_argument('--per-subject', action='store_true', default=False,
                         help='Track each subject independently instead of concatenating all keypoints')
     parser.add_argument('--checkpoint', type=int, default=None,
@@ -602,8 +638,9 @@ def main():
     if device is None:
         device = next(model.parameters()).device
 
-    metadata_path, video_paths, query_points_3d, per_subject_queries = load_trial(
-        args.trial_path, start_frame=args.start_frame)
+    (metadata_path, cam_names, video_paths, query_points_3d, per_subject_queries,
+    coords_gt, vis_gt_raw, valid_flat, per_subject_valid_masks) = load_trial(
+            args.trial_path, start_frame=args.start_frame)
 
     camera_group = load_camera_group_from_metadata(metadata_path, device='cpu')
 
@@ -612,6 +649,20 @@ def main():
             f'Number of video paths ({len(video_paths)}) does not match '
             f'number of cameras ({len(camera_group)}) in metadata'
         )
+    
+    # subsample cameras 
+    n_cams_total = len(camera_group)
+    cam_indices_used = list(range(n_cams_total))
+    cam_names_used = [cam_names[i] for i in cam_indices_used]
+
+    if args.n_views is not None and args.n_views < n_cams_total:
+        rng = np.random.default_rng(args.view_seed)
+        cam_indices_used = sorted(rng.choice(n_cams_total, args.n_views, replace=False).tolist())
+        print(f'Subsampling {args.n_views}/{n_cams_total} cameras: indices {cam_indices_used}')
+        camera_group = [camera_group[i] for i in cam_indices_used]
+        video_paths  = [video_paths[i] for i in cam_indices_used]
+    elif args.n_views is not None:
+        print(f'--n-views={args.n_views} >= available cameras ({n_cams_total}); using all cameras')
 
     if args.per_subject:
         all_subject_outputs = []
@@ -628,6 +679,7 @@ def main():
                 start_frame=args.start_frame,
                 n_frames=args.n_frames,
                 n_overlap=args.n_overlap,
+                max_kpts=args.max_kpts,
                 device=device,
             )
             subj_out['subject_idx'] = subj_idx
@@ -679,9 +731,57 @@ def main():
             start_frame=args.start_frame,
             n_frames=args.n_frames,
             n_overlap=args.n_overlap,
+            max_kpts=args.max_kpts,
             device=device,
         )
 
+    # --- Ground-truth extraction ---
+    frame_nums = (outputs['frame_numbers'].numpy()
+                  if isinstance(outputs['frame_numbers'], torch.Tensor)
+                  else np.asarray(outputs['frame_numbers']))
+    n_time_gt = coords_gt.shape[1]
+    frame_nums_gt = np.clip(frame_nums, 0, n_time_gt - 1)
+
+    if args.per_subject and 'subject_indices' in outputs:
+        coords_true_parts, vis_true_parts = [], []
+        for s_idx in outputs['subject_indices']:
+            vmask = per_subject_valid_masks[s_idx]
+            subj_coords = coords_gt[s_idx, frame_nums_gt]          # (T, n_kpts, 3)
+            subj_coords = subj_coords[:, vmask, :]                 # (T, K_s, 3)
+            coords_true_parts.append(subj_coords)
+
+            if vis_gt_raw is not None:
+                subj_vis = vis_gt_raw[s_idx, frame_nums_gt]        # (T, n_kpts, n_cams)
+                subj_vis = subj_vis[:, vmask, :].any(axis=-1, keepdims=True)  # (T, K_s, 1)
+            else:
+                subj_vis = np.all(np.isfinite(subj_coords), axis=-1, keepdims=True)
+            vis_true_parts.append(subj_vis)
+
+        coords_true = np.concatenate(coords_true_parts, axis=1)[np.newaxis]  # (1, T, K, 3)
+        vis_true    = np.concatenate(vis_true_parts,    axis=1)[np.newaxis]  # (1, T, K, 1)
+
+    else:
+        n_subj, n_time_full, n_kpts_full, _ = coords_gt.shape
+
+        # coords_gt is (n_subj, n_time, n_kpts, 3)
+        # transpose to (n_subj, n_kpts, n_time, 3) before flattening subjects+kpts
+        coords_flat_all = coords_gt.transpose(0, 2, 1, 3)                    # (n_subj, n_kpts, n_time, 3)
+        coords_flat_all = coords_flat_all.reshape(n_subj * n_kpts_full, n_time_full, 3)  # (S*K, n_time, 3)
+        coords_flat_all = coords_flat_all[valid_flat]                         # (K_valid, n_time, 3)
+        coords_true = coords_flat_all[:, frame_nums_gt, :].transpose(1, 0, 2)[np.newaxis]  # (1, T, K_valid, 3)
+
+        if vis_gt_raw is not None:
+            # vis_gt_raw is (n_subj, n_time, n_kpts, n_cams) — aggregate across cameras
+            vis_agg = vis_gt_raw.any(axis=-1)                                 # (n_subj, n_time, n_kpts)
+            vis_flat_all = vis_agg.transpose(0, 2, 1)                        # (n_subj, n_kpts, n_time)
+            vis_flat_all = vis_flat_all.reshape(n_subj * n_kpts_full, n_time_full)  # (S*K, n_time)
+            vis_flat_all = vis_flat_all[valid_flat]                           # (K_valid, n_time)
+            vis_true = vis_flat_all[:, frame_nums_gt].T[:, :, np.newaxis][np.newaxis]  # (1, T, K_valid, 1)
+        else:
+            vis_true = np.all(np.isfinite(coords_true), axis=-1, keepdims=True)
+
+    outputs['coords_true'] = coords_true   # (1, T, K, 3)
+    outputs['vis_true'] = vis_true      # (1, T, K, 1)
     outputs['video_paths'] = np.array(video_paths, dtype=str)
     outputs['metadata_path'] = metadata_path
     outputs['trial_path'] = args.trial_path
@@ -691,6 +791,9 @@ def main():
     outputs['n_frames_requested'] = args.n_frames
     outputs['n_overlap'] = args.n_overlap
     outputs['per_subject'] = args.per_subject
+    outputs['n_cams_total'] = len(camera_group)
+    outputs['cam_names_used'] = np.array(cam_names_used, dtype=str)
+
     if isinstance(outputs['coords_pred'], torch.Tensor) and outputs['coords_pred'].ndim >= 2:
         outputs['n_frames_returned'] = outputs['coords_pred'].shape[1]
     else:
