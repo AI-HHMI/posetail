@@ -24,6 +24,7 @@ nvidia-smi
 
 # pixi environment 
 export PATH="$HOME/.pixi/bin:$PATH"
+export PYTHONPATH="/groups/karashchuk/home/karashchukl/builds/vjepa2:$PYTHONPATH"
 pixi --version
 
 pixi install 
