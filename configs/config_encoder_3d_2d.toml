@@ -15,6 +15,7 @@ num_workers = 12
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning'
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-test'
 prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-odyssey'
+# prefix = '/data/animal-datasets-processed/ptest'
 # To mix 3D and 2D datasets point prefix at a directory that contains both
 # dataset sub-directories with pose3d.npz (3D) and pose2d.npz (2D) trials.
 # 2D datasets do not need vis or calibrated cameras; metadata.yaml is optional.
@@ -101,6 +102,7 @@ embedding_factor = 4
 use_camera_self_attention = true
 use_temporal_self_attention = true
 output_mode = "direct"
+f_eff_scale = true
 scene_encoder_proj = false
 head_3d_grid_size = 16
 head_3d_grid_radius = 1.0
