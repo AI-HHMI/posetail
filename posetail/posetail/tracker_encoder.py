@@ -23,6 +23,7 @@ class TrackerEncoder(nn.Module):
                  video_encoder_version = 'giant',
                  video_encoder_requires_grad = False,
                  video_encoder_hierarchical = True,
+                 video_encoder_finetune_last_n_layers = None,
                  corr_radius = 3, 
                  max_freq = 10, n_iters = 4, embedding_dim = 256,
                  query_patch_size = 9,
@@ -57,9 +58,21 @@ class TrackerEncoder(nn.Module):
             self.stride_overlap = stride_overlap 
         
         # encoder params
-        self.video_encoder_requires_grad = video_encoder_requires_grad
+        # video_encoder_requires_grad may be a bool (freeze/unfreeze for the whole
+        # run) or an int (iteration at which to switch gradients on). When it's an
+        # int the encoder starts frozen and is unfrozen later via
+        # maybe_unfreeze_video_encoder().
+        # NOTE: bool is a subclass of int, so check bool first.
+        if isinstance(video_encoder_requires_grad, bool):
+            self.video_encoder_unfreeze_iter = None
+            initial_requires_grad = video_encoder_requires_grad
+        else:
+            self.video_encoder_unfreeze_iter = int(video_encoder_requires_grad)
+            initial_requires_grad = False
+        self.video_encoder_requires_grad = initial_requires_grad
         self.video_encoder_version = video_encoder_version
         self.video_encoder_hierarchical = video_encoder_hierarchical
+        self.video_encoder_finetune_last_n_layers = video_encoder_finetune_last_n_layers
         
 
         # query encoder params
@@ -96,11 +109,12 @@ class TrackerEncoder(nn.Module):
 
         self.scene_encoder = SceneRepresentation(
             version = self.video_encoder_version,
-            freeze_encoder = not video_encoder_requires_grad,
+            freeze_encoder = not initial_requires_grad,
             n_frames = self.n_frames,
             image_size = self.image_size,
             hierarchical_features = self.video_encoder_hierarchical,
             decoder_dim = latent_dim if scene_encoder_proj else None,
+            video_encoder_finetune_last_n_layers = self.video_encoder_finetune_last_n_layers,
         )
         
         self.query_encoder = QueryEncoder(
@@ -128,7 +142,24 @@ class TrackerEncoder(nn.Module):
             f_eff_scale=f_eff_scale,
         )
 
+    def unfreeze_video_encoder(self, iteration):
+        """Unfreeze the video encoder once `iteration` reaches the configured
+        switch-on point (video_encoder_requires_grad given as an int).
 
+        Returns True the iteration the encoder is unfrozen, False otherwise.
+        Safe to call every iteration -- it is a no-op when there is nothing
+        scheduled or once the encoder is already trainable.
+        """
+        if self.video_encoder_unfreeze_iter is None:
+            return False
+        if self.video_encoder_requires_grad:
+            return False
+        if iteration < self.video_encoder_unfreeze_iter:
+            return False
+
+        self.scene_encoder.set_encoder_requires_grad(True)
+        self.video_encoder_requires_grad = True
+        return True
 
     def print_summary(self):
         print("Hey! PARAMETERS")

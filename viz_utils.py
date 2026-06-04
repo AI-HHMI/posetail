@@ -142,8 +142,8 @@ def generate_videos_2d(data_path, predictions_path, output_dir):
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS)
 
-        out_path = os.path.join(output_dir, f'{cam['name']}.mp4")
-
+        out_path = os.path.join(output_dir, f"{cam['name']}.mp4") 
+                                                               
         writer = cv2.VideoWriter(
             str(out_path),
             cv2.VideoWriter_fourcc(*'mp4v'),
