@@ -815,9 +815,12 @@ class PosetailDataset(Dataset):
         (2) metadata.yaml with only camera_widths/heights -> nominal pinhole;
         (3) no usable metadata -> read one image to get the size.
         """
+        # NOTE: a missing path is `None` for an all-2D metadata column (object
+        # dtype) but float `nan` once 3D string paths coexist (pandas infers the
+        # str dtype and coerces None->nan). isinstance(..., str) catches both.
         metadata_path = row['camera_metadata_path']
         cam_meta = None
-        if metadata_path is not None and os.path.exists(metadata_path):
+        if isinstance(metadata_path, str) and os.path.exists(metadata_path):
             cam_meta = load_yaml(metadata_path)
 
         if cam_meta is not None and all(
