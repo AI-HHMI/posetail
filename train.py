@@ -165,6 +165,7 @@ def run(config_path, fabric):
     torch.autograd.set_detect_anomaly(False)
     
     if fabric.is_global_zero:
+        os.makedirs(config.wandb.path, exist_ok=True)
         wandb.init(
             project = config.wandb.project_name,
             dir = config.wandb.path,
