@@ -648,11 +648,8 @@ class Decoder(nn.Module):
         # W ~ N(0, std^2) with zero bias the head-output std is std * sqrt(embed_dim). We fix that
         # *output* std (sigma_out) and back out std = sigma_out / sqrt(embed_dim), so the effective
         # init scale is independent of latent_dim (a fixed std would grow as sqrt(embed_dim)).
-        # The recalibrated output scales make every head's normalized target O(1), so the
-        # regression heads use sigma_out = 1, which is exactly LeCun normal (std = 1/sqrt(fan_in)).
-        # The logit heads use sigma_out = 0.2 so sigmoid/softmax start near neutral.
-        HEAD_OUT_STD_REG = 1.0
-        HEAD_OUT_STD_LOGIT = 0.2
+        HEAD_OUT_STD_REG = 0.01
+        HEAD_OUT_STD_LOGIT = 0.25
         reg_std = HEAD_OUT_STD_REG / (self.embed_dim ** 0.5)
         logit_std = HEAD_OUT_STD_LOGIT / (self.embed_dim ** 0.5)
 
