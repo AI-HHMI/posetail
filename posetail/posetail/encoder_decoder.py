@@ -643,21 +643,34 @@ class Decoder(nn.Module):
         self.heads_depth   = _make_heads(1)
         self.heads_conf_3d = _make_heads(1)
 
+        # Variance-matched, dimension-invariant head init.
+        # The LayerNorm gives each head a unit-variance input (Sum_i x_i^2 = embed_dim), so for
+        # W ~ N(0, std^2) with zero bias the head-output std is std * sqrt(embed_dim). We fix that
+        # *output* std (sigma_out) and back out std = sigma_out / sqrt(embed_dim), so the effective
+        # init scale is independent of latent_dim (a fixed std would grow as sqrt(embed_dim)).
+        # The recalibrated output scales make every head's normalized target O(1), so the
+        # regression heads use sigma_out = 1, which is exactly LeCun normal (std = 1/sqrt(fan_in)).
+        # The logit heads use sigma_out = 0.2 so sigmoid/softmax start near neutral.
+        HEAD_OUT_STD_REG = 1.0
+        HEAD_OUT_STD_LOGIT = 0.2
+        reg_std = HEAD_OUT_STD_REG / (self.embed_dim ** 0.5)
+        logit_std = HEAD_OUT_STD_LOGIT / (self.embed_dim ** 0.5)
+
         # Weight init — applied to both mode heads
         for m in range(2):
             for head in [self.heads_2d[m][1], self.heads_depth[m][1]]:
-                nn.init.normal_(head.weight, std=0.001)
+                nn.init.normal_(head.weight, std=reg_std)
                 nn.init.zeros_(head.bias)
 
             if output_mode == 'grid':
                 nn.init.zeros_(self.heads_3d[m][1].weight)
                 nn.init.zeros_(self.heads_3d[m][1].bias)
             else:
-                nn.init.normal_(self.heads_3d[m][1].weight, std=0.001)
+                nn.init.normal_(self.heads_3d[m][1].weight, std=reg_std)
                 nn.init.zeros_(self.heads_3d[m][1].bias)
 
             for head in [self.heads_vis[m][1], self.heads_conf[m][1], self.heads_conf_3d[m][1]]:
-                nn.init.normal_(head.weight, mean=0.0, std=0.01)
+                nn.init.normal_(head.weight, mean=0.0, std=logit_std)
                 nn.init.zeros_(head.bias)
 
         # Learnable output scales (shared across modes), initialised to data-driven
