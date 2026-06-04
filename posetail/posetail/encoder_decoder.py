@@ -597,7 +597,8 @@ class Decoder(nn.Module):
                  use_temporal_self_attention=False,
                  output_mode="direct",
                  head_3d_grid_size=8,
-                 head_3d_grid_radius=1.0):
+                 head_3d_grid_radius=1.0,
+                 f_eff_scale=False):
         super().__init__()
 
         self.embed_dim = embed_dim
@@ -606,6 +607,7 @@ class Decoder(nn.Module):
         self.use_camera_self_attention = use_camera_self_attention
         self.use_temporal_self_attention = use_temporal_self_attention
         self.output_mode = output_mode
+        self.f_eff_scale = f_eff_scale
         self.head_3d_grid_size = head_3d_grid_size
         self.head_3d_grid_radius = head_3d_grid_radius
 
@@ -673,39 +675,62 @@ class Decoder(nn.Module):
         self.heads_depth   = _make_heads(1)
         self.heads_conf_3d = _make_heads(1)
 
+        # Variance-matched, dimension-invariant head init.
+        # The LayerNorm gives each head a unit-variance input (Sum_i x_i^2 = embed_dim), so for
+        # W ~ N(0, std^2) with zero bias the head-output std is std * sqrt(embed_dim). We fix that
+        # *output* std (sigma_out) and back out std = sigma_out / sqrt(embed_dim), so the effective
+        # init scale is independent of latent_dim (a fixed std would grow as sqrt(embed_dim)).
+        HEAD_OUT_STD_REG = 0.01
+        HEAD_OUT_STD_LOGIT = 0.25
+        reg_std = HEAD_OUT_STD_REG / (self.embed_dim ** 0.5)
+        logit_std = HEAD_OUT_STD_LOGIT / (self.embed_dim ** 0.5)
+
         # Weight init — applied to both mode heads
         for m in range(2):
             for head in [self.heads_2d[m][1], self.heads_depth[m][1]]:
-                nn.init.normal_(head.weight, std=0.001)
+                nn.init.normal_(head.weight, std=reg_std)
                 nn.init.zeros_(head.bias)
 
             if output_mode == 'grid':
                 nn.init.zeros_(self.heads_3d[m][1].weight)
                 nn.init.zeros_(self.heads_3d[m][1].bias)
             else:
-                nn.init.normal_(self.heads_3d[m][1].weight, std=0.001)
+                nn.init.normal_(self.heads_3d[m][1].weight, std=reg_std)
                 nn.init.zeros_(self.heads_3d[m][1].bias)
 
             for head in [self.heads_vis[m][1], self.heads_conf[m][1], self.heads_conf_3d[m][1]]:
-                nn.init.normal_(head.weight, mean=0.0, std=0.01)
+                nn.init.normal_(head.weight, mean=0.0, std=logit_std)
                 nn.init.zeros_(head.bias)
 
-        # Learnable output scales (shared across modes)
-        if self.output_mode == 'direct':
-            self.scale_3d = nn.Parameter(torch.tensor([500.0]))
+        # Learnable output scales (shared across modes), initialised to data-driven
+        # magnitudes (see scripts/estimate_scale_stats.py).
+        #
+        # Absolute outputs (direct/grid 3D head, depth head) regress ~depth/cube_scale,
+        # which equals the effective focal `f_eff` (~1e3, varies ~13x across datasets):
+        #   - f_eff_scale on  → these are multiplied by f_eff per-camera in the forward,
+        #     so the learnable residual collapses to ~1 (and stays uniform across datasets).
+        #   - f_eff_scale off → the scale must absorb the whole f_eff, so it inits near the
+        #     cross-dataset median (~1e3).
+        # The 3D *residual* and the 2D outputs are motion / pixel quantities that carry no
+        # f_eff, so they init the same regardless of the flag.
+        #
+        # Init values do not affect checkpoint loading (load_state_dict overwrites the
+        # Parameters); when f_eff_scale is off the forward is also unchanged, so old
+        # checkpoints load and infer identically.
+        abs_scale = 1.0 if self.f_eff_scale else 1000.0
+
+        if self.output_mode in ('direct', 'grid'):
+            self.scale_3d = nn.Parameter(torch.tensor([abs_scale]))
             self.scale_2d = nn.Parameter(torch.tensor([128.0]))
         elif self.output_mode == 'residual':
-            self.scale_3d = nn.Parameter(torch.tensor([1.0]))
-            self.scale_2d = nn.Parameter(torch.tensor([1.0]))
+            self.scale_3d = nn.Parameter(torch.tensor([8.0]))
+            self.scale_2d = nn.Parameter(torch.tensor([6.0]))
         elif self.output_mode == 'resdirect':
-            # Per-mode: index 0 = 2D-query head (direct), index 1 = 3D-query head (residual)
-            self.scale_3d = nn.Parameter(torch.tensor([500.0, 1.0]))
-            self.scale_2d = nn.Parameter(torch.tensor([1.0]))
-        else:  # grid
-            self.scale_3d = nn.Parameter(torch.tensor([500.0]))
-            self.scale_2d = nn.Parameter(torch.tensor([128.0]))
+            # index 0 = 2D-query head (direct/absolute), index 1 = 3D-query head (residual)
+            self.scale_3d = nn.Parameter(torch.tensor([abs_scale, 8.0]))
+            self.scale_2d = nn.Parameter(torch.tensor([6.0]))
 
-        self.scale_depth = nn.Parameter(torch.tensor([500.0]))
+        self.scale_depth = nn.Parameter(torch.tensor([abs_scale]))
 
     def forward(self, scene_features, query_embeds, rays, mode_idx):
         """

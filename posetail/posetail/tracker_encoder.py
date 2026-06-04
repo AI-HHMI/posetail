@@ -40,7 +40,8 @@ class TrackerEncoder(nn.Module):
                  output_mode = 'direct',
                  scene_encoder_proj = False,
                  head_3d_grid_size = 8,
-                 head_3d_grid_radius = 1.0):
+                 head_3d_grid_radius = 1.0,
+                 f_eff_scale = False):
         super().__init__()
 
         self.mode_3d = mode_3d
@@ -95,6 +96,7 @@ class TrackerEncoder(nn.Module):
         self.use_temporal_self_attention = use_temporal_self_attention
         self.output_mode = output_mode
         self.scene_encoder_proj = scene_encoder_proj
+        self.f_eff_scale = f_eff_scale
 
         assert output_mode in ['direct', 'residual', 'grid', 'resdirect'], 'output_mode should be "direct", "residual", "grid", or "resdirect"'
         
@@ -137,6 +139,7 @@ class TrackerEncoder(nn.Module):
             output_mode=self.output_mode,
             head_3d_grid_size=head_3d_grid_size,
             head_3d_grid_radius=head_3d_grid_radius,
+            f_eff_scale=f_eff_scale,
         )
 
     def unfreeze_video_encoder(self, iteration):
@@ -196,6 +199,20 @@ class TrackerEncoder(nn.Module):
         if not self.per_camera_cube_scale:
             med = torch.median(cube_scale, dim=0).values  # (B,)
             cube_scale = med[None, :].expand(n_cams, B).contiguous()
+
+        # Effective focal per camera (cropped+resized intrinsics). cube_scale only converts
+        # world->pixels, leaving a leftover f_eff factor in the absolute-depth outputs; scaling
+        # those by f_eff (~= scene depth Z) makes the head targets O(1) uniformly across datasets.
+        # Gated on R==3 like cube_scale (the 2D-only path keeps cube_scale==1, so f_eff==1).
+        if self.f_eff_scale:
+            if R == 3:
+                f_eff = torch.stack([
+                    0.5 * (cam['mat'][0, 0] + cam['mat'][1, 1]) for cam in camera_group
+                ]).to(device)  # (n_cams,)
+                if not self.per_camera_cube_scale:
+                    f_eff = torch.full((n_cams,), torch.median(f_eff).item(), device=device)
+            else:
+                f_eff = torch.ones((n_cams,), device=device)
 
         # Ray translations must share a scale across cameras so that PROPE-style
         # CameraSelfAttention sees consistent inter-camera geometry.
@@ -294,6 +311,9 @@ class TrackerEncoder(nn.Module):
 
         # Softplus for depth prediction
         depth_pred_scaled = F.softplus(depth_pred[..., 0]) * rearrange(cube_scale, 'cams b -> cams b 1 1')
+        if self.f_eff_scale:
+            # depth is absolute in every output mode -> always f_eff-scaled
+            depth_pred_scaled = depth_pred_scaled * rearrange(f_eff, 'cams -> cams 1 1 1').to(depth_pred_scaled.dtype)
 
 
         if self.output_mode in ('residual', 'resdirect'):
@@ -345,10 +365,15 @@ class TrackerEncoder(nn.Module):
         rays_c = torch.stack([points_to_rays(cam, center, normalize_t=False)[0] for cam in camera_group])
         rays_c_inv = _invert_SE3(rays_c)  # [cams, 4, 4], ray-local → world
         
-        p3d_cams = points_3d_raw * rearrange(cube_scale, 'cams b -> cams b 1 1 1')
-
         add_residual = (self.output_mode == 'residual') or \
                        (self.output_mode == 'resdirect' and R == 3)
+
+        p3d_cams = points_3d_raw * rearrange(cube_scale, 'cams b -> cams b 1 1 1')
+        if self.f_eff_scale and not add_residual:
+            # direct 3D output is an absolute ray-local position -> f_eff-scaled.
+            # The residual branch (motion offset) is NOT scaled (handled by scale_3d only).
+            p3d_cams = p3d_cams * rearrange(f_eff, 'cams -> cams 1 1 1 1').to(p3d_cams.dtype)
+
         if add_residual:
             if R == 3:
                 query_world = repeat(
