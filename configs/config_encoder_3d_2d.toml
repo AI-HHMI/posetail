@@ -1,6 +1,6 @@
 [wandb]
-project_name = 'posetail-pretrain-v3'
-path = '/groups/karashchuk/home/karashchukl/results/posetail-pretrain-v3'
+project_name = 'posetail-pretraining-v3'
+path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3'
 mode = 'online' # 'online', 'offline', 'disabled'
 
 [dataset]
@@ -15,7 +15,7 @@ num_workers = 12
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning'
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-test'
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-odyssey'
-prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretrain-v3'
+prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3'
 # prefix = '/data/animal-datasets-processed/ptest'
 # To mix 3D and 2D datasets point prefix at a directory that contains both
 # dataset sub-directories with pose3d.npz (3D) and pose2d.npz (2D) trials.
@@ -91,14 +91,14 @@ max_freq = 10
 embedding_dim = 256
 use_volume_embedding = false
 corr_radius = 2
-principal_point_embedding = false
+principal_point_embedding = true
 intrinsic_embedding = true
 metric_ray_translation = true
 
 # decoder
 latent_dim = 512
 n_heads = 8
-n_time_space_blocks = 8
+n_time_space_blocks = 7
 embedding_factor = 4
 use_camera_self_attention = true
 use_temporal_self_attention = true
@@ -111,7 +111,7 @@ head_3d_grid_radius = 1.0
 [training]
 seed = 3
 # checkpoint_path = ''
-n_iterations = 400000
+n_iterations = 800000
 # scheduler_type = 'multisteplr'
 scheduler_type = 'schedulefree'
 max_grad_norm = 50.0
@@ -122,11 +122,11 @@ print_freq = 128 # in iterations
 debug_ix = -1 # only works for val 
 
 [training.optimizer]
-learning_rate = 3e-4
-weight_decay = 0.01
+learning_rate = 7e-4
+weight_decay = 0.002
 warmup_steps = 1500
 beta1 = 0.9
-beta2 = 0.999
+beta2 = 0.95
 
 [training.scheduler]
 # milestones = [50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550]
@@ -144,7 +144,7 @@ gamma = 0.8
 pixel_thresh = 3
 # delta = 0.1
 delta = 6
-use_huber_loss = false
+use_huber_loss = true
 
 # weights for calculating total loss (use 0 to not compute a specific loss)
 vis_loss_weight = 4
@@ -160,7 +160,7 @@ coords_loss_triangulate_weight = 0.0
 coords_loss_2d_weight = 1.0
 coords_loss_depth_weight = 1.0
 
-smoothness_loss_3d_weight = 1.0
-smoothness_loss_2d_weight = 1.0
+smoothness_loss_3d_weight = 0.5
+smoothness_loss_2d_weight = 0.5
 smoothness_loss_order = 4
 smoothness_loss_tolerance = 1.5
