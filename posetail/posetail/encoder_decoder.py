@@ -435,7 +435,8 @@ class QueryEncoder(nn.Module):
 
 class SceneRepresentation(nn.Module):
     def __init__(self, version='large', freeze_encoder=True, n_frames=16, image_size=256,
-                 hierarchical_features=True, decoder_dim=None):
+                 hierarchical_features=True, decoder_dim=None,
+                 video_encoder_finetune_last_n_layers=None):
         super().__init__()
 
         # Initialize encoder
@@ -461,12 +462,19 @@ class SceneRepresentation(nn.Module):
         self.patch_size = self.encoder.patch_size
         self.tubelet_size = self.encoder.tubelet_size
 
-        if freeze_encoder:
-            for param in self.encoder.parameters():
-                param.requires_grad = False
-            self.encoder.eval()
+        # When set, only the last N transformer blocks (+ final norm) of the
+        # video encoder are trainable; the rest stay frozen. None means every
+        # encoder param is trainable whenever gradients are enabled.
+        if video_encoder_finetune_last_n_layers is not None:
+            n_blocks = len(self.encoder.blocks)
+            assert 0 < video_encoder_finetune_last_n_layers <= n_blocks, (
+                f'video_encoder_finetune_last_n_layers must be in [1, {n_blocks}], '
+                f'got {video_encoder_finetune_last_n_layers}')
+        self.video_encoder_finetune_last_n_layers = video_encoder_finetune_last_n_layers
 
-        self.freeze_encoder = freeze_encoder
+        self.set_encoder_requires_grad(not freeze_encoder)
+        if freeze_encoder:
+            self.encoder.eval()
 
         self.n_frames = n_frames
         self.image_size = image_size
@@ -486,6 +494,30 @@ class SceneRepresentation(nn.Module):
         else:
             self.kv_proj = None
             self.kv_norm = None
+
+    def set_encoder_requires_grad(self, requires_grad):
+        """Toggle gradients for the underlying video encoder, e.g. to unfreeze
+        it partway through training. When finetune_last_n_layers is set and
+        gradients are being enabled, only the last N transformer blocks (plus
+        the final norm, if the encoder variant has one) are made trainable."""
+        for param in self.encoder.parameters():
+            param.requires_grad = requires_grad
+
+        if requires_grad and self.video_encoder_finetune_last_n_layers is not None:
+            # re-freeze everything, then unfreeze only the last N blocks (plus
+            # the final norm if this encoder variant has one -- the VJEPA 2.1
+            # VisionTransformer does not).
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+            trainable = list(self.encoder.blocks[-self.video_encoder_finetune_last_n_layers:])
+            encoder_norm = getattr(self.encoder, 'norm', None)
+            if encoder_norm is not None:
+                trainable.append(encoder_norm)
+            for module in trainable:
+                for param in module.parameters():
+                    param.requires_grad = True
+
+        self.freeze_encoder = not requires_grad
 
     def forward(self, views):
         """

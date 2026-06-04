@@ -333,8 +333,8 @@ class PosetailDataset(Dataset):
         self.split = split
         assert split in {'train', 'val', 'test'}
         self.split_dir = config.dataset[split].get('split_dir')
-
-        self.data_path = config.dataset.prefix
+                                                         
+        self.data_path = config.dataset[split].get('prefix') or config.dataset.get('prefix')                      
         self.datasets_to_exclude = config.dataset.get('datasets_to_exclude', [])
         self.n_frames = config.dataset[split].get('n_frames', 16)
         self.max_res = config.dataset[split].get('max_res', -1) # -1 means no resizing

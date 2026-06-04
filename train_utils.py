@@ -529,8 +529,26 @@ def train_epoch(config, model, fabric, dataloader,
     return train_dict
 
 
-def test_epoch(config, model, dataloader, loss = None, 
-               prefix = 'test/', evaluate = False): 
+def average_metrics(dicts, prefix, name = None):
+    ''' average a list of metric dicts. metric keys look like
+    "{prefix}{metric}". When name is given, the per-dataset metrics are
+    written to their own top-level wandb folder "{prefix_tag}_{name}/{metric}"
+    (e.g. "val_<dataset>/mte"), keeping them separate from the summary
+    metrics that live under the "{prefix}" folder (e.g. "val/mte"). '''
+    out = {}
+    for metric in dicts[0].keys():
+        metric_list = [float(d[metric]) for d in dicts]
+        key = metric
+        if name is not None:
+            prefix_tag = prefix.rstrip('/')
+            key = f'{prefix_tag}_{name}/{metric[len(prefix):]}'
+        out[f'{key}_avg'] = float(np.mean(metric_list))
+        out[f'{key}_std'] = float(np.std(metric_list))
+    return out
+
+
+def test_epoch(config, model, dataloader, loss = None,
+               prefix = 'test/', evaluate = False):
 
     device = model.device
     model.eval()
@@ -541,6 +559,7 @@ def test_epoch(config, model, dataloader, loss = None,
     n_batches = 0
     n_frames = 0
     metric_dicts = []
+    metric_datasets = []  # dataset name per entry in metric_dicts (batch_size=1)
 
     for j, batch in enumerate(dataloader):
 
@@ -606,6 +625,7 @@ def test_epoch(config, model, dataloader, loss = None,
                 prefix = prefix
             )
             metric_dicts.append(metrics_dict)
+            metric_datasets.append(batch.sample_info.get('dataset', 'unknown'))
 
         n_batches += 1
         n_frames += coords.shape[1]
@@ -627,14 +647,13 @@ def test_epoch(config, model, dataloader, loss = None,
     # average evaluation metrics if we evaluated
     if evaluate and metric_dicts:
 
-        avg_metrics_dict = {}
-        metrics = list(metric_dicts[0].keys())
+        # overall averages, e.g. "val/mte_avg"
+        val_dict.update(average_metrics(metric_dicts, prefix))
 
-        for metric in metrics:
-            metric_list = [float(metric_dict[metric]) for metric_dict in metric_dicts]
-            avg_metrics_dict[f'{metric}_avg'] = float(np.mean(metric_list))
-            avg_metrics_dict[f'{metric}_std'] = float(np.std(metric_list))
-
-        val_dict.update(avg_metrics_dict)
+        # per-dataset averages in their own folder, e.g. "val_<dataset_name>/mte_avg"
+        for dataset_name in sorted(set(metric_datasets)):
+            dataset_dicts = [d for d, name in zip(metric_dicts, metric_datasets)
+                             if name == dataset_name]
+            val_dict.update(average_metrics(dataset_dicts, prefix, name = dataset_name))
 
     return val_dict

@@ -56,7 +56,7 @@ python train.py --config-path configs/config_default_2d.toml
 python train.py --config-path configs/config_default_3d.toml --devices 1
 python train.py --config-path configs/config_default_3d.toml --devices 1 2
 pixi run python train.py --config-path configs/config_default_3d.toml --precision 32 --devices 1 
-pixi run python train.py --config-path configs/minicubes_kubric_pt.toml --precision 32 --devices 1 
+pixi run python train.py --config-path configs/tuning/config_encoder_3d_2d.toml --precision 32 --devices 1 --strategy ddp_find_unused_parameters_true
 '''
 
 def parse_args(): 
@@ -322,6 +322,15 @@ def run(config_path, fabric):
         train_dataset.set_progress(global_i / max(config.training.n_iterations, 1))
         result_dict = {'iteration': global_i}
         evaluate = i % eval_metric_freq == 0
+
+        # optionally unfreeze the video encoder once we reach the configured
+        # iteration (video_encoder_requires_grad set to an int in the config).
+        # Use a rank-independent iteration count so every rank flips on the same
+        # step, keeping DDP gradient sync consistent.
+        if hasattr(model, 'unfreeze_video_encoder'):
+            sync_i = start_iteration + i * fabric.world_size
+            if model.unfreeze_video_encoder(sync_i) and fabric.is_global_zero:
+                print(f"[iter {global_i}] unfroze video encoder gradients")
 
         if hasattr(optimizer, 'train'):
             optimizer.train()
