@@ -1,6 +1,6 @@
 [wandb]
-project_name = 'posetail-odyssey-pretrain'
-path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain'
+project_name = 'posetail-pretrain-v3'
+path = '/groups/karashchuk/home/karashchukl/results/posetail-pretrain-v3'
 mode = 'online' # 'online', 'offline', 'disabled'
 
 [dataset]
@@ -14,7 +14,8 @@ num_workers = 12
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-visibility'
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning'
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-test'
-prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-odyssey'
+# prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-odyssey'
+prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretrain-v3'
 # prefix = '/data/animal-datasets-processed/ptest'
 # To mix 3D and 2D datasets point prefix at a directory that contains both
 # dataset sub-directories with pose3d.npz (3D) and pose2d.npz (2D) trials.
