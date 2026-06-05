@@ -1,7 +1,7 @@
 [wandb]
-project_name = 'posetail-odyssey-finetuning'
+project_name = 'posetail-pretraining-v3'
 # path = '/data/results/lili/posetail'
-path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-finetuning'
+path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3'
 mode = 'online' # 'online', 'offline', 'disabled'
 
 [dataset]
@@ -10,9 +10,10 @@ num_workers = 12
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-tests/kubric-multiview-subset'
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-tests/wrapped'
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-visibility'
-prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v2'
+# prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v2'
+prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3'
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-test'
-datasets_to_exclude = ['anipose-fly', 'allen-mouse', 'pair-r24m']
+datasets_to_exclude = []
 
 [dataset.train]
 split_dir = 'train'
@@ -22,7 +23,7 @@ max_res = 256
 cams_to_sample = [1, 8] 
 kpts_to_sample = [128, 128]
 aug_prob = 0.25
-enable_kpt_filtering = true
+enable_kpt_filtering = false
 cam_thresh_for_vis = 1
 balance_datasets = true
 n_samples_per_dataset = -1
@@ -39,7 +40,7 @@ crop_3d_fraction = [0.05, 0.75]
 crop_3d_prob = 0.4
 
 [dataset.train.curriculum]
-enabled = true
+enabled = false
 ramp_start_frac = 0.0
 ramp_end_frac   = 0.05
 intensity_floor = 0.0
@@ -74,6 +75,14 @@ video_encoder_version = 'large'
 video_encoder_requires_grad = true
 video_encoder_hierarchical = true
 
+# If set to an int N, only the last N transformer blocks (+ final norm) of the
+# video encoder are finetuned and the rest stay frozen. Omit (or comment out)
+# to train all encoder params when video_encoder_requires_grad allows it.
+# Max N per size: base=12, large=24, giant=40, gigantic=48.
+# 
+video_encoder_finetune_last_n_layers = 12
+
+
 # processing
 stride_length = 16
 image_size = 256
@@ -85,16 +94,20 @@ max_freq = 10
 embedding_dim = 256
 use_volume_embedding = false
 corr_radius = 2
-principal_point_embedding = false
+principal_point_embedding = true
+intrinsic_embedding = true
+metric_ray_translation = true
 
 # decoder
 latent_dim = 512
 n_heads = 8
-n_time_space_blocks = 8
+n_time_space_blocks = 7
 embedding_factor = 4
 use_camera_self_attention = true
 use_temporal_self_attention = true
 output_mode = "direct" # direct, residual, grid
+f_eff_scale = true
+
 scene_encoder_proj = false
 head_3d_grid_size = 16
 head_3d_grid_radius = 1.0
@@ -136,13 +149,16 @@ seed = 3
 # checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260524_135448-f6x7atc3/files/checkpoints/checkpoint_00399996.pth'
 
 # direct with temporal attention
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260525_124610-zmxu284i/files/checkpoints/checkpoint_00399996.pth'
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260525_124610-zmxu284i/files/checkpoints/checkpoint_00399996.pth'
+
+# 
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260604_155610-sdkna7jo/files/checkpoints/checkpoint_00399360.pth'
 
 finetune = true
 n_iterations = 800000
 # scheduler_type = 'multisteplr'
 scheduler_type = 'schedulefree'
-max_grad_norm = 5.0
+max_grad_norm = 10.0
 checkpoint_freq = 10240 # in iterations
 eval_metric_freq = 16 # in iterations
 val_freq = 64 # in iterations
@@ -172,7 +188,7 @@ gamma = 0.8
 pixel_thresh = 3
 # delta = 0.1
 delta = 6
-use_huber_loss = false
+use_huber_loss = true
 
 # weights for calculating total loss (use 0 to not compute a specific loss)
 vis_loss_weight = 4
@@ -184,11 +200,11 @@ feature_loss_weight = 0.0
 coords_loss_weight = 1.0
 coords_loss_direct_weight = 1.0
 coords_loss_rays_weight = 0.1
-coords_loss_triangulate_weight = 0.0
+coords_loss_triangulate_weight = 0.2
 coords_loss_2d_weight = 1.0
 coords_loss_depth_weight = 0.1
 
-smoothness_loss_3d_weight = 1.0
-smoothness_loss_2d_weight = 1.0
+smoothness_loss_3d_weight = 0.5
+smoothness_loss_2d_weight = 0.5
 smoothness_loss_order = 4
 smoothness_loss_tolerance = 1.5

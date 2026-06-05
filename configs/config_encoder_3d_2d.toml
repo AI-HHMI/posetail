@@ -79,10 +79,12 @@ mode_3d = "encoder"
 video_encoder_version = 'large'
 video_encoder_requires_grad = false
 video_encoder_hierarchical = true
+
 # If set to an int N, only the last N transformer blocks (+ final norm) of the
 # video encoder are finetuned and the rest stay frozen. Omit (or comment out)
 # to train all encoder params when video_encoder_requires_grad allows it.
 # Max N per size: base=12, large=24, giant=40, gigantic=48.
+# 
 # video_encoder_finetune_last_n_layers = 8
 
 # processing
@@ -109,6 +111,7 @@ use_camera_self_attention = true
 use_temporal_self_attention = true
 output_mode = "direct"
 f_eff_scale = true
+
 scene_encoder_proj = false
 head_3d_grid_size = 16
 head_3d_grid_radius = 1.0
