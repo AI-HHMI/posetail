@@ -25,8 +25,15 @@ def normalize_by_mean_depth(x, vis, C, eps=1e-6):
     else:
         d = x
         offset = 0.0
-    mean_depth = (d * vis).sum(dim=(-3, -2), keepdim=True) / (vis.sum(dim=(-3, -2), keepdim=True) + eps)
-    return (x - offset) / (mean_depth + eps), mean_depth
+    # Excise NaN before the reduction: a single missing keypoint-frame would make
+    # NaN * 0 = NaN, contaminating the whole (cam, B) mean_depth via .sum().
+    valid = (vis > 0.5) & torch.isfinite(d)
+    d_safe = torch.where(valid, d, torch.zeros_like(d))
+    vis_f = valid.float()
+    mean_depth = d_safe.sum(dim=(-3, -2), keepdim=True) / (vis_f.sum(dim=(-3, -2), keepdim=True) + eps)
+    # Keep NaN out of the normalized output too (loss masks these positions anyway).
+    x_safe = torch.where(torch.isfinite(x), x, torch.zeros_like(x))
+    return (x_safe - offset) / (mean_depth + eps), mean_depth
 
 
 class TotalLoss(nn.Module):
@@ -609,19 +616,25 @@ class BCELossConf(nn.Module):
         self.pixel_thresh = pixel_thresh
         self.weight = weight
 
-    def _compute_loss(self, conf_pred, coords_pred, coords_true, vis_true, scale=1): 
+    def _compute_loss(self, conf_pred, coords_pred, coords_true, vis_true, scale=1):
 
-        dist = torch.sum((coords_pred - coords_true) ** 2, dim = -1) ** 0.5
+        # NaN-safe: zero the diff at invalid (occluded / non-finite GT) positions so
+        # NaN targets don't poison gradients (see WeightedMAELoss._compute_loss).
+        valid = (vis_true > 0.5) & torch.isfinite(coords_true[..., 0:1])
+        coords_true_safe = torch.where(valid, coords_true, coords_pred.detach())
+
+        dist = torch.sum((coords_pred - coords_true_safe) ** 2, dim = -1) ** 0.5
         mask = (dist <= self.pixel_thresh * scale).float().unsqueeze(dim = -1)
 
         loss = F.binary_cross_entropy_with_logits(
-            conf_pred, 
-            mask, 
-            reduction = 'mean')
+            conf_pred,
+            mask,
+            reduction = 'none')
 
-        loss = torch.nanmean(loss * vis_true)
+        valid_f = valid.float()
+        loss = (loss * valid_f).sum() / (valid_f.sum() + 1e-6)
 
-        return loss 
+        return loss
 
     def forward(self, conf_pred, coords_pred, coords_true, vis_true, scale=1, device = None): 
 
@@ -676,12 +689,20 @@ class WeightedMAELoss(nn.Module):
     
     def _compute_loss(self, coords_pred, coords_true, vis_true, scale=1.0):
 
-        if self.use_huber_loss:
-            loss = self.huber_loss(coords_pred, coords_true)
-        else:
-            loss = torch.abs(coords_pred - coords_true)
+        # validity = visible AND finite GT. vis alone is insufficient: it can be 1
+        # at NaN coords, and NaN targets poison the backward pass even when masked
+        # by multiplication (0 * NaN = NaN). torch.where zeroes the diff at invalid
+        # positions so NaN never enters a differentiable op (cf. SmoothnessLoss).
+        valid = (vis_true > 0.5) & torch.isfinite(coords_true[..., 0:1])
+        coords_true_safe = torch.where(valid, coords_true, coords_pred.detach())
 
-        loss = torch.nanmean((loss / scale) * vis_true)
+        if self.use_huber_loss:
+            loss = self.huber_loss(coords_pred, coords_true_safe)
+        else:
+            loss = torch.abs(coords_pred - coords_true_safe)
+
+        valid_f = valid.float()
+        loss = (loss / scale * valid_f).sum() / (valid_f.sum() * coords_pred.shape[-1] + 1e-6)
 
         return loss
 

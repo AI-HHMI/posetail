@@ -1,7 +1,7 @@
 [wandb]
-project_name = 'posetail-pretraining-v3'
+project_name = 'posetail-finetuning-v3'
 # path = '/data/results/lili/posetail'
-path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3'
+path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3'
 mode = 'online' # 'online', 'offline', 'disabled'
 
 [dataset]
@@ -11,7 +11,8 @@ num_workers = 12
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-tests/wrapped'
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-visibility'
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v2'
-prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3'
+# prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3'
+prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v3'
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-test'
 datasets_to_exclude = []
 
@@ -152,7 +153,12 @@ seed = 3
 # checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-odyssey-pretrain/wandb/run-20260525_124610-zmxu284i/files/checkpoints/checkpoint_00399996.pth'
 
 # 
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260604_155610-sdkna7jo/files/checkpoints/checkpoint_00399360.pth'
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260604_155610-sdkna7jo/files/checkpoints/checkpoint_00399360.pth'
+#
+#
+# direct finetuned a bit
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260605_084552-y7ef016w/files/checkpoints/checkpoint_00799998.pth'
+
 
 finetune = true
 n_iterations = 800000
