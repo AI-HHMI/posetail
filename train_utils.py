@@ -650,8 +650,15 @@ def test_epoch(config, model, dataloader, loss = None,
         # overall averages, e.g. "val/mte_avg"
         val_dict.update(average_metrics(metric_dicts, prefix))
 
-        # per-dataset averages in their own folder, e.g. "val_<dataset_name>/mte_avg"
+        # per-dataset averages in their own folder, e.g. "val_<dataset_name>/mte_avg".
+        # Optionally restrict which datasets get their own folder logged via
+        # dataset.<split>.split_out (a list of dataset names). When unset (None)
+        # every dataset is logged; the overall averages above are unaffected.
+        split_name = prefix.strip('/')
+        split_out = config.dataset.get(split_name, {}).get('split_out', None)
         for dataset_name in sorted(set(metric_datasets)):
+            if split_out is not None and dataset_name not in split_out:
+                continue
             dataset_dicts = [d for d, name in zip(metric_dicts, metric_datasets)
                              if name == dataset_name]
             val_dict.update(average_metrics(dataset_dicts, prefix, name = dataset_name))

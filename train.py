@@ -195,13 +195,33 @@ def run(config_path, fabric):
     base_lr = config.training.optimizer.learning_rate
     lr = base_lr * (fabric.world_size ** 0.5)
 
+    # Optionally give the pretrained video encoder a lower (discriminative) LR
+    # than the freshly-initialized decoder/query encoder. `encoder_lr_scale` is
+    # a multiplier on the (world-size-scaled) base LR, so the ratio is preserved
+    # when base_lr or the GPU count changes. Defaults to 1.0 == single group,
+    # leaving behavior unchanged. When the encoder is frozen this group simply
+    # has nothing to update; it activates once unfreeze_video_encoder fires.
+    encoder_lr_scale = config.training.optimizer.get('encoder_lr_scale', 1.0)
+    if encoder_lr_scale != 1.0:
+        encoder_param_ids = {id(p) for p in model.scene_encoder.encoder.parameters()}
+        encoder_params = [p for p in model.parameters() if id(p) in encoder_param_ids]
+        other_params = [p for p in model.parameters() if id(p) not in encoder_param_ids]
+        encoder_lr = lr * encoder_lr_scale
+        params = [{'params': other_params, 'lr': lr},
+                  {'params': encoder_params, 'lr': encoder_lr}]
+        if fabric.is_global_zero:
+            print(f"Discriminative LR enabled: encoder_lr_scale={encoder_lr_scale} "
+                  f"-> encoder lr={encoder_lr:.3e}, other lr={lr:.3e}")
+    else:
+        params = model.parameters()
+
     # set up optimizer
     if config.training.scheduler_type == 'schedulefree':
         warmup_steps = total_to_per_gpu(
             config.training.optimizer.get('warmup_steps', 0),
             fabric.world_size)
         optimizer = AdamWScheduleFree(
-            model.parameters(),
+            params,
             lr=lr,
             weight_decay=config.training.optimizer.weight_decay,
             warmup_steps=warmup_steps,
@@ -210,7 +230,7 @@ def run(config_path, fabric):
         )
     else:
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            params,
             lr=lr,
             weight_decay=config.training.optimizer.weight_decay,
             amsgrad=config.training.optimizer.amsgrad,
