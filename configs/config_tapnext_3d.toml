@@ -150,7 +150,7 @@ coords_loss_depth_weight = 1.0
 # constant, not per-scene normalization). Tune against the magnitude probe.
 coords_3d_loss_scale = 500.0
 
-smoothness_loss_3d_weight = 0.5
-smoothness_loss_2d_weight = 0.5
+smoothness_loss_3d_weight = 0.05
+smoothness_loss_2d_weight = 0.05
 smoothness_loss_order = 4
 smoothness_loss_tolerance = 1.5
