@@ -1,0 +1,140 @@
+[wandb]
+project_name = 'posetail-tapnext-v1'
+path = '/groups/karashchuk/home/karashchukl/results/posetail-tapnext-v1'
+mode = 'online' # 'online', 'offline', 'disabled'
+
+[dataset]
+# batch_size=1 is REQUIRED for mixed 2D+3D training.
+# The 2D loss axis-order assumption (B=cams=1) breaks at batch_size>1.
+# For multi-GPU training use --strategy ddp_find_unused_parameters_true (the default).
+batch_size = 1
+num_workers = 12
+prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3'
+
+[dataset.train]
+split_dir = 'train'
+n_frames = 16
+min_res = 256
+max_res = 256
+cams_to_sample = [1, 8]
+kpts_to_sample = [128, 128]
+aug_prob = 0.25
+enable_kpt_filtering = false
+cam_thresh_for_vis = 1
+balance_datasets = true
+n_samples_per_dataset = -1
+crop_to_points = true
+speed_thresh = 1.0
+query_anytime = true
+query_edge_bias = 200.0
+prop_dynamic_kpts_to_sample = 0.95
+prob_2d_only = 0.25
+crop_3d_enabled = true
+crop_3d_fraction = [0.05, 0.75]
+crop_3d_prob = 0.4
+# Causal forward-only supervision to match TAPNext's SSM semantics.
+causal_masking = true
+
+[dataset.train.curriculum]
+enabled = false
+ramp_start_frac = 0.0
+ramp_end_frac   = 0.4
+intensity_floor = 0.0
+
+[dataset.val]
+split_dir = 'val'
+n_frames = 16
+max_res = 256
+cams_to_sample = 5
+kpts_to_sample = 128
+aug_prob = 0.0
+crop_to_points = true
+speed_thresh = 1.0
+prop_dynamic_kpts_to_sample = 0.7
+query_anytime = false
+causal_masking = true
+
+[dataset.test]
+split_dir = 'test'
+max_res = 256
+n_frames = 16
+project_2d = false
+aug_prob = 0.0
+causal_masking = true
+
+[devices]
+device = 'cuda'
+
+
+[model]
+mode_3d = "tapnext"
+
+# TAPNext++ backbone
+width = 768
+patch_size = 8
+num_heads = 12
+depth = 12
+lru_width = 768
+prope_insert_positions = [2, 5, 8, 11]
+pretrained_ckpt_path = '~/builds/tapnet/tapnextpp_ckpt.pt'
+freeze_backbone = false
+use_checkpointing = false
+
+# processing
+stride_length = 16
+image_size = 256
+
+# geometry tail (reused from TrackerEncoder semantics)
+per_camera_cube_scale = true
+metric_ray_translation = true
+f_eff_scale = true
+
+[training]
+seed = 3
+# checkpoint_path = ''
+n_iterations = 800000
+scheduler_type = 'schedulefree'
+max_grad_norm = 50.0
+checkpoint_freq = 10240 # in iterations
+eval_metric_freq = 16 # in iterations
+val_freq = 64 # in iterations
+print_freq = 128 # in iterations
+debug_ix = -1 # only works for val
+
+[training.optimizer]
+# Lowered toward TAPNext++'s finetune regime (paper: peak 2e-5). Single
+# conservative LR for the whole model as a first cut (the new PROPE + 3D heads
+# train from scratch at the same rate); revisit with parameter groups if needed.
+learning_rate = 1e-4
+weight_decay = 0.002
+warmup_steps = 500
+beta1 = 0.9
+beta2 = 0.95
+
+[training.scheduler]
+
+[training.losses]
+gamma = 0.8
+pixel_thresh = 3
+delta = 6
+use_huber_loss = true
+
+# weights for calculating total loss (use 0 to not compute a specific loss)
+vis_loss_weight = 4
+conf_loss_weight = 0.0
+conf_2d_loss_weight = 0.0
+# TAPNext++ down-weights occluded points 0.2x vs visible.
+occluded_coords_loss_weight = 0.2
+feature_loss_weight = 0.0
+
+coords_loss_weight = 1.0
+coords_loss_direct_weight = 1.0
+coords_loss_rays_weight = 0.1
+coords_loss_triangulate_weight = 0.0
+coords_loss_2d_weight = 1.0
+coords_loss_depth_weight = 1.0
+
+smoothness_loss_3d_weight = 0.5
+smoothness_loss_2d_weight = 0.5
+smoothness_loss_order = 4
+smoothness_loss_tolerance = 1.5

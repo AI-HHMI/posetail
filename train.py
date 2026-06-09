@@ -47,6 +47,7 @@ from posetail.datasets.posetail_dataset import PosetailDataset, custom_collate
 from posetail.posetail.losses import *
 from posetail.posetail.tracker import Tracker
 from posetail.posetail.tracker_encoder import TrackerEncoder
+from posetail.posetail.tracker_tapnext import TrackerTapNext
 from train_utils import *
 
 from schedulefree import AdamWScheduleFree
@@ -185,6 +186,8 @@ def run(config_path, fabric):
     # device = torch.device(config.devices.device)
     if config.model['mode_3d'] == 'encoder':
         model = TrackerEncoder(**config.model)
+    elif config.model['mode_3d'] == 'tapnext':
+        model = TrackerTapNext(**config.model)
     else:
         model = Tracker(**config.model)
         

@@ -356,6 +356,11 @@ class PosetailDataset(Dataset):
         self.enable_kpt_filtering = config.dataset[split].get('enable_kpt_filtering', False)
         self.query_anytime = config.dataset[split].get('query_anytime', False)
         self.query_edge_bias = config.dataset[split].get('query_edge_bias', 3.0)
+        # Causal masking (for the causal TAPNext tracker): NaN the trajectory
+        # target for frames before each point's query time so pre-query frames
+        # are excluded from the loss via the existing isfinite mask. Default off
+        # keeps TrackerEncoder behavior identical.
+        self.causal_masking = config.dataset[split].get('causal_masking', False)
         self.no_nan_coords = config.dataset[split].get('no_nan_coords', True)
 
         # 3D sphere subvolume crop augmentation
@@ -804,7 +809,22 @@ class PosetailDataset(Dataset):
 
 
         # p2d = project_points_torch(cgroup, coords) # (cams, t, n_kpts, 2)
-        
+
+        # Causal masking: a point queried at frame `qt` is tracked forward only;
+        # NaN the trajectory target for t < qt so those frames drop out of every
+        # coordinate loss via the central isfinite mask. The query-frame coords
+        # (the model input, extracted at qt downstream) stay finite.
+        if self.causal_masking:
+            Tn = coords.shape[0]
+            # pre[t, n] = True for frames strictly before that point's query time
+            pre = torch.arange(Tn, device=coords.device)[:, None] < query_times[None, :].to(torch.long)
+            coords = coords.clone()
+            coords[pre] = float('nan')
+            if p2d is not None:
+                # p2d: (cams, t, n, 2)
+                p2d = p2d.clone()
+                p2d[:, pre] = float('nan')
+
         return views, coords, vis, fnums, cgroup, row, query_times, vis_2d, p2d
 
 
