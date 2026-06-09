@@ -142,11 +142,14 @@ class TapNextBackbone(nn.Module):
     self.image_pos_emb = nn.Parameter(
         torch.zeros((1, h * w, c)), requires_grad=True
     )
-    self.register_buffer(
-        'query_pos_embed',
-        torch.tensor(
-            posemb_sincos_2d(self.image_size[0], self.image_size[1], c)
-        ),
+    # Deterministic sincos positional field, identical on every rank. Kept as a
+    # plain attribute (NOT a registered buffer): with this as the model's only
+    # buffer, DDP's coalesced buffer broadcast aliases input/output of a single
+    # contiguous tensor and crashes ("refer to a single memory location"). It is
+    # constant, so it needs no cross-rank sync; device/dtype are handled in
+    # ``embed_queries`` via ``.to(...)``.
+    self.query_pos_embed = torch.tensor(
+        posemb_sincos_2d(self.image_size[0], self.image_size[1], c)
     )
     self.visible_head = nn.Sequential(
         nn.Linear(width, 256),
@@ -194,9 +197,9 @@ class TapNextBackbone(nn.Module):
     tiled_point_query_tokens = self.point_query_token.repeat(b, 1, q, 1)
     mask_tokens = self.mask_token.repeat(b, t, q, 1)
     unknown_tokens = self.unknown_token.repeat(b, t, q, 1)
-    query_pos_embed = self.query_pos_embed.view(
-        1, self.image_size[0], self.image_size[1], c
-    ).repeat(b, 1, 1, 1)
+    query_pos_embed = self.query_pos_embed.to(
+        device=query_points.device, dtype=query_points.dtype
+    ).view(1, self.image_size[0], self.image_size[1], c).repeat(b, 1, 1, 1)
     #  [B Q t 3]
     query_timesteps, query_positions = (
         query_points[..., :1],

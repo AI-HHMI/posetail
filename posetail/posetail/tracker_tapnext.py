@@ -146,6 +146,10 @@ class TrackerTapNext(nn.Module):
         ckpt = torch.load(path, map_location='cpu')
         state = ckpt.get('state_dict', ckpt) if isinstance(ckpt, dict) else ckpt
         sd = {k.replace('tapnext.', ''): v for k, v in state.items()}
+        # query_pos_embed is a deterministic sincos constant recomputed in
+        # TapNextBackbone (held as a plain attribute, not a buffer, so DDP does
+        # not try to broadcast it); drop it from the load so it isn't flagged.
+        sd.pop('query_pos_embed', None)
         missing, unexpected = self.backbone.load_state_dict(sd, strict=False)
         # The backbone is fully covered by the pretrained TAPNext++ checkpoint.
         if len(missing) > 0 or len(unexpected) > 0:
