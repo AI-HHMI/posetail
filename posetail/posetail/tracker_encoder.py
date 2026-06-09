@@ -41,6 +41,8 @@ class TrackerEncoder(nn.Module):
                  scene_encoder_proj = False,
                  head_3d_grid_size = 8,
                  head_3d_grid_radius = 1.0,
+                 log_3d_output = False,
+                 log_3d_eps = 0.1,
                  f_eff_scale = False):
         super().__init__()
 
@@ -139,6 +141,8 @@ class TrackerEncoder(nn.Module):
             output_mode=self.output_mode,
             head_3d_grid_size=head_3d_grid_size,
             head_3d_grid_radius=head_3d_grid_radius,
+            log_3d_output=log_3d_output,
+            log_3d_eps=log_3d_eps,
             f_eff_scale=f_eff_scale,
         )
 

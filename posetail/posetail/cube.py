@@ -9,7 +9,26 @@ import torch.nn.functional as F
 from einops import rearrange, einsum, repeat
 
 
-def project_volumes(volumes): 
+def signed_log1p(x, eps=1.0):
+    """Signed-log warp: map a value to a compressed coordinate with denser
+    resolution near 0. ``c = sign(x) * log1p(|x| / eps)``. Exact inverse of
+    ``signed_expm1``. Used by the ``log_3d_output`` 3D grid/regression warp
+    (the 3D head represents its output in this compressed space so the bins /
+    gradient concentrate near 0, where motion residuals live). Computed in fp32."""
+    x = x.float()
+    return torch.sign(x) * torch.log1p(torch.abs(x) / eps)
+
+
+def signed_expm1(c, eps=1.0):
+    """Inverse of ``signed_log1p``: map a compressed coordinate back to a value.
+    ``x = sign(c) * eps * expm1(|c|)``. With ``c_range = log1p(radius/eps)`` this
+    maps ``[-c_range, c_range] -> [-radius, radius]`` (denser near 0). Computed in
+    fp32; clamp the input to ``c_range`` to keep ``expm1`` (and its gradient) bounded."""
+    c = c.float()
+    return torch.sign(c) * eps * torch.expm1(torch.abs(c))
+
+
+def project_volumes(volumes):
     ''' 
     project volume to get the xy, xz, and yz planes 
     ''' 

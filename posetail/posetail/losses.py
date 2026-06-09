@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from einops import rearrange, repeat, einsum
 from posetail.posetail.cube import get_camera_scale, project_points_torch, is_point_visible
-from posetail.posetail.cube import to_homogeneous, from_homogeneous
+from posetail.posetail.cube import to_homogeneous, from_homogeneous, signed_log1p
 
 from collections import defaultdict
 
@@ -566,15 +566,22 @@ class TotalLoss(nn.Module):
                 if self.coords_softmax_3d_weight > 0:
                     if g.get('is_resid', False):
                         # gridresid: the 3D bins encode the motion offset from the
-                        # per-track query anchor. Subtract the (detached) anchor in
-                        # ray-local space; the same cube_scale*f_eff `denom` as the
-                        # absolute grid normalizes it (the gridresid forward DOES
-                        # f_eff-scale its residual -> O(1), uniform across datasets).
-                        target_3d = (p_raylocal - g['anchor_local']) / denom
+                        # per-track query anchor, normalized by cube*image_size
+                        # (~pixels; NO f_eff -> ortho-safe). Subtract the (detached)
+                        # anchor in ray-local space, then divide.
+                        denom_resid = rearrange(cs, 'cams b -> cams b 1 1 1') * g['image_size']
+                        target_3d = (p_raylocal - g['anchor_local']) / denom_resid
                     else:
-                        target_3d = p_raylocal / denom                # (cams,b,t,n,3) normalized
+                        target_3d = p_raylocal / denom                # absolute: / cube*f_eff
+                    lo3d, hi3d = g['g3d_lo'], g['g3d_hi']
+                    if g.get('log_warp', False):
+                        # quantize in the same signed-log space the warped bin
+                        # centres live in (monotonic -> nearest-in-warped == nearest
+                        # centre); range becomes [-c_range, c_range].
+                        target_3d = signed_log1p(target_3d, g['eps'])
+                        lo3d, hi3d = -g['c_range'], g['c_range']
                     coords_softmax_3d = self.coords_softmax_3d_weight * grid_softmax_loss(
-                        g['logits_3d'], target_3d, g['g3d_lo'], g['g3d_hi'], vis_true_cams)
+                        g['logits_3d'], target_3d, lo3d, hi3d, vis_true_cams)
 
                 if self.depth_softmax_weight > 0:
                     target_logd = torch.log(depths_true[..., 0] / denom_d + 1e-6)  # (cams,b,t,n)

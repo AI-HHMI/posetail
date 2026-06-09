@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 
+import math
+
 import torch
-import torch.nn as nn 
+import torch.nn as nn
 import torch.nn.functional as F
 
 from posetail.posetail.networks import EmbedV2V
 from posetail.posetail.cube import is_point_visible, project_points_torch
 from posetail.posetail.cube import CameraSelfAttention
+from posetail.posetail.cube import signed_log1p, signed_expm1
 from posetail.posetail.utils import get_fourier_encoding, apply_rope_1d
 
 from einops import rearrange, repeat, einsum
@@ -598,6 +601,8 @@ class Decoder(nn.Module):
                  output_mode="direct",
                  head_3d_grid_size=8,
                  head_3d_grid_radius=1.0,
+                 log_3d_output=False,
+                 log_3d_eps=0.1,
                  f_eff_scale=False):
         super().__init__()
 
@@ -610,9 +615,19 @@ class Decoder(nn.Module):
         self.f_eff_scale = f_eff_scale
         self.head_3d_grid_size = head_3d_grid_size
         self.head_3d_grid_radius = head_3d_grid_radius
+        # signed-log warp of the 3D output (3D only). See cube.signed_log1p/expm1.
+        self.log_3d_output = log_3d_output
+        self.log_3d_eps = log_3d_eps
+        self.log_3d_c_range = float(math.log1p(head_3d_grid_radius / log_3d_eps))
 
         if output_mode == 'grid':
-            grid_1d = torch.linspace(-head_3d_grid_radius, head_3d_grid_radius, head_3d_grid_size)
+            if log_3d_output:
+                # signed-log spaced per-axis centres (denser near 0), still spanning
+                # exactly [-radius, radius]; then the joint 8^3 cartesian grid.
+                cr = self.log_3d_c_range
+                grid_1d = signed_expm1(torch.linspace(-cr, cr, head_3d_grid_size), log_3d_eps)
+            else:
+                grid_1d = torch.linspace(-head_3d_grid_radius, head_3d_grid_radius, head_3d_grid_size)
             grid_offsets = torch.cartesian_prod(grid_1d, grid_1d, grid_1d)  # [G**3, 3]
             self.register_buffer("grid_offsets_3d", grid_offsets)
 
@@ -778,7 +793,18 @@ class Decoder(nn.Module):
         if self.output_mode == 'grid':
             logits_3d = self.heads_3d[m](x)
             prob_3d = F.softmax(logits_3d, dim=-1)
-            out_3d = (prob_3d @ self.grid_offsets_3d) * self.scale_3d
+            out_3d = prob_3d @ self.grid_offsets_3d.to(prob_3d.dtype)
+            if not self.log_3d_output:
+                # Absolute grid: the learnable scale carries the metric magnitude.
+                # Under log_3d_output the WARPED centres are already metric in
+                # [-radius, radius], so scale_3d is dropped (else it double-scales).
+                out_3d = out_3d * self.scale_3d
+        elif self.log_3d_output:
+            # Continuous warp: value = signed_expm1(compressed head output). Clamp to
+            # c_range + fp32 keep expm1/its gradient bounded; scale_3d is dropped (eps
+            # sets the slope, the clamp the reach). Init head ~0 -> output 0 (parity).
+            cr = self.log_3d_c_range
+            out_3d = signed_expm1(self.heads_3d[m](x).clamp(-cr, cr), self.log_3d_eps).to(x.dtype)
         else:
             scale_3d = self.scale_3d[m] if self.output_mode == 'resdirect' else self.scale_3d
             out_3d = self.heads_3d[m](x) * scale_3d

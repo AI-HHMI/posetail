@@ -18,6 +18,8 @@ Key properties:
   * Input video must be in [-1, 1] (NOT ImageNet-normalized).
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,6 +30,7 @@ from posetail.posetail.cube import get_camera_scale, from_homogeneous, to_homoge
 from posetail.posetail.cube import undistort_points, triangulate_simple_batch, project_points_torch
 from posetail.posetail.cube import points_to_rays, _invert_SE3
 from posetail.posetail.cube import CameraSelfAttention, is_point_visible
+from posetail.posetail.cube import signed_log1p, signed_expm1
 from posetail.posetail.utils import PadToSize, count_parameters, get_fourier_encoding
 from posetail.posetail.tapnext import TapNextBackbone
 
@@ -65,6 +68,12 @@ class TrackerTapNext(nn.Module):
                  head_3d_grid_radius=1.0,
                  depth_log_min=-3.0,
                  depth_log_max=3.0,
+                 # `log_3d_output`: represent the 3D head's output in a signed-log
+                 # compressed space (denser resolution near 0, where motion residuals
+                 # live). Affects ONLY the 3D output (2D + depth untouched; depth is
+                 # already log). Default False keeps the linear behavior bit-identical.
+                 log_3d_output=False,
+                 log_3d_eps=0.1,
                  mode_3d='tapnext',
                  **_ignored):
         super().__init__()
@@ -77,6 +86,13 @@ class TrackerTapNext(nn.Module):
         # mode); depth stays absolute in every mode. `gridresid` = both.
         self.is_grid = output_mode in ('grid', 'gridresid')
         self.is_resid = output_mode in ('residual', 'gridresid')
+        # signed-log warp of the 3D output. `c_range = log1p(radius/eps)` is the
+        # compressed half-width: the warp maps [-c_range, c_range] <-> [-radius,
+        # radius]. Grid modes place bin centres in warped space; continuous modes
+        # apply the warp (clamped) in the forward. See cube.signed_log1p/expm1.
+        self.log_3d_output = log_3d_output
+        self.log_3d_eps = log_3d_eps
+        self.log_3d_c_range = float(math.log1p(head_3d_grid_radius / log_3d_eps))
         self.head_grid_size = head_grid_size
         self.image_size = image_size
         self.S = stride_length
@@ -147,8 +163,16 @@ class TrackerTapNext(nn.Module):
             G = head_grid_size
             self.head_3d_direct = _head(3 * G)
             self.head_depth = _head(G)
-            self.register_buffer('grid_1d',
-                                 torch.linspace(-head_3d_grid_radius, head_3d_grid_radius, G))
+            # 3D bin centres. With log_3d_output the centres are signed-log spaced
+            # (denser near 0) but still span exactly [-radius, radius]; otherwise
+            # linear. The depth grid is ALWAYS linear-in-log (its own representation),
+            # never touched by log_3d_output.
+            if self.log_3d_output:
+                cr = self.log_3d_c_range
+                grid_1d = signed_expm1(torch.linspace(-cr, cr, G), log_3d_eps)
+            else:
+                grid_1d = torch.linspace(-head_3d_grid_radius, head_3d_grid_radius, G)
+            self.register_buffer('grid_1d', grid_1d)
             self.register_buffer('depth_grid',
                                  torch.linspace(depth_log_min, depth_log_max, G))
             self.g3d_lo, self.g3d_hi = -head_3d_grid_radius, head_3d_grid_radius
@@ -182,11 +206,12 @@ class TrackerTapNext(nn.Module):
         # ~depth/cube_scale == f_eff; with f_eff_scale on the per-camera f_eff
         # multiply in the forward collapses the learnable residual to ~1.
         abs_scale = 1.0 if self.f_eff_scale else 1000.0
-        # The `residual` direct head emits a metric motion offset. With f_eff_scale
-        # on it is f_eff-normalized like the absolute head (motion/(cube*f_eff)~O(1)),
-        # so abs_scale (1.0) fits; only the no-f_eff case needs the encoder's larger
-        # 8.0 (motion/cube ~5). Grid/gridresid ignore scale_3d (the bins carry it).
-        scale_3d_init = 8.0 if (output_mode == 'residual' and not self.f_eff_scale) else abs_scale
+        # The `residual` direct head emits a metric motion offset (motion/cube ~ a few
+        # px-units, NOT f_eff-scaled -> ortho-safe); the encoder inits its residual
+        # scale at 8.0. Absolute direct/grid keep abs_scale. Grid/gridresid ignore
+        # scale_3d (the bins carry the magnitude); under log_3d_output the continuous
+        # path also drops scale_3d (the warp's eps/clamp set slope/reach instead).
+        scale_3d_init = 8.0 if output_mode == 'residual' else abs_scale
         self.scale_3d = nn.Parameter(torch.tensor([scale_3d_init]))
         self.scale_depth = nn.Parameter(torch.tensor([abs_scale]))
 
@@ -500,7 +525,16 @@ class TrackerTapNext(nn.Module):
             logits_depth = self.head_depth(point_tokens)                     # (cam,b,t,n,K)
             depth_norm = torch.exp(self._grid_decode(logits_depth, self.depth_grid))  # (cam,b,t,n)
         else:
-            points_3d_raw = self.head_3d_direct(point_tokens) * self.scale_3d   # (cam,b,t,n,3)
+            if self.log_3d_output:
+                # Continuous (direct/residual) warp: the head predicts a compressed
+                # coordinate; the value = signed_expm1(.). Clamp to c_range + fp32
+                # keep expm1 (and its gradient) bounded; scale_3d is dropped (eps sets
+                # the slope, the clamp the reach). Init head ~0 -> output 0 (parity).
+                cr = self.log_3d_c_range
+                head_out = self.head_3d_direct(point_tokens).clamp(-cr, cr)
+                points_3d_raw = signed_expm1(head_out, self.log_3d_eps).to(point_tokens.dtype)
+            else:
+                points_3d_raw = self.head_3d_direct(point_tokens) * self.scale_3d  # (cam,b,t,n,3)
             depth_pred = self.head_depth(point_tokens) * self.scale_depth       # (cam,b,t,n,1)
             depth_norm = F.softplus(depth_pred[..., 0])                         # (cam,b,t,n)
         conf_pred_2d_logits = self.head_conf2d(point_tokens)                # (cam,b,t,n,1)
@@ -553,12 +587,16 @@ class TrackerTapNext(nn.Module):
         rays_c_inv = _invert_SE3(rays_c)
 
         p3d_cams = points_3d_raw * rearrange(cube_scale, 'cams b -> cams b 1 1 1')
-        if self.f_eff_scale:
-            # f_eff-scale the metric ray-local output in every mode — absolute
-            # (direct/grid) AND residual (residual/gridresid) alike — so the
-            # regression/bin targets stay O(1) and uniform across datasets. The
-            # per-track anchor (below) is added afterwards in the same metric frame.
+        if self.f_eff_scale and not self.is_resid:
+            # f_eff-scale ABSOLUTE outputs only (direct/grid): position/(cube*f_eff)
+            # is a dimensionless depth ratio -> O(1) and ortho-safe. A residual is
+            # NOT f_eff-scaled (f_eff is the wrong normalizer for motion and breaks
+            # ortho cameras) — matches tracker_encoder.py's `not add_residual` gate.
             p3d_cams = p3d_cams * rearrange(f_eff, 'cams -> cams 1 1 1 1').to(p3d_cams.dtype)
+        if self.output_mode == 'gridresid':
+            # The gridresid bins encode motion / (cube * image_size) (~pixels, in
+            # [0,1], camera-invariant). Map back to metric motion by * image_size.
+            p3d_cams = p3d_cams * self.image_size
 
         # residual modes: add the per-track query anchor in metric ray-local space.
         # R==3 anchor = the query's GT world coords; R==2 anchor = the model's own
@@ -619,9 +657,16 @@ class TrackerTapNext(nn.Module):
                 'gd_lo': self.gd_lo, 'gd_hi': self.gd_hi,
                 'K': self.head_grid_size,
                 # gridresid: the 3D grid bins encode a residual offset, so the loss
-                # forms its bin target as (GT_raylocal - anchor)/cube_scale (no
-                # f_eff). Absolute `grid` mode passes is_resid=False, no anchor.
+                # forms its bin target as (GT_raylocal - anchor)/(cube*image_size)
+                # (no f_eff; ortho-safe). Absolute `grid` mode passes is_resid=False,
+                # no anchor, and divides by cube*f_eff instead.
                 'is_resid': self.is_resid,
                 'anchor_local': query_local.detach() if query_local is not None else None,
+                'image_size': self.image_size,
+                # log_3d_output: the loss must quantize the 3D bin target in the same
+                # signed-log warped space as the (warped) bin centres.
+                'log_warp': self.log_3d_output,
+                'eps': self.log_3d_eps,
+                'c_range': self.log_3d_c_range,
             }
         return result_dict

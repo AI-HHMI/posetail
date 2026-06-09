@@ -82,17 +82,27 @@ mode_3d = "tapnext"
 #                ported verbatim from TrackerEncoder. Depth stays absolute.
 #   "gridresid"= the grid 3D head supplies that residual offset, so the bounded grid
 #                window only spans plausible *motion* (every GT target lands interior).
-#                Depth stays the absolute log-depth grid.
-output_mode = "gridresid"
+#                The residual is normalized by cube*image_size (~pixels, NO f_eff) so
+#                it is camera-invariant and works for orthographic cameras (f_eff is
+#                the wrong normalizer for motion). Depth stays the absolute log grid.
+output_mode = "grid"
 head_grid_size = 256
-# Ray-local grid half-width (normalized units), set from scripts/estimate_grid_radius.py
-# on posetail-finetuning-v3 (p99.9, uniform across datasets):
-#   "grid"      (absolute /cube*f_eff)        -> ~2.5 (depth axis dominates).
-#   "gridresid" (motion   /cube*f_eff)        -> ~1.0 (forward motion; f_eff-normalized
-#               so it stays O(1) and uniform — motion/cube alone spans 20x by dataset).
-head_3d_grid_radius = 1.0
-depth_log_min = -3.0
-depth_log_max = 3.0
+# Ray-local grid half-width, set from scripts/estimate_grid_radius.py on
+# posetail-finetuning-v3 to cover every dataset's p99.9 (a generous radius is cheap
+# under log_3d_output, which concentrates bins near 0):
+#   "grid"      (absolute /cube*f_eff)        -> ~5.0 (per-dataset p99.9 up to 4.2).  [active]
+#   "gridresid" (motion   /cube*image_size)   -> ~1.5 (per-dataset p99.9 up to 0.93).
+head_3d_grid_radius = 5.0
+# Signed-log warp of the 3D output (3D only; 2D + depth untouched). Places the grid
+# bins in a compressed space with denser resolution near 0. eps ~= 0.1*radius: the
+# absolute-grid distribution (p50~0.6, depth axis ~1) is only mildly peaked, so a
+# gentle warp (149->199 of 256 effective bins); gridresid wants a tighter eps~0.01*r.
+log_3d_output = true
+log_3d_eps = 0.5
+# Depth log-grid range = log(depth/(cube*f_eff)). Tightened from [-3,3] (only ~68/256
+# bins used) to cover every dataset's reach [~-1.8, 1.5] with margin (~2x resolution).
+depth_log_min = -2.5
+depth_log_max = 2.0
 
 # TAPNext++ backbone
 width = 768
