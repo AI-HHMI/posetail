@@ -76,8 +76,8 @@ num_heads = 12
 depth = 12
 lru_width = 768
 prope_insert_positions = [2, 5, 8, 11]
-pretrained_ckpt_path = '~/builds/tapnet/tapnextpp_ckpt.pt'
-freeze_backbone = false
+pretrained_ckpt_path = '/groups/karashchuk/home/karashchukl/builds/tapnet/tapnextpp_ckpt.pt'
+freeze_backbone = 5000
 use_checkpointing = true
 
 # processing
@@ -113,7 +113,7 @@ debug_ix = -1 # only works for val
 # Lowered toward TAPNext++'s finetune regime (paper: peak 2e-5). Single
 # conservative LR for the whole model as a first cut (the new PROPE + 3D heads
 # train from scratch at the same rate); revisit with parameter groups if needed.
-learning_rate = 1e-4
+learning_rate = 2e-5
 weight_decay = 0.002
 warmup_steps = 500
 beta1 = 0.9
@@ -128,7 +128,7 @@ delta = 6
 use_huber_loss = true
 
 # weights for calculating total loss (use 0 to not compute a specific loss)
-vis_loss_weight = 4
+vis_loss_weight = 400
 conf_loss_weight = 0.0
 conf_2d_loss_weight = 0.0
 # TAPNext++ down-weights occluded points 0.2x vs visible.
