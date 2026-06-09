@@ -182,14 +182,20 @@ class TapNextBackbone(nn.Module):
     video_tokens = video_tokens + self.image_pos_emb.unsqueeze(0)
     return video_tokens
 
-  def embed_queries(self, timesteps, query_points):
-    """Ported verbatim from upstream ``TAPNext.embed_queries``.
+  def embed_queries(self, timesteps, query_points, extra_query_embed=None):
+    """Ported from upstream ``TAPNext.embed_queries`` (+ optional aux embed).
 
     query_points: [b, q, 3] = (query_frame, x_px, y_px). Places, per query, the
     ``point_query_token`` (+ position embed of the query pixel) at frame
     ``query_frame``, ``mask_token`` for frames after (predicted), and
     ``unknown_token`` for frames before (causal: not predicted).
     Returns point tokens [b, t, q, c].
+
+    ``extra_query_embed`` [b, q, c] (optional): an additive residual summed onto
+    the ``point_query_token`` so it lands ONLY at the query frame (the scatter
+    places ``point_query_tokens`` at ``query_time``; mask/unknown frames are
+    untouched). Used by ``TrackerTapNext`` to inject zero-init depth/visibility/
+    intrinsic signals; ``None`` keeps the upstream-faithful path bit-identical.
     """
     b, q, _ = query_points.shape
     t = timesteps
@@ -221,6 +227,8 @@ class TapNextBackbone(nn.Module):
         0, 2, 3, 1
     )  # [b Q t c]
     point_query_tokens = tiled_point_query_tokens + query_pos_embed_spatial
+    if extra_query_embed is not None:
+      point_query_tokens = point_query_tokens + extra_query_embed.unsqueeze(1)
     # NOTE: query hints are only implemented in jax but not in pytorch
     # the two masks below are used to not add point query (if queried later in
     # online tracking)

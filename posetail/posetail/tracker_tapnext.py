@@ -27,8 +27,8 @@ from einops import rearrange, einsum, repeat
 from posetail.posetail.cube import get_camera_scale, from_homogeneous, to_homogeneous
 from posetail.posetail.cube import undistort_points, triangulate_simple_batch, project_points_torch
 from posetail.posetail.cube import points_to_rays, _invert_SE3
-from posetail.posetail.cube import CameraSelfAttention
-from posetail.posetail.utils import PadToSize, count_parameters
+from posetail.posetail.cube import CameraSelfAttention, is_point_visible
+from posetail.posetail.utils import PadToSize, count_parameters, get_fourier_encoding
 from posetail.posetail.tapnext import TapNextBackbone
 
 
@@ -52,6 +52,10 @@ class TrackerTapNext(nn.Module):
                  per_camera_cube_scale=False,
                  metric_ray_translation=False,
                  f_eff_scale=False,
+                 # query-geometry signals (same knob names/semantics as QueryEncoder)
+                 max_freq=10,
+                 principal_point_embedding=False,
+                 intrinsic_embedding=False,
                  mode_3d='tapnext',
                  **_ignored):
         super().__init__()
@@ -139,6 +143,36 @@ class TrackerTapNext(nn.Module):
         self.scale_3d = nn.Parameter(torch.tensor([abs_scale]))
         self.scale_depth = nn.Parameter(torch.tensor([abs_scale]))
 
+        # --- query-geometry aux embeddings (zero-init additive residual) ---
+        # Reinstate the rich QueryEncoder query signals lost in the native
+        # TAPNext token (depth/distance, per-camera frustum visibility, focal +
+        # principal point). Each is Fourier+linear'd (same math as QueryEncoder,
+        # encoder_decoder.py:329-395) and summed onto the query token at the
+        # query frame. ALL projections are zero-initialized so the residual is
+        # exactly 0 at init -> the model stays bit-identical to pretrained
+        # TAPNext (mirrors the zero-init PROPE out_proj). Depth + visibility are
+        # always on in 3D (as in QueryEncoder); focal/pp are flag-gated.
+        self.max_freq = max_freq
+        self.principal_point_embedding = principal_point_embedding
+        self.intrinsic_embedding = intrinsic_embedding
+        mf = max_freq
+        self.q_depth_proj = nn.Linear(2 * mf + 1, width)   # depth scalar (always)
+        self.q_vis_embed = nn.Embedding(2, width)          # in/out frustum (always)
+        self.q_depth_norm_scale = nn.Parameter(torch.tensor([1.0]))
+        if intrinsic_embedding:
+            self.q_focal_proj = nn.Linear(4 * mf + 2, width)   # (fx, fy)
+        if principal_point_embedding:
+            self.q_pp_proj = nn.Linear(4 * mf + 2, width)      # principal point
+        zero_linears = [self.q_depth_proj]
+        if intrinsic_embedding:
+            zero_linears.append(self.q_focal_proj)
+        if principal_point_embedding:
+            zero_linears.append(self.q_pp_proj)
+        for m in zero_linears:
+            nn.init.zeros_(m.weight)
+            nn.init.zeros_(m.bias)
+        nn.init.zeros_(self.q_vis_embed.weight)
+
     # ------------------------------------------------------------------ utils
     def _load_pretrained(self, path):
         import os
@@ -186,6 +220,63 @@ class TrackerTapNext(nn.Module):
         print("  backbone params: {:,d}".format(count_parameters(self.backbone)))
         print("  camera-attn params: {:,d}".format(count_parameters(self.camera_attns)))
         print("  PROPE insert positions: {}".format(sorted(self.prope_insert_positions)))
+
+    # ----------------------------------------------------------- aux query embed
+    def _query_aux_embed(self, cam_i, camera_group, coords, cube_scale, view_hw):
+        """Zero-init additive residual for one camera's query tokens -> [B,N,c].
+
+        Mirrors QueryEncoder's depth/visibility/focal/pp math
+        (encoder_decoder.py:329-395). In 3D: depth + frustum visibility (+ focal
+        if ``intrinsic_embedding`` + principal point if
+        ``principal_point_embedding``). In 2D (R==2): only a pixel in-bounds
+        visibility check (depth/focal/pp need a real 3D point + cube scale).
+        Returns exactly 0 at init because every projection is zero-initialized.
+        """
+        B, N, R = coords.shape
+        H, W = view_hw
+        mf = self.max_freq
+        coords_f = coords.to(torch.float32)
+
+        if R == 2:
+            # 2D: visibility is a plain pixel-bounds check (cf. encoder_decoder.py:409).
+            margin = 2
+            in_bounds = ((coords_f[..., 0] >= margin) & (coords_f[..., 0] < W - margin) &
+                         (coords_f[..., 1] >= margin) & (coords_f[..., 1] < H - margin))
+            return self.q_vis_embed(in_bounds.to(torch.int32))      # [B,N,c]
+
+        cam = camera_group[cam_i]
+        # --- depth: log distance to camera center / per-camera cube scale ---
+        center = cam['center'].to(torch.float32)                    # (3,)
+        raw = (coords_f - center).norm(dim=-1) / cube_scale[cam_i][:, None]  # (B,N)
+        depths = torch.log(raw + 1e-6) * self.q_depth_norm_scale    # (B,N)
+        dr = depths.reshape(B, N, 1, 1)                             # 'bsnr', r=1
+        fourier_depth = get_fourier_encoding(dr, min_freq=0, max_freq=mf)
+        fourier_depth = torch.cat([dr, fourier_depth], dim=-1)      # (B,N,1,2mf+1)
+        extra = self.q_depth_proj(fourier_depth).squeeze(2)        # [B,N,c]
+
+        # --- visibility: frustum + in-front test ---
+        visible = is_point_visible(cam, coords_f.reshape(B * N, 3), margin=2)
+        extra = extra + self.q_vis_embed(visible.reshape(B, N).to(torch.int32))
+
+        # --- focal length (fx, fy), normalized by the canvas the net sees ---
+        if self.intrinsic_embedding:
+            focal = torch.stack([cam['mat'][0, 0], cam['mat'][1, 1]]).to(torch.float32)
+            focal = focal / self.image_size                         # (2,)
+            fn = focal.reshape(1, 1, 1, 2).expand(B, N, 1, 2)       # 'bsnr', r=2
+            fourier_f = get_fourier_encoding(fn, min_freq=0, max_freq=mf)
+            fourier_f = torch.cat([fn, fourier_f], dim=-1)          # (B,N,1,4mf+2)
+            extra = extra + self.q_focal_proj(fourier_f).squeeze(2)
+
+        # --- principal point, normalized to [-1, 1] ---
+        if self.principal_point_embedding:
+            pp = (cam['mat'][:2, 2] - cam['offset']).to(torch.float32)
+            pp = pp / self.image_size * 2.0 - 1.0                   # (2,)
+            pn = pp.reshape(1, 1, 1, 2).expand(B, N, 1, 2)
+            fourier_pp = get_fourier_encoding(pn, min_freq=0, max_freq=mf)
+            fourier_pp = torch.cat([pn, fourier_pp], dim=-1)        # (B,N,1,4mf+2)
+            extra = extra + self.q_pp_proj(fourier_pp).squeeze(2)
+
+        return extra
 
     # ---------------------------------------------------------------- forward
     def forward(self, views, coords, camera_group, query_times=None):
@@ -252,7 +343,10 @@ class TrackerTapNext(nn.Module):
             video_tokens = self.backbone.patch_embed(frames)         # (B,T,HW,c)
             qp = torch.cat([query_times[..., None].to(torch.float32),
                             p2d_query[cam_i]], dim=-1)               # (B,N,3) = (t,x,y)
-            point_tokens = self.backbone.embed_queries(T, qp)        # (B,T,N,c)
+            extra = self._query_aux_embed(cam_i, camera_group, coords,
+                                          cube_scale, (H, W))         # (B,N,c) zero at init
+            point_tokens = self.backbone.embed_queries(
+                T, qp, extra_query_embed=extra)                       # (B,T,N,c)
             x_cams.append(torch.cat([video_tokens, point_tokens], dim=2))  # (B,T,HW+N,c)
 
         x = torch.stack(x_cams, dim=0)                                # (cam,B,T,HW+N,c)
