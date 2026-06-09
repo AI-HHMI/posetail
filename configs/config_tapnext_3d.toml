@@ -69,6 +69,18 @@ device = 'cuda'
 [model]
 mode_3d = "tapnext"
 
+# 3D/depth output representation. "grid" = per-dimension marginal soft-argmax over
+# `head_grid_size` bins (2D-prediction style) for BOTH the 3D head (3 dims, ray-local
+# normalized units in [-head_3d_grid_radius, +radius]) and the depth head (1 dim, log
+# of normalized depth in [depth_log_min, depth_log_max]). Bounded + zero-init +
+# self-balancing; supervised directly by the coordinate-softmax CE below. "direct" =
+# the old unbounded regression heads.
+output_mode = "grid"
+head_grid_size = 256
+head_3d_grid_radius = 1.0
+depth_log_min = -3.0
+depth_log_max = 3.0
+
 # TAPNext++ backbone
 width = 768
 patch_size = 8
@@ -143,6 +155,15 @@ coords_loss_rays_weight = 0.1
 coords_loss_triangulate_weight = 0.2
 coords_loss_2d_weight = 2.0
 coords_loss_depth_weight = 1.0
+
+# Direct logit-classification (cross-entropy on position bins), upstream TAPNext++'s
+# primary objective. 2D supervises the pretrained track logits; 3D/depth supervise the
+# grid heads' bins (only active in output_mode = "grid"). These are the dominant 3D/
+# depth signal; the decoded-coordinate regression terms above remain as the small
+# auxiliary term (like upstream's 0.1*huber alongside 1.0*softmax).
+coords_softmax_2d_weight = 1.0
+coords_softmax_3d_weight = 1.0
+depth_softmax_weight = 1.0
 
 # Constant, metric-preserving rescale of the regular (multi-cam) 3D loss branch
 # so it matches the per-scene-normalized 2D-query branch (~500x hotter otherwise)
