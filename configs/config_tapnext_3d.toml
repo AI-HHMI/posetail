@@ -77,7 +77,7 @@ depth = 12
 lru_width = 768
 prope_insert_positions = [2, 5, 8, 11]
 pretrained_ckpt_path = '/groups/karashchuk/home/karashchukl/builds/tapnet/tapnextpp_ckpt.pt'
-freeze_backbone = 5000
+freeze_backbone = 500
 use_checkpointing = true
 
 # processing
