@@ -56,11 +56,22 @@ class TrackerTapNext(nn.Module):
                  max_freq=10,
                  principal_point_embedding=False,
                  intrinsic_embedding=False,
+                 # 3D/depth output representation. "direct" = unbounded regression
+                 # (today's behavior); "grid" = per-dimension marginal soft-argmax
+                 # over `head_grid_size` bins (2D-prediction style) for BOTH the 3D
+                 # head (3 dims) and the depth head (1 dim, in log-normalized space).
+                 output_mode='direct',
+                 head_grid_size=256,
+                 head_3d_grid_radius=1.0,
+                 depth_log_min=-3.0,
+                 depth_log_max=3.0,
                  mode_3d='tapnext',
                  **_ignored):
         super().__init__()
 
         self.mode_3d = mode_3d
+        self.output_mode = output_mode
+        self.head_grid_size = head_grid_size
         self.image_size = image_size
         self.S = stride_length
         self.n_frames = stride_length
@@ -121,19 +132,42 @@ class TrackerTapNext(nn.Module):
         def _head(out_dim):
             return nn.Sequential(nn.LayerNorm(width), nn.Linear(width, out_dim))
 
-        self.head_3d_direct = _head(3)
-        self.head_depth = _head(1)
+        # In "grid" mode the 3D head emits 3*G marginal-per-axis logits and the
+        # depth head emits G logits over a fixed bin grid; otherwise they regress
+        # 3 and 1 values directly (today's behavior). Register the bin centers:
+        # 3D in normalized ray-local units [-radius, radius]; depth in log of the
+        # normalized depth (distance / cube_scale [/ f_eff]) over [log_min, log_max].
+        if output_mode == 'grid':
+            G = head_grid_size
+            self.head_3d_direct = _head(3 * G)
+            self.head_depth = _head(G)
+            self.register_buffer('grid_1d',
+                                 torch.linspace(-head_3d_grid_radius, head_3d_grid_radius, G))
+            self.register_buffer('depth_grid',
+                                 torch.linspace(depth_log_min, depth_log_max, G))
+            self.g3d_lo, self.g3d_hi = -head_3d_grid_radius, head_3d_grid_radius
+            self.gd_lo, self.gd_hi = depth_log_min, depth_log_max
+        else:
+            self.head_3d_direct = _head(3)
+            self.head_depth = _head(1)
         self.head_conf2d = _head(1)
         self.head_conf3d = _head(1)
 
         # Variance-matched, dimension-invariant head init (see encoder_decoder.py).
+        # Grid heads are zero-init (uniform softmax -> starts at the grid centre,
+        # i.e. 0 ray-local / mid log-depth), matching encoder_decoder.py:695.
         HEAD_OUT_STD_REG = 0.01
         HEAD_OUT_STD_LOGIT = 0.25
         reg_std = HEAD_OUT_STD_REG / (width ** 0.5)
         logit_std = HEAD_OUT_STD_LOGIT / (width ** 0.5)
-        for head in [self.head_3d_direct[1], self.head_depth[1]]:
-            nn.init.normal_(head.weight, std=reg_std)
-            nn.init.zeros_(head.bias)
+        if output_mode == 'grid':
+            for head in [self.head_3d_direct[1], self.head_depth[1]]:
+                nn.init.zeros_(head.weight)
+                nn.init.zeros_(head.bias)
+        else:
+            for head in [self.head_3d_direct[1], self.head_depth[1]]:
+                nn.init.normal_(head.weight, std=reg_std)
+                nn.init.zeros_(head.bias)
         for head in [self.head_conf2d[1], self.head_conf3d[1]]:
             nn.init.normal_(head.weight, mean=0.0, std=logit_std)
             nn.init.zeros_(head.bias)
@@ -304,6 +338,22 @@ class TrackerTapNext(nn.Module):
 
         return extra
 
+    # ------------------------------------------------------------- grid decode
+    def _grid_decode(self, logits, grid_values):
+        """Per-axis masked soft-argmax over a fixed grid of bin centres, mirroring
+        ``TapNextBackbone.prediction_heads`` (threshold 20 bins, temperature 0.5).
+        ``logits`` (..., K), ``grid_values`` (K,) -> decoded value (...,). Used for
+        both the grid 3D head (called per-axis) and the grid depth head."""
+        soft_argmax_threshold = 20
+        softmax_temperature = 0.5
+        K = logits.shape[-1]
+        argmax = logits.argmax(dim=-1, keepdim=True)
+        index = torch.arange(K, device=logits.device)
+        mask = (torch.abs(argmax - index) <= soft_argmax_threshold).float()
+        probs = F.softmax(logits * softmax_temperature, dim=-1) * mask
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        return (probs * grid_values).sum(dim=-1)
+
     # ---------------------------------------------------------------- forward
     def forward(self, views, coords, camera_group, query_times=None):
         device = coords.device
@@ -422,13 +472,26 @@ class TrackerTapNext(nn.Module):
                                  cam=n_cams, b=B)
 
         # ----- 2D branch (pretrained heads): absolute pixel tracks -----
-        tracks, _track_logits, vis_logits = self.backbone.prediction_heads(point_tokens)
+        tracks, track_logits, vis_logits = self.backbone.prediction_heads(point_tokens)
         points_pred_scaled = tracks                                    # (cam,b,t,n,2) absolute px
         vis_pred_2d_logits = vis_logits                                # (cam,b,t,n,1)
 
         # ----- 3D branch (new heads) -----
-        points_3d_raw = self.head_3d_direct(point_tokens) * self.scale_3d   # (cam,b,t,n,3)
-        depth_pred = self.head_depth(point_tokens) * self.scale_depth       # (cam,b,t,n,1)
+        # `points_3d_raw` is the normalized ray-local 3D point and `depth_norm` the
+        # normalized depth (distance / cube_scale [/ f_eff]); both get scaled back to
+        # metric below. In grid mode they are masked soft-argmax over a fixed bin grid
+        # (bounded, self-balancing); in direct mode they are unbounded regressions.
+        logits_3d = logits_depth = None
+        if self.output_mode == 'grid':
+            logits_3d = rearrange(self.head_3d_direct(point_tokens),
+                                  'cam b t n (d k) -> cam b t n d k', d=3, k=self.head_grid_size)
+            points_3d_raw = self._grid_decode(logits_3d, self.grid_1d)       # (cam,b,t,n,3)
+            logits_depth = self.head_depth(point_tokens)                     # (cam,b,t,n,K)
+            depth_norm = torch.exp(self._grid_decode(logits_depth, self.depth_grid))  # (cam,b,t,n)
+        else:
+            points_3d_raw = self.head_3d_direct(point_tokens) * self.scale_3d   # (cam,b,t,n,3)
+            depth_pred = self.head_depth(point_tokens) * self.scale_depth       # (cam,b,t,n,1)
+            depth_norm = F.softplus(depth_pred[..., 0])                         # (cam,b,t,n)
         conf_pred_2d_logits = self.head_conf2d(point_tokens)                # (cam,b,t,n,1)
         conf_3d_logits = self.head_conf3d(point_tokens)                     # (cam,b,t,n,1)
 
@@ -436,7 +499,7 @@ class TrackerTapNext(nn.Module):
         conf_pred_2d = F.sigmoid(conf_pred_2d_logits)
         conf_3d = torch.softmax(conf_3d_logits[..., 0], dim=0)              # (cam,b,t,n)
 
-        depth_pred_scaled = F.softplus(depth_pred[..., 0]) * rearrange(cube_scale, 'cams b -> cams b 1 1')
+        depth_pred_scaled = depth_norm * rearrange(cube_scale, 'cams b -> cams b 1 1')
         if self.f_eff_scale:
             depth_pred_scaled = depth_pred_scaled * rearrange(f_eff, 'cams -> cams 1 1 1').to(depth_pred_scaled.dtype)
 
@@ -506,5 +569,22 @@ class TrackerTapNext(nn.Module):
             'vis_pred_2d': vis_pred_2d_logits[..., 0],
             'conf_pred_2d': conf_pred_2d_logits[..., 0],
             'depth_pred': depth_pred_scaled,
+            # Raw 2D position logits (256 x-bins | 256 y-bins) for direct
+            # coordinate-softmax supervision (upstream TAPNext++'s primary 2D loss).
+            '2d_logits': track_logits,                                  # (cam,b,t,n,512)
         }
+        # In grid mode, hand the loss the raw 3D/depth bin logits plus the geometry
+        # it needs to discretize GT into bin targets (it never sees the model): the
+        # per-camera ray-local SE3, cube_scale, f_eff, and the grid ranges.
+        if self.output_mode == 'grid':
+            result_dict['grid'] = {
+                'logits_3d': logits_3d,            # (cam,b,t,n,3,K)
+                'logits_depth': logits_depth,      # (cam,b,t,n,K)
+                'rays_c': rays_c,                  # (cams,4,4) world -> ray-local
+                'cube_scale': cube_scale,          # (cams,B)
+                'f_eff': f_eff if self.f_eff_scale else None,  # (cams,) or None
+                'g3d_lo': self.g3d_lo, 'g3d_hi': self.g3d_hi,
+                'gd_lo': self.gd_lo, 'gd_hi': self.gd_hi,
+                'K': self.head_grid_size,
+            }
         return result_dict
