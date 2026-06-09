@@ -85,20 +85,22 @@ mode_3d = "tapnext"
 #                The residual is normalized by cube*image_size (~pixels, NO f_eff) so
 #                it is camera-invariant and works for orthographic cameras (f_eff is
 #                the wrong normalizer for motion). Depth stays the absolute log grid.
-output_mode = "grid"
+output_mode = "gridresid"
 head_grid_size = 256
 # Ray-local grid half-width, set from scripts/estimate_grid_radius.py on
 # posetail-finetuning-v3 to cover every dataset's p99.9 (a generous radius is cheap
 # under log_3d_output, which concentrates bins near 0):
-#   "grid"      (absolute /cube*f_eff)        -> ~5.0 (per-dataset p99.9 up to 4.2).  [active]
-#   "gridresid" (motion   /cube*image_size)   -> ~1.5 (per-dataset p99.9 up to 0.93).
-head_3d_grid_radius = 5.0
+#   "grid"      (absolute /cube*f_eff)        -> ~5.0 (per-dataset p99.9 up to 4.2).
+#   "gridresid" (motion   /cube*image_size)   -> ~1.5 (per-dataset p99.9 up to 0.93).  [active]
+head_3d_grid_radius = 1.5
 # Signed-log warp of the 3D output (3D only; 2D + depth untouched). Places the grid
-# bins in a compressed space with denser resolution near 0. eps ~= 0.1*radius: the
-# absolute-grid distribution (p50~0.6, depth axis ~1) is only mildly peaked, so a
-# gentle warp (149->199 of 256 effective bins); gridresid wants a tighter eps~0.01*r.
+# bins in a compressed space with denser resolution near 0. The gridresid motion
+# residual is sharply peaked at 0 (p50~0.02, p99.9~0.63 of radius), so a tight eps
+# (~0.01, the probe optimum) spreads the central bulk across the grid (~53->~179 of
+# 256 effective bins). (For absolute "grid" use a gentler eps~0.1*radius.) Grid modes
+# have no expm1-gradient risk (CE backprops into logits, not through the warp).
 log_3d_output = true
-log_3d_eps = 0.5
+log_3d_eps = 0.01
 # Depth log-grid range = log(depth/(cube*f_eff)). Tightened from [-3,3] (only ~68/256
 # bins used) to cover every dataset's reach [~-1.8, 1.5] with margin (~2x resolution).
 depth_log_min = -2.5
