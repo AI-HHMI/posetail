@@ -71,6 +71,12 @@ class TrackerTapNext(nn.Module):
 
         self.mode_3d = mode_3d
         self.output_mode = output_mode
+        # `is_grid`: the 3D/depth heads emit soft-argmax bin logits (vs direct
+        # regression). `is_resid`: the 3D head predicts a motion *offset* added to
+        # a per-track query anchor (ported from tracker_encoder.py's `residual`
+        # mode); depth stays absolute in every mode. `gridresid` = both.
+        self.is_grid = output_mode in ('grid', 'gridresid')
+        self.is_resid = output_mode in ('residual', 'gridresid')
         self.head_grid_size = head_grid_size
         self.image_size = image_size
         self.S = stride_length
@@ -137,7 +143,7 @@ class TrackerTapNext(nn.Module):
         # 3 and 1 values directly (today's behavior). Register the bin centers:
         # 3D in normalized ray-local units [-radius, radius]; depth in log of the
         # normalized depth (distance / cube_scale [/ f_eff]) over [log_min, log_max].
-        if output_mode == 'grid':
+        if self.is_grid:
             G = head_grid_size
             self.head_3d_direct = _head(3 * G)
             self.head_depth = _head(G)
@@ -160,7 +166,7 @@ class TrackerTapNext(nn.Module):
         HEAD_OUT_STD_LOGIT = 0.25
         reg_std = HEAD_OUT_STD_REG / (width ** 0.5)
         logit_std = HEAD_OUT_STD_LOGIT / (width ** 0.5)
-        if output_mode == 'grid':
+        if self.is_grid:
             for head in [self.head_3d_direct[1], self.head_depth[1]]:
                 nn.init.zeros_(head.weight)
                 nn.init.zeros_(head.bias)
@@ -176,7 +182,12 @@ class TrackerTapNext(nn.Module):
         # ~depth/cube_scale == f_eff; with f_eff_scale on the per-camera f_eff
         # multiply in the forward collapses the learnable residual to ~1.
         abs_scale = 1.0 if self.f_eff_scale else 1000.0
-        self.scale_3d = nn.Parameter(torch.tensor([abs_scale]))
+        # The `residual` direct head emits a metric motion offset. With f_eff_scale
+        # on it is f_eff-normalized like the absolute head (motion/(cube*f_eff)~O(1)),
+        # so abs_scale (1.0) fits; only the no-f_eff case needs the encoder's larger
+        # 8.0 (motion/cube ~5). Grid/gridresid ignore scale_3d (the bins carry it).
+        scale_3d_init = 8.0 if (output_mode == 'residual' and not self.f_eff_scale) else abs_scale
+        self.scale_3d = nn.Parameter(torch.tensor([scale_3d_init]))
         self.scale_depth = nn.Parameter(torch.tensor([abs_scale]))
 
         # --- query-geometry aux embeddings (zero-init additive residual) ---
@@ -482,7 +493,7 @@ class TrackerTapNext(nn.Module):
         # metric below. In grid mode they are masked soft-argmax over a fixed bin grid
         # (bounded, self-balancing); in direct mode they are unbounded regressions.
         logits_3d = logits_depth = None
-        if self.output_mode == 'grid':
+        if self.is_grid:
             logits_3d = rearrange(self.head_3d_direct(point_tokens),
                                   'cam b t n (d k) -> cam b t n d k', d=3, k=self.head_grid_size)
             points_3d_raw = self._grid_decode(logits_3d, self.grid_1d)       # (cam,b,t,n,3)
@@ -543,7 +554,28 @@ class TrackerTapNext(nn.Module):
 
         p3d_cams = points_3d_raw * rearrange(cube_scale, 'cams b -> cams b 1 1 1')
         if self.f_eff_scale:
+            # f_eff-scale the metric ray-local output in every mode — absolute
+            # (direct/grid) AND residual (residual/gridresid) alike — so the
+            # regression/bin targets stay O(1) and uniform across datasets. The
+            # per-track anchor (below) is added afterwards in the same metric frame.
             p3d_cams = p3d_cams * rearrange(f_eff, 'cams -> cams 1 1 1 1').to(p3d_cams.dtype)
+
+        # residual modes: add the per-track query anchor in metric ray-local space.
+        # R==3 anchor = the query's GT world coords; R==2 anchor = the model's own
+        # ray-fused 3D prediction at the query frame (gather over points_3d_rays).
+        query_local = None
+        if self.is_resid:
+            if R == 3:
+                query_world = repeat(coords.to(torch.float32),
+                                     'b n r -> cams b t n r', cams=n_cams, t=T)
+            else:
+                t_idx = repeat(query_times.long(), 'b n -> b 1 n r', r=3)
+                query_3d = torch.gather(points_3d_rays, dim=1, index=t_idx)  # (b,1,n,3)
+                query_world = repeat(query_3d, 'b 1 n r -> cams b t n r', t=T, cams=n_cams)
+            query_local = from_homogeneous(
+                einsum(rays_c, to_homogeneous(query_world),
+                       'cams x r, cams b t n r -> cams b t n x'))
+            p3d_cams = p3d_cams + query_local
 
         points_3d_all_direct = from_homogeneous(
             einsum(rays_c_inv, to_homogeneous(p3d_cams),
@@ -576,7 +608,7 @@ class TrackerTapNext(nn.Module):
         # In grid mode, hand the loss the raw 3D/depth bin logits plus the geometry
         # it needs to discretize GT into bin targets (it never sees the model): the
         # per-camera ray-local SE3, cube_scale, f_eff, and the grid ranges.
-        if self.output_mode == 'grid':
+        if self.is_grid:
             result_dict['grid'] = {
                 'logits_3d': logits_3d,            # (cam,b,t,n,3,K)
                 'logits_depth': logits_depth,      # (cam,b,t,n,K)
@@ -586,5 +618,10 @@ class TrackerTapNext(nn.Module):
                 'g3d_lo': self.g3d_lo, 'g3d_hi': self.g3d_hi,
                 'gd_lo': self.gd_lo, 'gd_hi': self.gd_hi,
                 'K': self.head_grid_size,
+                # gridresid: the 3D grid bins encode a residual offset, so the loss
+                # forms its bin target as (GT_raylocal - anchor)/cube_scale (no
+                # f_eff). Absolute `grid` mode passes is_resid=False, no anchor.
+                'is_resid': self.is_resid,
+                'anchor_local': query_local.detach() if query_local is not None else None,
             }
         return result_dict

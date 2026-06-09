@@ -564,7 +564,15 @@ class TotalLoss(nn.Module):
                     denom_d = denom_d * rearrange(feff, 'cams -> cams 1 1 1').to(denom_d.dtype)
 
                 if self.coords_softmax_3d_weight > 0:
-                    target_3d = p_raylocal / denom                    # (cams,b,t,n,3) normalized
+                    if g.get('is_resid', False):
+                        # gridresid: the 3D bins encode the motion offset from the
+                        # per-track query anchor. Subtract the (detached) anchor in
+                        # ray-local space; the same cube_scale*f_eff `denom` as the
+                        # absolute grid normalizes it (the gridresid forward DOES
+                        # f_eff-scale its residual -> O(1), uniform across datasets).
+                        target_3d = (p_raylocal - g['anchor_local']) / denom
+                    else:
+                        target_3d = p_raylocal / denom                # (cams,b,t,n,3) normalized
                     coords_softmax_3d = self.coords_softmax_3d_weight * grid_softmax_loss(
                         g['logits_3d'], target_3d, g['g3d_lo'], g['g3d_hi'], vis_true_cams)
 

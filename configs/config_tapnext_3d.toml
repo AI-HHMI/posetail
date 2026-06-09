@@ -69,14 +69,27 @@ device = 'cuda'
 [model]
 mode_3d = "tapnext"
 
-# 3D/depth output representation. "grid" = per-dimension marginal soft-argmax over
-# `head_grid_size` bins (2D-prediction style) for BOTH the 3D head (3 dims, ray-local
-# normalized units in [-head_3d_grid_radius, +radius]) and the depth head (1 dim, log
-# of normalized depth in [depth_log_min, depth_log_max]). Bounded + zero-init +
-# self-balancing; supervised directly by the coordinate-softmax CE below. "direct" =
-# the old unbounded regression heads.
-output_mode = "grid"
+# 3D/depth output representation (4 modes):
+#   "direct"   = unbounded regression heads (the original behavior).
+#   "grid"     = per-dimension marginal soft-argmax over `head_grid_size` bins
+#                (2D-prediction style) for BOTH the 3D head (3 dims, ray-local units
+#                in [-head_3d_grid_radius, +radius]) and the depth head (1 dim, log
+#                of normalized depth in [depth_log_min, depth_log_max]). Bounded +
+#                zero-init + self-balancing; supervised by the coordinate-softmax CE.
+#   "residual" = direct (unbounded) 3D head emitting a motion *offset* added to a
+#                per-track query anchor (the query point's 3D location; for 2D-only
+#                queries, the model's own ray-fused 3D prediction at the query frame),
+#                ported verbatim from TrackerEncoder. Depth stays absolute.
+#   "gridresid"= the grid 3D head supplies that residual offset, so the bounded grid
+#                window only spans plausible *motion* (every GT target lands interior).
+#                Depth stays the absolute log-depth grid.
+output_mode = "gridresid"
 head_grid_size = 256
+# Ray-local grid half-width (normalized units), set from scripts/estimate_grid_radius.py
+# on posetail-finetuning-v3 (p99.9, uniform across datasets):
+#   "grid"      (absolute /cube*f_eff)        -> ~2.5 (depth axis dominates).
+#   "gridresid" (motion   /cube*f_eff)        -> ~1.0 (forward motion; f_eff-normalized
+#               so it stays O(1) and uniform — motion/cube alone spans 20x by dataset).
 head_3d_grid_radius = 1.0
 depth_log_min = -3.0
 depth_log_max = 3.0
