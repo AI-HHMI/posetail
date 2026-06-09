@@ -53,7 +53,8 @@ class TotalLoss(nn.Module):
                  smoothness_loss_3d_weight = 0,
                  smoothness_loss_2d_weight = 0,
                  smoothness_loss_order = 4,
-                 smoothness_loss_tolerance = 1.0):
+                 smoothness_loss_tolerance = 1.0,
+                 coords_3d_loss_scale = 1.0):
         super().__init__()
 
         self.gamma = gamma
@@ -82,6 +83,15 @@ class TotalLoss(nn.Module):
         self.smoothness_loss_2d_weight = smoothness_loss_2d_weight
         self.smoothness_loss_order = smoothness_loss_order
         self.smoothness_loss_tolerance = smoothness_loss_tolerance
+
+        # Constant, metric-preserving rescale of the regular (multi-cam) 3D loss
+        # branch. The regular branch measures absolute coordinate error / cube_scale
+        # (~0.11), which runs ~500x hotter than the per-scene-normalized 2D-query
+        # branch and dominates the gradient (corrupting the frozen 2D heads). We
+        # cannot normalize per scene/camera in the multi-cam case (it breaks
+        # cross-camera metric consistency), so we divide the regular-3D losses by a
+        # single global constant to match magnitudes while keeping absolute depth.
+        self.coords_3d_loss_scale = coords_3d_loss_scale
 
         self.bce_loss_vis = BCELossVis(
             gamma = self.gamma, 
@@ -289,8 +299,11 @@ class TotalLoss(nn.Module):
             occluded_true = ~vis_true
 
             if p2d is None:
-                scale_cb = rearrange(scale, 'cams b -> cams b 1 1 1')
-                scale_b  = scale.median(dim=0).values.reshape(B, 1, 1, 1)
+                # WeightedMAELoss divides the error by `scale`, so multiplying the
+                # cube_scale by the (>=1) constant scales the regular-3D loss DOWN
+                # to match the normalized 2D-query branch's magnitude.
+                scale_cb = rearrange(scale, 'cams b -> cams b 1 1 1') * self.coords_3d_loss_scale
+                scale_b  = scale.median(dim=0).values.reshape(B, 1, 1, 1) * self.coords_3d_loss_scale
             else:
                 scale_cb = 1.0
                 scale_b  = 1.0

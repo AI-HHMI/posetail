@@ -106,8 +106,10 @@ class TrackerTapNext(nn.Module):
         if pretrained_ckpt_path is not None:
             self._load_pretrained(pretrained_ckpt_path)
 
-        if self.backbone_frozen:
-            self._set_backbone_requires_grad(False)
+        # NOTE: the early freeze is applied at the END of __init__ (not here),
+        # because it now also covers the PROPE attention + aux projections created
+        # below. Freezing those during the early phase keeps the 2D heads' inputs
+        # pristine (they read the same point tokens PROPE/aux would perturb).
 
         # --- cross-camera PROPE attention (new, zero-init -> no-op at init) ---
         self.camera_attns = nn.ModuleList([
@@ -173,6 +175,13 @@ class TrackerTapNext(nn.Module):
             nn.init.zeros_(m.bias)
         nn.init.zeros_(self.q_vis_embed.weight)
 
+        # Early freeze (backbone + PROPE + aux). Applied here, after every
+        # early-frozen module exists. Both PROPE and the aux residual are zero-init,
+        # so freezing them keeps the 2D path bit-identical to pretrained TAPNext
+        # through the frozen phase while the from-scratch 3D heads warm up.
+        if self.backbone_frozen:
+            self._set_backbone_requires_grad(False)
+
     # ------------------------------------------------------------------ utils
     def _load_pretrained(self, path):
         import os
@@ -196,14 +205,31 @@ class TrackerTapNext(nn.Module):
         else:
             print(f"[TrackerTapNext] loaded pretrained backbone from {path}")
 
+    def _early_frozen_parameters(self):
+        """Params held frozen during the early phase: the pretrained backbone PLUS
+        the new PROPE attention and aux-query projections. Freezing the latter two
+        (both zero-init) keeps the point tokens the frozen 2D heads read pristine,
+        so 2D/occlusion stay at pretrained quality until the 3D heads warm up."""
+        params = list(self.backbone.parameters())
+        params += list(self.camera_attns.parameters())
+        aux = [self.q_depth_proj, self.q_vis_embed, self.q_depth_norm_scale]
+        if self.intrinsic_embedding:
+            aux.append(self.q_focal_proj)
+        if self.principal_point_embedding:
+            aux.append(self.q_pp_proj)
+        for a in aux:
+            params += list(a.parameters()) if isinstance(a, nn.Module) else [a]
+        return params
+
     def _set_backbone_requires_grad(self, requires_grad):
-        for p in self.backbone.parameters():
+        for p in self._early_frozen_parameters():
             p.requires_grad = requires_grad
 
     def unfreeze_video_encoder(self, iteration):
-        """Unfreeze the TAPNext backbone once `iteration` reaches the configured
-        switch-on point. Safe to call every iteration (no-op otherwise).
-        Named to match TrackerEncoder so train.py's maybe_unfreeze call works."""
+        """Unfreeze the backbone + PROPE + aux projections once `iteration` reaches
+        the configured switch-on point. Safe to call every iteration (no-op
+        otherwise). Named to match TrackerEncoder so train.py's maybe_unfreeze call
+        works."""
         if self.backbone_unfreeze_iter is None:
             return False
         if not self.backbone_frozen:
