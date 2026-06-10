@@ -376,7 +376,7 @@ def train_iteration(config, model, fabric, batch,
         for metric in metrics:
             metric_list = [float(metric_dict[metric]) for metric_dict in metric_dicts]
             avg_metrics_dict[f'{metric}_avg'] = float(np.mean(metric_list))
-            avg_metrics_dict[f'{metric}_std'] = float(np.std(metric_list))
+            # avg_metrics_dict[f'{metric}_std'] = float(np.std(metric_list))
 
         train_dict.update(avg_metrics_dict)
 
@@ -522,19 +522,24 @@ def train_epoch(config, model, fabric, dataloader,
         for metric in metrics:
             metric_list = [float(metric_dict[metric]) for metric_dict in metric_dicts]
             avg_metrics_dict[f'{metric}_avg'] = float(np.mean(metric_list))
-            avg_metrics_dict[f'{metric}_std'] = float(np.std(metric_list))
+            # avg_metrics_dict[f'{metric}_std'] = float(np.std(metric_list))
 
         train_dict.update(avg_metrics_dict)
 
     return train_dict
 
 
-def average_metrics(dicts, prefix, name = None):
+def average_metrics(dicts, prefix, name = None, nan_safe = False):
     ''' average a list of metric dicts. metric keys look like
     "{prefix}{metric}". When name is given, the per-dataset metrics are
     written to their own top-level wandb folder "{prefix_tag}_{name}/{metric}"
     (e.g. "val_<dataset>/mte"), keeping them separate from the summary
-    metrics that live under the "{prefix}" folder (e.g. "val/mte"). '''
+    metrics that live under the "{prefix}" folder (e.g. "val/mte").
+
+    When nan_safe is True, nan entries are ignored (np.nanmean/np.nanstd),
+    matching how losses are aggregated in BaseLoss.collapse_history. '''
+    mean_fn = np.nanmean if nan_safe else np.mean
+    std_fn = np.nanstd if nan_safe else np.std
     out = {}
     for metric in dicts[0].keys():
         metric_list = [float(d[metric]) for d in dicts]
@@ -542,8 +547,8 @@ def average_metrics(dicts, prefix, name = None):
         if name is not None:
             prefix_tag = prefix.rstrip('/')
             key = f'{prefix_tag}_{name}/{metric[len(prefix):]}'
-        out[f'{key}_avg'] = float(np.mean(metric_list))
-        out[f'{key}_std'] = float(np.std(metric_list))
+        out[f'{key}_avg'] = float(mean_fn(metric_list))
+        # out[f'{key}_std'] = float(std_fn(metric_list))
     return out
 
 
@@ -560,6 +565,8 @@ def test_epoch(config, model, dataloader, loss = None,
     n_frames = 0
     metric_dicts = []
     metric_datasets = []  # dataset name per entry in metric_dicts (batch_size=1)
+    loss_dicts = []       # per-batch loss snapshots (batch_size=1)
+    loss_datasets = []    # dataset name per entry in loss_dicts
 
     for j, batch in enumerate(dataloader):
 
@@ -600,14 +607,22 @@ def test_epoch(config, model, dataloader, loss = None,
 
         if loss is not None:
             total_loss = loss(
-                model = model, 
+                model = model,
                 outputs = outputs,
-                coords_true = coords, 
+                coords_true = coords,
                 vis_true = vis,
                 vis_true_cams = vis_2d,
-                cgroup = cgroup, 
-                p2d = p2d, 
+                cgroup = cgroup,
+                p2d = p2d,
                 device = coords_pred.device)
+
+            # snapshot this batch's just-appended losses (one value per key per
+            # forward), tagged by dataset, so they can be aggregated per-dataset
+            # below. Keyed with `prefix` for compatibility with average_metrics.
+            batch_losses = {f'{prefix}{name}': vals[-1]
+                            for name, vals in loss.loss_history.items() if vals}
+            loss_dicts.append(batch_losses)
+            loss_datasets.append(batch.sample_info.get('dataset', 'unknown'))
 
         if evaluate and coords.shape[-1] == 3:
             if p2d is not None:
@@ -655,5 +670,13 @@ def test_epoch(config, model, dataloader, loss = None,
             dataset_dicts = [d for d, name in zip(metric_dicts, metric_datasets)
                              if name == dataset_name]
             val_dict.update(average_metrics(dataset_dicts, prefix, name = dataset_name))
+
+    # per-dataset loss averages, e.g. "val_<dataset_name>/coords_loss_avg"
+    if loss is not None and loss_dicts:
+        for dataset_name in sorted(set(loss_datasets)):
+            dataset_loss_dicts = [d for d, name in zip(loss_dicts, loss_datasets)
+                                  if name == dataset_name]
+            val_dict.update(average_metrics(dataset_loss_dicts, prefix,
+                                            name = dataset_name, nan_safe = True))
 
     return val_dict
