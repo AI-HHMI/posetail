@@ -31,6 +31,7 @@ from posetail.posetail.cube import undistort_points, triangulate_simple_batch, p
 from posetail.posetail.cube import points_to_rays, _invert_SE3
 from posetail.posetail.cube import CameraSelfAttention, is_point_visible
 from posetail.posetail.cube import signed_log1p, signed_expm1
+from posetail.posetail.cube import noisy_or_logit
 from posetail.posetail.utils import PadToSize, count_parameters, get_fourier_encoding
 from posetail.posetail.tapnext import TapNextBackbone
 
@@ -622,7 +623,7 @@ class TrackerTapNext(nn.Module):
         points_3d_direct = einsum(points_3d_all_direct, conf_3d,
                                   'cams b t n r, cams b t n -> b t n r')
 
-        vis_pred = torch.amax(vis_pred_2d_logits, dim=0)               # (b,t,n,1)
+        vis_pred = noisy_or_logit(vis_pred_2d_logits, dim=0)           # (b,t,n,1) noisy-OR logit
         conf_pred = torch.amax(conf_3d_logits[..., 0], dim=0)          # (b,t,n)
 
         result_dict = {

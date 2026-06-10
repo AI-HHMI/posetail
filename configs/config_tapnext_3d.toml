@@ -168,6 +168,7 @@ use_huber_loss = true
 # vis: the pretrained visible_head is already good; 400 over-drove the shared
 # tokens (vis_2d ~1000 at init) and degraded occlusion. Gentle adaptation only.
 vis_loss_weight = 5
+vis_loss_3d_weight = 1.0
 conf_loss_weight = 0.0
 conf_2d_loss_weight = 0.0
 # TAPNext++ down-weights occluded points 0.2x vs visible.
@@ -177,7 +178,7 @@ feature_loss_weight = 0.0
 coords_loss_weight = 1.0
 coords_loss_direct_weight = 1.0
 coords_loss_rays_weight = 0.1
-coords_loss_triangulate_weight = 0.2
+coords_loss_triangulate_weight = 0.0
 coords_loss_2d_weight = 2.0
 coords_loss_depth_weight = 1.0
 

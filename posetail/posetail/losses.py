@@ -82,6 +82,7 @@ class TotalLoss(nn.Module):
 
     def __init__(self, gamma = 0.8, pixel_thresh = 12, delta = 6,
                  use_huber_loss = False, vis_loss_weight = 1,
+                 vis_loss_3d_weight = 0.0,
                  conf_loss_weight = 1, coords_loss_weight = 1,
                  occluded_coords_loss_weight = 1,
                  feature_loss_weight = 0.5,
@@ -110,6 +111,7 @@ class TotalLoss(nn.Module):
 
         # weight for each loss (0 to not use or compute)
         self.vis_loss_weight = vis_loss_weight
+        self.vis_loss_3d_weight = vis_loss_3d_weight
         self.conf_loss_weight = conf_loss_weight
         self.coords_loss_weight = coords_loss_weight
         self.occluded_coords_loss_weight = occluded_coords_loss_weight
@@ -147,8 +149,16 @@ class TotalLoss(nn.Module):
         self.depth_softmax_weight = depth_softmax_weight
 
         self.bce_loss_vis = BCELossVis(
-            gamma = self.gamma, 
+            gamma = self.gamma,
             weight = self.vis_loss_weight
+        )
+
+        # separate-weight BCE for the aggregated 3D visibility (noisy-OR logit
+        # over cameras). weight 0 -> returns nan -> dropped from total_loss, so
+        # this is inert until a config opts in via vis_loss_3d_weight.
+        self.bce_loss_vis_3d = BCELossVis(
+            gamma = self.gamma,
+            weight = self.vis_loss_3d_weight
         )
 
         self.bce_loss_conf = BCELossConf(
@@ -392,7 +402,7 @@ class TotalLoss(nn.Module):
 
             # compute losses
             if valid_vis:
-                vis_loss = self.bce_loss_vis(
+                vis_loss = self.bce_loss_vis_3d(
                     vis_pred=vis_pred_iters if training_iters else vis_pred,
                     vis_true=vis_true_unrolled if training_iters else vis_true,
                     device=device)
@@ -648,7 +658,7 @@ class TotalLoss(nn.Module):
             coords_loss_direct,
             coords_loss_rays,
             coords_loss_triangulate,
-            # vis_loss, # replaced by vis_loss_cams
+            vis_loss,  # 3D noisy-OR visibility (inert unless vis_loss_3d_weight > 0)
             vis_loss_cams,
             conf_loss,
             conf_loss_2d,

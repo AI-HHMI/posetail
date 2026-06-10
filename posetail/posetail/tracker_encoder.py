@@ -10,6 +10,7 @@ from einops import rearrange, einsum, reduce, repeat
 from posetail.posetail.cube import get_camera_scale, from_homogeneous, to_homogeneous
 from posetail.posetail.cube import undistort_points, triangulate_simple_batch, project_points_torch
 from posetail.posetail.cube import points_to_rays, _invert_SE3
+from posetail.posetail.cube import noisy_or_logit
 from posetail.posetail.utils import PadToMultiple, PadToSize, count_parameters
 from posetail.posetail.encoder_decoder import SceneRepresentation, QueryEncoder, Decoder
 
@@ -408,7 +409,7 @@ class TrackerEncoder(nn.Module):
         # bad_pred = torch.amax(conf_pred_2d[..., 0], dim=0) <= 1e-5
         # points_3d = einsum(points_3d, ~bad_pred, 'b t n r, b t n -> b t n r') 
         
-        vis_pred = torch.amax(vis_pred_2d_logits, dim=0)
+        vis_pred = noisy_or_logit(vis_pred_2d_logits, dim=0)  # noisy-OR logit
         conf_pred = torch.amax(conf_3d_logits[..., 0], dim=0)
         
         # assemble outputs 
