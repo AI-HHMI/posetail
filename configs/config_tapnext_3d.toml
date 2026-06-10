@@ -175,11 +175,11 @@ conf_2d_loss_weight = 0.0
 occluded_coords_loss_weight = 0.2
 feature_loss_weight = 0.0
 
-coords_loss_weight = 1.0
-coords_loss_direct_weight = 1.0
-coords_loss_rays_weight = 0.1
+coords_loss_weight = 4.0
+coords_loss_direct_weight = 8.0
+coords_loss_rays_weight = 0.5
 coords_loss_triangulate_weight = 0.0
-coords_loss_2d_weight = 2.0
+coords_loss_2d_weight = 1.0
 coords_loss_depth_weight = 1.0
 
 # Direct logit-classification (cross-entropy on position bins), upstream TAPNext++'s
