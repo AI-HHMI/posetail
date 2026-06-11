@@ -1,0 +1,199 @@
+[wandb]
+project_name = 'posetail-pretraining-v3'
+path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3'
+mode = 'online' # 'online', 'offline', 'disabled'
+
+[dataset]
+# batch_size=1 is REQUIRED for mixed 2D+3D training.
+# The 2D loss axis-order assumption (B=cams=1) breaks at batch_size>1.
+# For multi-GPU training use --strategy ddp_find_unused_parameters_true (the default).
+batch_size = 1
+num_workers = 12
+prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3'
+# tuned (posetail-scene-proj-tuning sweep): excluding this subset gave markedly lower
+# kubric MTE (mean 0.62 vs 1.15 with it included).
+datasets_to_exclude = ['point-odyssey-animal-sub256']
+
+[dataset.train]
+split_dir = 'train'
+n_frames = 16
+min_res = 256
+max_res = 256
+cams_to_sample = [1, 8]
+kpts_to_sample = [128, 128]
+aug_prob = 0.25
+enable_kpt_filtering = false
+cam_thresh_for_vis = 1
+balance_datasets = true
+n_samples_per_dataset = -1
+crop_to_points = true
+speed_thresh = 1.0
+query_anytime = true
+query_edge_bias = 200.0
+prop_dynamic_kpts_to_sample = 0.95
+prob_2d_only = 0.25
+crop_3d_enabled = true
+crop_3d_fraction = [0.05, 0.75]
+crop_3d_prob = 0.4
+# NOTE: no causal_masking — the encoder's temporal self-attention is bidirectional
+# (causal masking is a TapNext SSM-specific setting).
+
+[dataset.train.curriculum]
+enabled = false
+ramp_start_frac = 0.0
+ramp_end_frac   = 0.4
+intensity_floor = 0.0
+
+[dataset.val]
+split_dir = 'val'
+n_frames = 16
+max_res = 256
+cams_to_sample = 5
+kpts_to_sample = 128
+aug_prob = 0.0
+crop_to_points = true
+speed_thresh = 1.0
+prop_dynamic_kpts_to_sample = 0.7
+query_anytime = false
+
+[dataset.test]
+split_dir = 'test'
+max_res = 256
+n_frames = 16
+project_2d = false
+aug_prob = 0.0
+
+[devices]
+device = 'cuda'
+
+
+[model]
+mode_3d = "encoder"
+
+video_encoder_version = 'large'
+# tuned (sweep): keep the VJEPA backbone frozen for the first 100k iters, then unfreeze.
+# The best runs used 100k-200k here; 500 (unfreeze almost immediately) was clearly worse.
+video_encoder_requires_grad = 100000
+video_encoder_hierarchical = true
+
+# tuned (sweep): finetuning the last 2 layers beat 4 (mean kubric 0.66 vs 1.39).
+video_encoder_finetune_last_n_layers = 2
+
+# processing
+stride_length = 16
+image_size = 256
+query_patch_size = 9
+per_camera_cube_scale = true
+
+# query encoder
+max_freq = 10
+embedding_dim = 256
+use_volume_embedding = false
+corr_radius = 2
+principal_point_embedding = true
+intrinsic_embedding = true
+metric_ray_translation = true
+
+# decoder
+latent_dim = 512
+n_heads = 8
+n_time_space_blocks = 6
+embedding_factor = 4
+use_camera_self_attention = true
+use_temporal_self_attention = true
+f_eff_scale = true
+# scene_encoder_proj = true matters: projecting encoder features to the decoder dim
+# trains notably better than false. (use_huber_loss + principal_point_embedding below
+# are likewise kept on.)
+scene_encoder_proj = true
+
+# 3D/depth output representation: "grid" = per-axis marginal soft-argmax over a fixed
+# bin grid (bounded, zero-init, self-balancing), supervised by cross-entropy. The 3D
+# head predicts the *absolute* ray-local position (no residual anchor), normalized by
+# cube*f_eff. Depth is the absolute log grid. A 2D position-logit head (2*image_size
+# pixel bins) is also supervised by CE. Mirrors TrackerTapNext's grid recipe.
+# (The residual variant lives in config_encoder_gridresid.toml.)
+output_mode = "grid"
+head_3d_grid_size = 256
+# Ray-local grid half-width for ABSOLUTE position (grid pos / cube*f_eff, per-dataset
+# p99.9 up to ~4.2); generous under log_3d_output, which concentrates bins near 0.
+# (gridresid uses ~1.5 since it bins the much smaller motion residual.)
+head_3d_grid_radius = 5.0
+# Signed-log warp of the 3D grid. ABSOLUTE positions are NOT peaked at 0 (they spread
+# across [-radius, radius], p99.9 up to ~4.2), so the tight eps that suits the gridresid
+# motion residual would over-concentrate bins near 0. Per config_tapnext_3d.toml /
+# estimate_grid_radius.py, absolute "grid" mode wants a gentler eps ~0.1*radius -> ~0.5
+# at radius=5.0. Grid modes have no expm1-gradient risk (CE backprops into logits, not
+# through the warp).
+log_3d_output = true
+log_3d_eps = 0.5
+# Depth log-grid range = log(depth/(cube*f_eff)); covers every dataset's reach with margin.
+depth_log_min = -2.5
+depth_log_max = 2.0
+
+[training]
+seed = 3
+n_iterations = 800000
+scheduler_type = 'schedulefree'
+max_grad_norm = 50.0
+checkpoint_freq = 10240 # in iterations
+eval_metric_freq = 16 # in iterations
+val_freq = 64 # in iterations
+print_freq = 128 # in iterations
+debug_ix = -1 # only works for val
+
+[training.optimizer]
+# Encoder-tuned: the decoder + query encoder train FROM SCRATCH (the VJEPA backbone is
+# frozen), so keep the original encoder LR — TapNext's 2e-5 is a finetune rate for a
+# pretrained backbone and would stall a from-scratch decoder. The grid-CE objective is
+# far better-conditioned than direct regression, so 7e-4 should now be stable.
+# tuned (sweep): the best runs used learning_rate=7e-4 with encoder_lr_scale=0.3.
+learning_rate = 7e-4
+weight_decay = 0.002
+warmup_steps = 1500
+beta1 = 0.9
+beta2 = 0.95
+# tuned (sweep): scale the (unfrozen) encoder LR to 0.3x the base; 0.3 beat 1.0 clearly
+# (mean kubric 0.80 vs 1.31).
+encoder_lr_scale = 0.3
+
+[training.scheduler]
+
+[training.losses]
+gamma = 0.8
+pixel_thresh = 3
+delta = 6
+use_huber_loss = true
+
+# weights for calculating total loss (use 0 to not compute a specific loss)
+vis_loss_weight = 5
+vis_loss_3d_weight = 1.0
+conf_loss_weight = 0.0
+conf_2d_loss_weight = 0.0
+# TAPNext++ down-weights occluded points 0.2x vs visible.
+occluded_coords_loss_weight = 0.2
+feature_loss_weight = 0.0
+
+coords_loss_weight = 4.0
+coords_loss_direct_weight = 8.0
+coords_loss_rays_weight = 0.5
+coords_loss_triangulate_weight = 0.0
+coords_loss_2d_weight = 1.0
+coords_loss_depth_weight = 1.0
+
+# Direct logit-classification (cross-entropy on position bins) — the dominant 2D/3D/
+# depth signal. 2D supervises the new pixel-bin head; 3D/depth supervise the grid bins.
+# The decoded-coordinate regression terms above remain as small auxiliary losses.
+coords_softmax_2d_weight = 1.0
+coords_softmax_3d_weight = 1.0
+depth_softmax_weight = 1.0
+
+# Constant, metric-preserving rescale of the regular (multi-cam) 3D loss branch so it
+# matches the per-scene-normalized 2D-query branch (~500x hotter otherwise) and stops
+# monopolizing the gradient.
+coords_3d_loss_scale = 500.0
+
+smoothness_loss_3d_weight = 0.05
+smoothness_loss_2d_weight = 0.05
+smoothness_loss_order = 4
+smoothness_loss_tolerance = 1.5
