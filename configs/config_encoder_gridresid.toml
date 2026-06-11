@@ -12,7 +12,7 @@ num_workers = 12
 prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3'
 # tuned (posetail-scene-proj-tuning sweep): excluding this subset gave markedly lower
 # kubric MTE (mean 0.62 vs 1.15 with it included).
-datasets_to_exclude = ['point-odyssey-animal-sub256']
+# datasets_to_exclude = ['point-odyssey-animal-sub256']
 
 [dataset.train]
 split_dir = 'train'
