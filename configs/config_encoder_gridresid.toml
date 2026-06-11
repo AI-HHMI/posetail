@@ -10,9 +10,6 @@ mode = 'online' # 'online', 'offline', 'disabled'
 batch_size = 1
 num_workers = 12
 prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3'
-# tuned (posetail-scene-proj-tuning sweep): excluding this subset gave markedly lower
-# kubric MTE (mean 0.62 vs 1.15 with it included).
-# datasets_to_exclude = ['point-odyssey-animal-sub256']
 
 [dataset.train]
 split_dir = 'train'
@@ -71,13 +68,12 @@ device = 'cuda'
 mode_3d = "encoder"
 
 video_encoder_version = 'large'
-# tuned (sweep): keep the VJEPA backbone frozen for the first 100k iters, then unfreeze.
-# The best runs used 100k-200k here; 500 (unfreeze almost immediately) was clearly worse.
-video_encoder_requires_grad = 100000
+# Unfreeze the VJEPA backbone at iter 25000, then finetune the last 4 layers.
+# (6i8ryveg used 500; trying a later unfreeze here.)
+video_encoder_requires_grad = 25000
 video_encoder_hierarchical = true
 
-# tuned (sweep): finetuning the last 2 layers beat 4 (mean kubric 0.66 vs 1.39).
-video_encoder_finetune_last_n_layers = 2
+video_encoder_finetune_last_n_layers = 4
 
 # processing
 stride_length = 16
@@ -144,16 +140,15 @@ debug_ix = -1 # only works for val
 # Encoder-tuned: the decoder + query encoder train FROM SCRATCH (the VJEPA backbone is
 # frozen), so keep the original encoder LR — TapNext's 2e-5 is a finetune rate for a
 # pretrained backbone and would stall a from-scratch decoder. The grid-CE objective is
-# far better-conditioned than direct regression, so 7e-4 should now be stable.
-# tuned (sweep): the best runs used learning_rate=7e-4 with encoder_lr_scale=0.3.
-learning_rate = 7e-4
+# far better-conditioned than direct regression, so 7e-4 should now be stable. We keep
+# the original 5e-4 base LR (6i8ryveg's setting); encoder_lr_scale=1.0 trains the
+# (unfrozen) encoder at the full base rate.
+learning_rate = 5e-4
 weight_decay = 0.002
 warmup_steps = 1500
 beta1 = 0.9
 beta2 = 0.95
-# tuned (sweep): scale the (unfrozen) encoder LR to 0.3x the base; 0.3 beat 1.0 clearly
-# (mean kubric 0.80 vs 1.31).
-encoder_lr_scale = 0.3
+encoder_lr_scale = 1.0
 
 [training.scheduler]
 
