@@ -52,6 +52,8 @@ intensity_floor = 0.0
 
 [dataset.val]
 split_dir = 'val'
+# specify which datasets get logged to wandb as val_<dataset_name>
+# split_out = ['kubric-multiview']
 n_frames = 16
 max_res = 256
 cams_to_sample = 5
@@ -84,8 +86,8 @@ video_encoder_hierarchical = true
 # video encoder are finetuned and the rest stay frozen. Omit (or comment out)
 # to train all encoder params when video_encoder_requires_grad allows it.
 # Max N per size: base=12, large=24, giant=40, gigantic=48.
-# 
-# video_encoder_finetune_last_n_layers = 8
+# video_encoder_finetune_last_n_layers = 4
+
 
 # processing
 stride_length = 16
@@ -135,6 +137,7 @@ weight_decay = 0.002
 warmup_steps = 1500
 beta1 = 0.9
 beta2 = 0.95
+encoder_lr_scale = 1.0
 
 [training.scheduler]
 # milestones = [50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550]
