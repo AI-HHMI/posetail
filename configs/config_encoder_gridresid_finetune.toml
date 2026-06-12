@@ -19,7 +19,7 @@ batch_size = 1
 num_workers = 12
 # Finetune on the finetuning-v3 set (vs the pretraining-v3 set used for pretraining).
 prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v3'
-datasets_to_exclude = []
+datasets_to_exclude = ["johnson-fly"]
 
 [dataset.train]
 split_dir = 'train'
@@ -84,7 +84,7 @@ video_encoder_version = 'large'
 video_encoder_requires_grad = true
 video_encoder_hierarchical = true
 
-video_encoder_finetune_last_n_layers = 4
+video_encoder_finetune_last_n_layers = 6
 
 # processing
 stride_length = 16
@@ -140,27 +140,27 @@ seed = 3
 finetune = true
 # Finetune from the gridresid pretraining run (6i8ryveg). NOTE: that run is still
 # training — update this to its final / best checkpoint when pretraining completes.
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260610_131032-6i8ryveg/files/checkpoints/checkpoint_00573552.pth'
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260610_131032-6i8ryveg/files/checkpoints/checkpoint_00799998.pth'
 
 n_iterations = 800000
 scheduler_type = 'schedulefree'
 max_grad_norm = 50.0
 checkpoint_freq = 10240 # in iterations
-eval_metric_freq = 16 # in iterations
-val_freq = 64 # in iterations
-print_freq = 128 # in iterations
+eval_metric_freq = 24 # in iterations
+val_freq = 48 # in iterations
+print_freq = 96 # in iterations
 debug_ix = -1 # only works for val
 
 [training.optimizer]
 # Finetuning LR + longer warmup (from config_encoder_3d_finetuning_2d.toml).
-learning_rate = 5e-4
+learning_rate = 2e-4
 weight_decay = 0.002
 warmup_steps = 3000
 beta1 = 0.9
 beta2 = 0.95
 # Full base LR on the (pretrained) encoder. Lower this (e.g. 0.3) for gentler finetuning
 # if the pretrained features start to degrade early.
-encoder_lr_scale = 1.0
+encoder_lr_scale = 0.5
 
 [training.scheduler]
 
@@ -173,8 +173,8 @@ delta = 6
 use_huber_loss = true
 
 # weights for calculating total loss (use 0 to not compute a specific loss)
-vis_loss_weight = 5
-vis_loss_3d_weight = 1.0
+vis_loss_weight = 10
+vis_loss_3d_weight = 10.0
 conf_loss_weight = 0.0
 conf_2d_loss_weight = 0.0
 # TAPNext++ down-weights occluded points 0.2x vs visible.
@@ -182,18 +182,18 @@ occluded_coords_loss_weight = 0.2
 feature_loss_weight = 0.0
 
 coords_loss_weight = 4.0
-coords_loss_direct_weight = 8.0
+coords_loss_direct_weight = 4.0
 coords_loss_rays_weight = 0.5
-coords_loss_triangulate_weight = 0.2
+coords_loss_triangulate_weight = 0.0
 coords_loss_2d_weight = 1.0
 coords_loss_depth_weight = 1.0
 
 # Direct logit-classification (cross-entropy on position bins) — the dominant 2D/3D/
 # depth signal. 2D supervises the new pixel-bin head; 3D/depth supervise the grid bins.
 # The decoded-coordinate regression terms above remain as small auxiliary losses.
-coords_softmax_2d_weight = 1.0
-coords_softmax_3d_weight = 1.0
-depth_softmax_weight = 1.0
+coords_softmax_2d_weight = 10.0
+coords_softmax_3d_weight = 10.0
+depth_softmax_weight = 10.0
 
 # Constant, metric-preserving rescale of the regular (multi-cam) 3D loss branch so it
 # matches the per-scene-normalized 2D-query branch (~500x hotter otherwise) and stops
