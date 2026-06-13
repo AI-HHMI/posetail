@@ -4,9 +4,7 @@ path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3'
 mode = 'online' # 'online', 'offline', 'disabled'
 
 [dataset]
-# batch_size=1 is REQUIRED for mixed 2D+3D training.
-# The 2D loss axis-order assumption (B=cams=1) breaks at batch_size>1.
-# For multi-GPU training use --strategy ddp_find_unused_parameters_true (the default).
+# batch_size=1 REQUIRED for mixed 2D+3D (2D loss assumes B=cams=1). Multi-GPU: --strategy ddp.
 batch_size = 1
 num_workers = 12
 prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3'
@@ -32,8 +30,7 @@ prob_2d_only = 0.25
 crop_3d_enabled = true
 crop_3d_fraction = [0.05, 0.75]
 crop_3d_prob = 0.4
-# NOTE: no causal_masking — the encoder's temporal self-attention is bidirectional
-# (causal masking is a TapNext SSM-specific setting).
+# No causal_masking: the encoder's temporal self-attention is bidirectional (TapNext-only).
 
 [dataset.train.curriculum]
 enabled = false
@@ -68,12 +65,12 @@ device = 'cuda'
 mode_3d = "encoder"
 
 video_encoder_version = 'large'
-# Unfreeze the VJEPA backbone at iter 25000, then finetune the last 4 layers.
-# (6i8ryveg used 500; trying a later unfreeze here.)
-video_encoder_requires_grad = 25000
+# VJEPA backbone frozen for all of pretraining; finetuning unlocks the whole encoder.
+video_encoder_requires_grad = false
 video_encoder_hierarchical = true
 
-video_encoder_finetune_last_n_layers = 4
+# Inert while the encoder is frozen.
+video_encoder_finetune_last_n_layers = 12
 
 # processing
 stride_length = 16
@@ -98,27 +95,16 @@ embedding_factor = 4
 use_camera_self_attention = true
 use_temporal_self_attention = true
 f_eff_scale = true
-# scene_encoder_proj = true matters: projecting encoder features to the decoder dim
-# trains notably better than false. (use_huber_loss + principal_point_embedding below
-# are likewise kept on.) The best sweep runs left scene_proj_dim/mlp/prenorm unset
-# (defaults), so we do the same here.
+# Projecting encoder features to the decoder dim trains notably better than false.
 scene_encoder_proj = true
 
-# 3D/depth output representation: "gridresid" = per-axis marginal soft-argmax over a
-# fixed bin grid (bounded, zero-init, self-balancing), supervised by cross-entropy.
-# The 3D head emits a *motion residual* offset from a per-track query anchor (the
-# query's 3D location; for 2D-only queries the model's own ray-fused 3D prediction),
-# normalized by cube*image_size (~pixels, NO f_eff -> camera/ortho-invariant). Depth
-# is the absolute log grid. A 2D position-logit head (2*image_size pixel bins) is also
-# supervised by CE. Mirrors TrackerTapNext's gridresid recipe.
+# "gridresid" = per-axis soft-argmax bin grid (CE-supervised): 3D head emits a motion residual
+# from a query anchor, depth is a log grid, plus a 2D pixel-bin position head.
 output_mode = "gridresid"
 head_3d_grid_size = 256
-# Ray-local motion grid half-width (gridresid motion / cube*image_size, p99.9 up to
-# ~0.93 across datasets); generous under log_3d_output, which concentrates bins near 0.
+# Ray-local motion grid half-width (p99.9 ~0.93 across datasets); generous under log_3d_output.
 head_3d_grid_radius = 1.5
-# Signed-log warp of the 3D grid: tight eps spreads the sharply-peaked motion residual
-# (p50~0.02) across the bins. Grid modes have no expm1-gradient risk (CE backprops into
-# logits, not through the warp).
+# Signed-log warp: tight eps spreads the sharply-peaked motion residual (p50~0.02) across bins.
 log_3d_output = true
 log_3d_eps = 0.01
 # Depth log-grid range = log(depth/(cube*f_eff)); covers every dataset's reach with margin.
@@ -137,12 +123,8 @@ print_freq = 128 # in iterations
 debug_ix = -1 # only works for val
 
 [training.optimizer]
-# Encoder-tuned: the decoder + query encoder train FROM SCRATCH (the VJEPA backbone is
-# frozen), so keep the original encoder LR — TapNext's 2e-5 is a finetune rate for a
-# pretrained backbone and would stall a from-scratch decoder. The grid-CE objective is
-# far better-conditioned than direct regression, so 7e-4 should now be stable. We keep
-# the original 5e-4 base LR (6i8ryveg's setting); encoder_lr_scale=1.0 trains the
-# (unfrozen) encoder at the full base rate.
+# Decoder trains from scratch on the frozen backbone -> 5e-4 base LR (6i8ryveg). encoder_lr_scale
+# moot (encoder frozen).
 learning_rate = 5e-4
 weight_decay = 0.002
 warmup_steps = 1500
@@ -163,28 +145,31 @@ vis_loss_weight = 5
 vis_loss_3d_weight = 1.0
 conf_loss_weight = 0.0
 conf_2d_loss_weight = 0.0
-# TAPNext++ down-weights occluded points 0.2x vs visible.
-occluded_coords_loss_weight = 0.2
+# Halved (0.2->0.1): the occluded regression term is large and would dominate after the CE cut.
+occluded_coords_loss_weight = 0.1
 feature_loss_weight = 0.0
 
 coords_loss_weight = 4.0
 coords_loss_direct_weight = 8.0
 coords_loss_rays_weight = 0.5
 coords_loss_triangulate_weight = 0.0
-coords_loss_2d_weight = 1.0
-coords_loss_depth_weight = 1.0
+# Regression terms boosted (were 1.0) so they, not the CE, drive mte/mpjpe.
+coords_loss_2d_weight = 2.0
+coords_loss_depth_weight = 2.0
 
-# Direct logit-classification (cross-entropy on position bins) — the dominant 2D/3D/
-# depth signal. 2D supervises the new pixel-bin head; 3D/depth supervise the grid bins.
-# The decoded-coordinate regression terms above remain as small auxiliary losses.
-coords_softmax_2d_weight = 1.0
-coords_softmax_3d_weight = 1.0
+# Reproject fused 3D preds into each camera (pixel space): bounded multi-view depth signal.
+coords_loss_direct_reproj_weight = 1.0
+coords_loss_rays_reproj_weight = 0.3
+
+# Position-bin CE, cut to keep it auxiliary (~30% of loss) so regression drives mte/mpjpe.
+# depth highest (1.0): it's the one CE term that actually descends.
+coords_softmax_2d_weight = 0.3
+coords_softmax_3d_weight = 0.3
 depth_softmax_weight = 1.0
 
-# Constant, metric-preserving rescale of the regular (multi-cam) 3D loss branch so it
-# matches the per-scene-normalized 2D-query branch (~500x hotter otherwise) and stops
-# monopolizing the gradient.
-coords_3d_loss_scale = 500.0
+# Rescale of the multi-cam 3D loss branch; lowered 500->150 to revive direct 3D regression
+# there. If 2d_loss/mte degrade early the branch is too hot, raise back up.
+coords_3d_loss_scale = 150.0
 
 smoothness_loss_3d_weight = 0.05
 smoothness_loss_2d_weight = 0.05
