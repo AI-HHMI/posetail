@@ -100,6 +100,7 @@ class TotalLoss(nn.Module):
                  smoothness_loss_order = 4,
                  smoothness_loss_tolerance = 1.0,
                  coords_3d_loss_scale = 1.0,
+                 cube_scale_floor = 0.0,
                  coords_softmax_2d_weight = 0.0,
                  coords_softmax_3d_weight = 0.0,
                  depth_softmax_weight = 0.0):
@@ -143,6 +144,15 @@ class TotalLoss(nn.Module):
         # cross-camera metric consistency), so we divide the regular-3D losses by a
         # single global constant to match magnitudes while keeping absolute depth.
         self.coords_3d_loss_scale = coords_3d_loss_scale
+
+        # Floor on per-camera cube_scale before it divides the regular-3D loss
+        # (_compute_loss: loss / scale). A degenerate crop (few near-coplanar points) makes the
+        # projection-Jacobian SVD blow up -> cube_scale = 1/sensitivity collapses toward 0 ->
+        # the loss divisor (cube_scale * coords_3d_loss_scale) shrinks -> depth/3d losses spike
+        # ~100-150x (grad_norm to thousands). Catastrophic spikes are all at cube_scale < ~0.02;
+        # the [0.02,0.05) band is already clean. Clamping the divisor from below caps that
+        # inflation. 0.0 disables (legacy behavior).
+        self.cube_scale_floor = cube_scale_floor
 
         # Direct logit-classification objectives (cross-entropy on the position bins),
         # mirroring upstream TAPNext++'s primary 2D loss. The 2D term supervises the
@@ -389,6 +399,10 @@ class TotalLoss(nn.Module):
             if not self.per_camera_cube_scale:
                 med = scale.median(dim=0).values  # (B,)
                 scale = med[None, :].expand_as(scale).contiguous()
+            # Clamp degenerate-crop cube_scale collapse (see __init__) so it can't blow up the
+            # /scale division in the regular-3D losses. Off when floor==0.
+            if self.cube_scale_floor > 0:
+                scale = scale.clamp_min(self.cube_scale_floor)
 
             occluded_true = ~vis_true
 
