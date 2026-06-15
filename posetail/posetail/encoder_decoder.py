@@ -436,6 +436,7 @@ class QueryEncoder(nn.Module):
 class SceneRepresentation(nn.Module):
     def __init__(self, version='large', freeze_encoder=True, n_frames=16, image_size=256,
                  hierarchical_features=True, decoder_dim=None,
+                 proj_prenorm=False, proj_mlp=False,
                  video_encoder_finetune_last_n_layers=None):
         super().__init__()
 
@@ -486,14 +487,46 @@ class SceneRepresentation(nn.Module):
         nn.init.trunc_normal_(self.pos_embed, mean=0.0, std=0.02, a=-2 * 0.02, b=2 * 0.02)
 
         if decoder_dim is not None:
-            self.kv_proj = nn.Linear(self.embed_dim, decoder_dim)
-            nn.init.xavier_uniform_(self.kv_proj.weight)
-            nn.init.zeros_(self.kv_proj.bias)
+            in_dim = self.embed_dim
+
+            # Optional per-level pre-projection normalization. With hierarchical
+            # features the scene vector is N VJEPA levels concatenated along the
+            # feature dim, so we LayerNorm each level's chunk independently before
+            # projecting -- targeting the cross-depth scale mismatch. Gracefully
+            # degrades to a single LayerNorm when features are not hierarchical.
+            if proj_prenorm:
+                self.n_proj_levels = 4 if hierarchical_features else 1
+                assert in_dim % self.n_proj_levels == 0
+                level_dim = in_dim // self.n_proj_levels
+                self.pre_norms = nn.ModuleList(
+                    [nn.LayerNorm(level_dim) for _ in range(self.n_proj_levels)])
+            else:
+                self.n_proj_levels = 1
+                self.pre_norms = None
+
+            # Projection from the (concatenated) encoder dim down to decoder_dim:
+            # either a single Linear or a small MLP bottleneck (Linear-GELU-Linear).
+            if proj_mlp:
+                self.kv_proj = nn.Sequential(
+                    nn.Linear(in_dim, decoder_dim),
+                    nn.GELU(),
+                    nn.Linear(decoder_dim, decoder_dim),
+                )
+                for m in self.kv_proj:
+                    if isinstance(m, nn.Linear):
+                        nn.init.xavier_uniform_(m.weight)
+                        nn.init.zeros_(m.bias)
+            else:
+                self.kv_proj = nn.Linear(in_dim, decoder_dim)
+                nn.init.xavier_uniform_(self.kv_proj.weight)
+                nn.init.zeros_(self.kv_proj.bias)
+
             self.kv_norm = nn.LayerNorm(decoder_dim)
             self.embed_dim = decoder_dim
         else:
             self.kv_proj = None
             self.kv_norm = None
+            self.pre_norms = None
 
     def set_encoder_requires_grad(self, requires_grad):
         """Toggle gradients for the underlying video encoder, e.g. to unfreeze
@@ -534,6 +567,10 @@ class SceneRepresentation(nn.Module):
             feat = self.encoder(xr)  # [B, n_tokens, embed_dim]
             feat = feat + self.pos_embed
             if self.kv_proj is not None:
+                if self.pre_norms is not None:
+                    chunks = torch.chunk(feat, self.n_proj_levels, dim=-1)
+                    feat = torch.cat(
+                        [norm(c) for norm, c in zip(self.pre_norms, chunks)], dim=-1)
                 feat = self.kv_proj(feat)
                 feat = self.kv_norm(feat)
             encoded_list.append(feat)

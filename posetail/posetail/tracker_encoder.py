@@ -39,6 +39,9 @@ class TrackerEncoder(nn.Module):
                  mode_3d = 'encoder',
                  output_mode = 'direct',
                  scene_encoder_proj = False,
+                 scene_proj_dim = None,
+                 scene_proj_prenorm = False,
+                 scene_proj_mlp = False,
                  head_3d_grid_size = 8,
                  head_3d_grid_radius = 1.0,
                  f_eff_scale = False):
@@ -96,6 +99,9 @@ class TrackerEncoder(nn.Module):
         self.use_temporal_self_attention = use_temporal_self_attention
         self.output_mode = output_mode
         self.scene_encoder_proj = scene_encoder_proj
+        self.scene_proj_dim = scene_proj_dim
+        self.scene_proj_prenorm = scene_proj_prenorm
+        self.scene_proj_mlp = scene_proj_mlp
         self.f_eff_scale = f_eff_scale
 
         assert output_mode in ['direct', 'residual', 'grid', 'resdirect'], 'output_mode should be "direct", "residual", "grid", or "resdirect"'
@@ -113,7 +119,9 @@ class TrackerEncoder(nn.Module):
             n_frames = self.n_frames,
             image_size = self.image_size,
             hierarchical_features = self.video_encoder_hierarchical,
-            decoder_dim = latent_dim if scene_encoder_proj else None,
+            decoder_dim = (scene_proj_dim or latent_dim) if scene_encoder_proj else None,
+            proj_prenorm = scene_proj_prenorm,
+            proj_mlp = scene_proj_mlp,
             video_encoder_finetune_last_n_layers = self.video_encoder_finetune_last_n_layers,
         )
         

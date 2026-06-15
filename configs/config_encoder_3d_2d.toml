@@ -112,6 +112,13 @@ use_temporal_self_attention = true
 output_mode = "direct"
 f_eff_scale = true
 scene_encoder_proj = false
+# Scene-feature projection tuning (only active when scene_encoder_proj = true):
+#   scene_proj_dim:     projection target dim; unset/None -> latent_dim (current behavior)
+#   scene_proj_prenorm: per-(hierarchical)-level LayerNorm before projecting
+#   scene_proj_mlp:     use a Linear-GELU-Linear bottleneck instead of a single Linear
+# scene_proj_dim = 512
+scene_proj_prenorm = false
+scene_proj_mlp = false
 head_3d_grid_size = 16
 head_3d_grid_radius = 1.0
 
