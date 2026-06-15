@@ -1,0 +1,203 @@
+[wandb]
+project_name = 'posetail-tapnext-v1'
+path = '/groups/karashchuk/home/karashchukl/results/posetail-tapnext-v1'
+mode = 'online' # 'online', 'offline', 'disabled'
+
+[dataset]
+# batch_size=1 is REQUIRED for mixed 2D+3D training.
+# The 2D loss axis-order assumption (B=cams=1) breaks at batch_size>1.
+# For multi-GPU training use --strategy ddp_find_unused_parameters_true (the default).
+batch_size = 1
+num_workers = 12
+prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3'
+
+[dataset.train]
+split_dir = 'train'
+n_frames = 16
+min_res = 256
+max_res = 256
+cams_to_sample = [1, 8]
+kpts_to_sample = [128, 128]
+aug_prob = 0.25
+enable_kpt_filtering = false
+cam_thresh_for_vis = 1
+balance_datasets = true
+n_samples_per_dataset = -1
+crop_to_points = true
+speed_thresh = 1.0
+query_anytime = true
+query_edge_bias = 200.0
+prop_dynamic_kpts_to_sample = 0.95
+prob_2d_only = 0.25
+crop_3d_enabled = true
+crop_3d_fraction = [0.05, 0.75]
+crop_3d_prob = 0.4
+# Causal forward-only supervision to match TAPNext's SSM semantics.
+causal_masking = true
+
+[dataset.train.curriculum]
+enabled = false
+ramp_start_frac = 0.0
+ramp_end_frac   = 0.4
+intensity_floor = 0.0
+
+[dataset.val]
+split_dir = 'val'
+n_frames = 16
+max_res = 256
+cams_to_sample = 5
+kpts_to_sample = 128
+aug_prob = 0.0
+crop_to_points = true
+speed_thresh = 1.0
+prop_dynamic_kpts_to_sample = 0.7
+query_anytime = false
+causal_masking = true
+
+[dataset.test]
+split_dir = 'test'
+max_res = 256
+n_frames = 16
+project_2d = false
+aug_prob = 0.0
+causal_masking = true
+
+[devices]
+device = 'cuda'
+
+
+[model]
+mode_3d = "tapnext"
+
+# 3D/depth output representation (4 modes):
+#   "direct"   = unbounded regression heads (the original behavior).
+#   "grid"     = per-dimension marginal soft-argmax over `head_grid_size` bins
+#                (2D-prediction style) for BOTH the 3D head (3 dims, ray-local units
+#                in [-head_3d_grid_radius, +radius]) and the depth head (1 dim, log
+#                of normalized depth in [depth_log_min, depth_log_max]). Bounded +
+#                zero-init + self-balancing; supervised by the coordinate-softmax CE.
+#   "residual" = direct (unbounded) 3D head emitting a motion *offset* added to a
+#                per-track query anchor (the query point's 3D location; for 2D-only
+#                queries, the model's own ray-fused 3D prediction at the query frame),
+#                ported verbatim from TrackerEncoder. Depth stays absolute.
+#   "gridresid"= the grid 3D head supplies that residual offset, so the bounded grid
+#                window only spans plausible *motion* (every GT target lands interior).
+#                The residual is normalized by cube*image_size (~pixels, NO f_eff) so
+#                it is camera-invariant and works for orthographic cameras (f_eff is
+#                the wrong normalizer for motion). Depth stays the absolute log grid.
+output_mode = "gridresid"
+head_grid_size = 256
+# Ray-local grid half-width, set from scripts/estimate_grid_radius.py on
+# posetail-finetuning-v3 to cover every dataset's p99.9 (a generous radius is cheap
+# under log_3d_output, which concentrates bins near 0):
+#   "grid"      (absolute /cube*f_eff)        -> ~5.0 (per-dataset p99.9 up to 4.2).
+#   "gridresid" (motion   /cube*image_size)   -> ~1.5 (per-dataset p99.9 up to 0.93).  [active]
+head_3d_grid_radius = 1.5
+# Signed-log warp of the 3D output (3D only; 2D + depth untouched). Places the grid
+# bins in a compressed space with denser resolution near 0. The gridresid motion
+# residual is sharply peaked at 0 (p50~0.02, p99.9~0.63 of radius), so a tight eps
+# (~0.01, the probe optimum) spreads the central bulk across the grid (~53->~179 of
+# 256 effective bins). (For absolute "grid" use a gentler eps~0.1*radius.) Grid modes
+# have no expm1-gradient risk (CE backprops into logits, not through the warp).
+log_3d_output = true
+log_3d_eps = 0.01
+# Depth log-grid range = log(depth/(cube*f_eff)). Tightened from [-3,3] (only ~68/256
+# bins used) to cover every dataset's reach [~-1.8, 1.5] with margin (~2x resolution).
+depth_log_min = -2.5
+depth_log_max = 2.0
+
+# TAPNext++ backbone
+width = 768
+patch_size = 8
+num_heads = 12
+depth = 12
+lru_width = 768
+prope_insert_positions = [2, 5, 8, 11]
+pretrained_ckpt_path = '/groups/karashchuk/home/karashchukl/builds/tapnet/tapnextpp_ckpt.pt'
+freeze_backbone = 500
+use_checkpointing = true
+
+# processing
+stride_length = 16
+image_size = 256
+
+# geometry tail (reused from TrackerEncoder semantics)
+per_camera_cube_scale = true
+metric_ray_translation = true
+f_eff_scale = true
+
+# query-geometry signals (same semantics as the QueryEncoder; matches
+# config_encoder_3d_2d.toml). Depth + frustum visibility are always on in 3D;
+# focal/principal-point are gated by the two flags below. All are injected as a
+# zero-init additive residual so init stays bit-identical to pretrained TAPNext.
+max_freq = 10
+principal_point_embedding = true
+intrinsic_embedding = true
+
+[training]
+seed = 3
+# checkpoint_path = ''
+n_iterations = 800000
+scheduler_type = 'schedulefree'
+max_grad_norm = 50.0
+checkpoint_freq = 10240 # in iterations
+eval_metric_freq = 16 # in iterations
+val_freq = 16 # in iterations
+print_freq = 32 # in iterations
+debug_ix = -1 # only works for val
+
+[training.optimizer]
+# Lowered toward TAPNext++'s finetune regime (paper: peak 2e-5). Single
+# conservative LR for the whole model as a first cut (the new PROPE + 3D heads
+# train from scratch at the same rate); revisit with parameter groups if needed.
+learning_rate = 2e-5
+weight_decay = 0.002
+warmup_steps = 500
+beta1 = 0.9
+beta2 = 0.95
+
+[training.scheduler]
+
+[training.losses]
+gamma = 0.8
+pixel_thresh = 3
+delta = 6
+use_huber_loss = true
+
+# weights for calculating total loss (use 0 to not compute a specific loss)
+# vis: the pretrained visible_head is already good; 400 over-drove the shared
+# tokens (vis_2d ~1000 at init) and degraded occlusion. Gentle adaptation only.
+vis_loss_weight = 5
+vis_loss_3d_weight = 1.0
+conf_loss_weight = 0.0
+conf_2d_loss_weight = 0.0
+# TAPNext++ down-weights occluded points 0.2x vs visible.
+occluded_coords_loss_weight = 0.2
+feature_loss_weight = 0.0
+
+coords_loss_weight = 4.0
+coords_loss_direct_weight = 8.0
+coords_loss_rays_weight = 0.5
+coords_loss_triangulate_weight = 0.0
+coords_loss_2d_weight = 1.0
+coords_loss_depth_weight = 1.0
+
+# Direct logit-classification (cross-entropy on position bins), upstream TAPNext++'s
+# primary objective. 2D supervises the pretrained track logits; 3D/depth supervise the
+# grid heads' bins (only active in output_mode = "grid"). These are the dominant 3D/
+# depth signal; the decoded-coordinate regression terms above remain as the small
+# auxiliary term (like upstream's 0.1*huber alongside 1.0*softmax).
+coords_softmax_2d_weight = 1.0
+coords_softmax_3d_weight = 1.0
+depth_softmax_weight = 1.0
+
+# Constant, metric-preserving rescale of the regular (multi-cam) 3D loss branch
+# so it matches the per-scene-normalized 2D-query branch (~500x hotter otherwise)
+# and stops monopolizing the gradient. Keeps absolute/cross-camera depth (global
+# constant, not per-scene normalization). Tune against the magnitude probe.
+coords_3d_loss_scale = 500.0
+
+smoothness_loss_3d_weight = 0.05
+smoothness_loss_2d_weight = 0.05
+smoothness_loss_order = 4
+smoothness_loss_tolerance = 1.5

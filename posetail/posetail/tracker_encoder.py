@@ -10,6 +10,7 @@ from einops import rearrange, einsum, reduce, repeat
 from posetail.posetail.cube import get_camera_scale, from_homogeneous, to_homogeneous
 from posetail.posetail.cube import undistort_points, triangulate_simple_batch, project_points_torch
 from posetail.posetail.cube import points_to_rays, _invert_SE3
+from posetail.posetail.cube import noisy_or_logit
 from posetail.posetail.utils import PadToMultiple, PadToSize, count_parameters
 from posetail.posetail.encoder_decoder import SceneRepresentation, QueryEncoder, Decoder
 
@@ -44,6 +45,10 @@ class TrackerEncoder(nn.Module):
                  scene_proj_mlp = False,
                  head_3d_grid_size = 8,
                  head_3d_grid_radius = 1.0,
+                 log_3d_output = False,
+                 log_3d_eps = 0.1,
+                 depth_log_min = -2.5,
+                 depth_log_max = 2.0,
                  f_eff_scale = False):
         super().__init__()
 
@@ -104,7 +109,10 @@ class TrackerEncoder(nn.Module):
         self.scene_proj_mlp = scene_proj_mlp
         self.f_eff_scale = f_eff_scale
 
-        assert output_mode in ['direct', 'residual', 'grid', 'resdirect'], 'output_mode should be "direct", "residual", "grid", or "resdirect"'
+        assert output_mode in ['direct', 'residual', 'grid', 'gridresid', 'resdirect'], 'output_mode should be "direct", "residual", "grid", "gridresid", or "resdirect"'
+        # Grid (classification) modes: per-axis marginal soft-argmax + cross-entropy,
+        # mirroring TrackerTapNext. "gridresid" predicts a motion residual offset.
+        self.is_grid = output_mode in ('grid', 'gridresid')
         
         # self.transform_norm = transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)
         self.transform_norm = transforms.Compose([
@@ -147,6 +155,11 @@ class TrackerEncoder(nn.Module):
             output_mode=self.output_mode,
             head_3d_grid_size=head_3d_grid_size,
             head_3d_grid_radius=head_3d_grid_radius,
+            log_3d_output=log_3d_output,
+            log_3d_eps=log_3d_eps,
+            depth_log_min=depth_log_min,
+            depth_log_max=depth_log_max,
+            image_size=self.image_size,
             f_eff_scale=f_eff_scale,
         )
 
@@ -297,7 +310,7 @@ class TrackerEncoder(nn.Module):
         query_rays = rearrange(query_rays_flat, 'cams b (t n) d e -> b t n cams d e', t=T, n=N)
 
         mode_idx = torch.tensor([1 if R == 3 else 0], dtype=torch.long, device=query_embeds.device)
-        outputs = self.decoder(scene_features, query_embeds, query_rays, mode_idx)
+        outputs, grid_logits = self.decoder(scene_features, query_embeds, query_rays, mode_idx)
         outputs = rearrange(outputs, 'b t n cams outdim -> cams b t n outdim')
 
         points_3d_raw, points_pred, vis_pred_2d_logits, conf_pred_2d_logits, depth_pred, conf_3d_logits = torch.split(
@@ -317,17 +330,25 @@ class TrackerEncoder(nn.Module):
         # depths_query_shaped = rearrange(depths_query, 'b t n cams -> cams b t n')
         # depth_pred_scaled = depths_query_shaped + depth_pred[..., 0] * cube_scale * self.depth_scale
 
-        # Softplus for depth prediction
-        depth_pred_scaled = F.softplus(depth_pred[..., 0]) * rearrange(cube_scale, 'cams b -> cams b 1 1')
+        # Normalized depth -> metric. In grid mode the decoder already decoded
+        # depth_norm = exp(soft-argmax(log-depth bins)) (>0), so skip the softplus.
+        if self.is_grid:
+            depth_norm = depth_pred[..., 0]
+        else:
+            depth_norm = F.softplus(depth_pred[..., 0])
+        depth_pred_scaled = depth_norm * rearrange(cube_scale, 'cams b -> cams b 1 1')
         if self.f_eff_scale:
             # depth is absolute in every output mode -> always f_eff-scaled
             depth_pred_scaled = depth_pred_scaled * rearrange(f_eff, 'cams -> cams 1 1 1').to(depth_pred_scaled.dtype)
 
 
-        if self.output_mode in ('residual', 'resdirect'):
+        if self.is_grid:
+            # grid 2D head decodes absolute pixel positions directly (soft-argmax).
+            points_pred_scaled = points_pred
+        elif self.output_mode in ('residual', 'resdirect'):
             # Predict offsets instead of absolute bounded coordinates
             points_pred_scaled = p2d_query + points_pred
-        elif self.output_mode == 'direct' or self.output_mode == 'grid':
+        elif self.output_mode == 'direct':
             # Predict absolute coordinates
             points_pred_scaled = points_pred + self.image_size // 2
 
@@ -373,10 +394,16 @@ class TrackerEncoder(nn.Module):
         rays_c = torch.stack([points_to_rays(cam, center, normalize_t=False)[0] for cam in camera_group])
         rays_c_inv = _invert_SE3(rays_c)  # [cams, 4, 4], ray-local → world
         
-        add_residual = (self.output_mode == 'residual') or \
+        add_residual = (self.output_mode in ('residual', 'gridresid')) or \
                        (self.output_mode == 'resdirect' and R == 3)
 
+        query_local = None
         p3d_cams = points_3d_raw * rearrange(cube_scale, 'cams b -> cams b 1 1 1')
+        if self.output_mode == 'gridresid':
+            # gridresid bins encode motion / (cube * image_size) (~pixels, NO f_eff ->
+            # ortho-safe); map back to metric motion by * image_size (mirror
+            # tracker_tapnext.py:597-600).
+            p3d_cams = p3d_cams * self.image_size
         if self.f_eff_scale and not add_residual:
             # direct 3D output is an absolute ray-local position -> f_eff-scaled.
             # The residual branch (motion offset) is NOT scaled (handled by scale_3d only).
@@ -412,7 +439,7 @@ class TrackerEncoder(nn.Module):
         # bad_pred = torch.amax(conf_pred_2d[..., 0], dim=0) <= 1e-5
         # points_3d = einsum(points_3d, ~bad_pred, 'b t n r, b t n -> b t n r') 
         
-        vis_pred = torch.amax(vis_pred_2d_logits, dim=0)
+        vis_pred = noisy_or_logit(vis_pred_2d_logits, dim=0)  # noisy-OR logit
         conf_pred = torch.amax(conf_3d_logits[..., 0], dim=0)
         
         # assemble outputs 
@@ -434,6 +461,36 @@ class TrackerEncoder(nn.Module):
             'conf_pred_2d': conf_pred_2d_logits[..., 0], # (cams, b, t, n)
             'depth_pred': depth_pred_scaled # (cams, b, t, n)
         }
+
+        # Grid (classification) supervision: hand the loss the raw 2D/3D/depth bin
+        # logits plus the geometry it needs to discretize GT into bin targets (the
+        # exact inverse of the forward decode). Mirrors tracker_tapnext.py:645-672 so
+        # the model-agnostic CE paths in losses.py fire identically for the encoder.
+        if self.is_grid:
+            result_dict['2d_logits'] = rearrange(
+                grid_logits['logits_2d'], 'b t n cams p -> cams b t n p')  # (cams,b,t,n,2P)
+            result_dict['grid'] = {
+                'logits_3d': rearrange(grid_logits['logits_3d'],
+                                       'b t n cams d g -> cams b t n d g'),  # (cams,b,t,n,3,K)
+                'logits_depth': rearrange(grid_logits['logits_depth'],
+                                          'b t n cams g -> cams b t n g'),   # (cams,b,t,n,K)
+                'rays_c': rays_c,                  # (cams,4,4) world -> ray-local
+                'cube_scale': cube_scale,          # (cams,B)
+                'f_eff': f_eff if self.f_eff_scale else None,  # (cams,) or None
+                'g3d_lo': self.decoder.g3d_lo, 'g3d_hi': self.decoder.g3d_hi,
+                'gd_lo': self.decoder.gd_lo, 'gd_hi': self.decoder.gd_hi,
+                'K': self.decoder.head_3d_grid_size,
+                # gridresid: 3D bins encode the motion offset from the per-track query
+                # anchor, normalized by cube*image_size (no f_eff -> ortho-safe).
+                'is_resid': (self.output_mode == 'gridresid'),
+                'anchor_local': query_local.detach() if query_local is not None else None,
+                'image_size': self.image_size,
+                # log_3d_output: the loss quantizes the 3D bin target in the same
+                # signed-log warped space as the (warped) bin centres.
+                'log_warp': self.decoder.log_3d_output,
+                'eps': self.decoder.log_3d_eps,
+                'c_range': self.decoder.log_3d_c_range,
+            }
 
         # if self.training: 
         #     train_dict = {

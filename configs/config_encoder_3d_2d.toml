@@ -37,7 +37,7 @@ n_samples_per_dataset = -1
 crop_to_points = true
 speed_thresh = 1.0
 query_anytime = true
-query_edge_bias = 100.0
+query_edge_bias = 200.0
 prop_dynamic_kpts_to_sample = 0.95
 prob_2d_only = 0.25
 crop_3d_enabled = true
@@ -81,11 +81,13 @@ mode_3d = "encoder"
 video_encoder_version = 'large'
 video_encoder_requires_grad = false
 video_encoder_hierarchical = true
+
 # If set to an int N, only the last N transformer blocks (+ final norm) of the
 # video encoder are finetuned and the rest stay frozen. Omit (or comment out)
 # to train all encoder params when video_encoder_requires_grad allows it.
 # Max N per size: base=12, large=24, giant=40, gigantic=48.
 # video_encoder_finetune_last_n_layers = 4
+
 
 # processing
 stride_length = 16
@@ -111,6 +113,7 @@ use_camera_self_attention = true
 use_temporal_self_attention = true
 output_mode = "direct"
 f_eff_scale = true
+
 scene_encoder_proj = false
 # Scene-feature projection tuning (only active when scene_encoder_proj = true):
 #   scene_proj_dim:     projection target dim; unset/None -> latent_dim (current behavior)

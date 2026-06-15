@@ -115,8 +115,13 @@ def load_multiview_clip(readers, start_frame, n_frames, crop_boxes=None, target_
     return views, end_frame - start_frame
 
 
-def crop_camera_group_to_queries(camera_group, query_coords_3d, min_crop_dim, padding=20):
-    p2d = project_points_torch(camera_group, query_coords_3d)
+def crop_camera_group_to_queries(camera_group, query_coords, min_crop_dim, padding=20, is_2d=False):
+    if is_2d:
+        # 2D queries are already pixel coords in the (single) camera frame; no
+        # projection. Shape to (cams=1, ..., 2) so the cropping math below matches.
+        p2d = query_coords.reshape(1, -1, 2)
+    else:
+        p2d = project_points_torch(camera_group, query_coords)
     crops = []
 
     for cnum in range(p2d.shape[0]):
@@ -260,6 +265,50 @@ def load_camera_group_from_metadata(metadata_path, device='cpu'):
     return camera_group
 
 
+def load_camera_group_2d(video_paths, metadata_path=None, device='cpu'):
+    """Build a single-camera group for a 2D (uncalibrated) trial.
+
+    Mirrors PosetailDataset._build_2d_cgroup:
+      (1) fully-calibrated metadata.yaml -> real camera;
+      (2) metadata.yaml with only camera_widths/heights -> nominal pinhole;
+      (3) no usable metadata -> read one image to get the size -> nominal pinhole.
+    """
+    from posetail.datasets.posetail_dataset import _make_nominal_2d_camera
+
+    cam_meta = None
+    if metadata_path is not None and os.path.exists(metadata_path):
+        with open(metadata_path, 'r') as f:
+            cam_meta = yaml.safe_load(f)
+
+    if cam_meta is not None and all(
+            k in cam_meta for k in ('intrinsic_matrices', 'extrinsic_matrices',
+                                    'distortion_matrices',
+                                    'camera_heights', 'camera_widths')):
+        # fully calibrated 2D metadata — use the real camera(s)
+        return load_camera_group_from_metadata(metadata_path, device=device)
+
+    if cam_meta is not None and 'camera_widths' in cam_meta and 'camera_heights' in cam_meta:
+        widths, heights = cam_meta['camera_widths'], cam_meta['camera_heights']
+        key = next(iter(widths))
+        w, h = int(widths[key]), int(heights[key])
+    else:
+        # fall back to reading one image from the (single) camera folder
+        cam_dir = video_paths[0]
+        if os.path.isdir(cam_dir):
+            sample = sorted(os.listdir(cam_dir))[0]
+            from PIL import Image
+            w, h = Image.open(os.path.join(cam_dir, sample)).size
+        else:
+            reader = VideoReader(cam_dir, ctx=cpu(0))
+            frame = reader[0]
+            if hasattr(frame, 'asnumpy'):
+                frame = frame.asnumpy()
+            h, w = frame.shape[:2]
+
+    cgroup = _make_nominal_2d_camera(w, h)
+    return camera_group_to_device(cgroup, device)
+
+
 def load_model_from_base_folder(base_folder, checkpoint=None, device=None):
     config_path, checkpoint_path = resolve_config_and_checkpoint(base_folder, checkpoint=checkpoint)
 
@@ -290,8 +339,16 @@ def run_tracker_encoder_on_videos(
     n_overlap=2,
     max_kpts=None,
     device=None,
+    pred_key_3d='coords_pred',
 ):
-    
+
+    # Dimensionality of the queries: R==3 -> 3D world coords (multi-view), R==2 ->
+    # 2D pixel coords in a single camera frame. The model supports both.
+    # pred_key_3d selects which 3D model output to use as the prediction (and the
+    # recurrence query) — e.g. 'coords_pred' (default) or '3d_pred_triangulate'.
+    R = query_points_3d.shape[-1]
+    is_2d = (R == 2)
+
     # --- keypoint chunking (insert here) ---
     n_kpts = query_points_3d.shape[0] if query_points_3d.ndim == 2 else query_points_3d.shape[1]
     if max_kpts is not None and n_kpts > max_kpts:
@@ -312,6 +369,7 @@ def run_tracker_encoder_on_videos(
                 n_overlap=n_overlap,
                 max_kpts=None,
                 device=device,
+                pred_key_3d=pred_key_3d,
             )
             chunk_outputs.append(chunk_out)
         return {
@@ -370,14 +428,26 @@ def run_tracker_encoder_on_videos(
 
             camera_group_chunk, crop_boxes = crop_camera_group_to_queries(
                 camera_group=camera_group,
-                query_coords_3d=current_queries,
+                query_coords=current_queries,
                 min_crop_dim=model.image_size,
                 padding=20,
+                is_2d=is_2d,
             )
             camera_group_chunk = resize_camera_group(
                 camera_group_chunk,
                 model.image_size,
             )
+
+            # For 2D, queries are pixel coords in the ORIGINAL frame; the model
+            # expects them in the cropped+resized model-input frame. The crop is
+            # square, so a single uniform scale maps between the two spaces.
+            if is_2d:
+                crop_low = crop_boxes[0][:2].to(device=device, dtype=torch.float32)
+                crop_side = (crop_boxes[0][2] - crop_boxes[0][0]).to(torch.float32)
+                model_scale = float(model.image_size) / float(crop_side)
+                queries_model = (current_queries - crop_low) * model_scale
+            else:
+                queries_model = current_queries
 
             target_sizes = [
                 tuple(cam['size'].tolist())
@@ -420,12 +490,19 @@ def run_tracker_encoder_on_videos(
 
             outputs = model(
                 views=views,
-                coords=current_queries,
+                coords=queries_model,
                 query_times=query_times,
                 camera_group=camera_group_chunk,
             )
 
-            coords_pred = outputs['coords_pred'][:, :keep_len]
+            if is_2d:
+                # 2D predictions live in model-input pixel space; map back to the
+                # original full-image frame so outputs and the recurrence stay there.
+                coords_pred = outputs['2d_pred'][0]  # single cam: (b, t, n, 2)
+                coords_pred = crop_low + coords_pred / model_scale
+                coords_pred = coords_pred[:, :keep_len]
+            else:
+                coords_pred = outputs[pred_key_3d][:, :keep_len]
             vis_pred = outputs['vis_pred'][:, :keep_len]
             conf_pred = outputs['conf_pred'][:, :keep_len]
 
@@ -464,7 +541,7 @@ def run_tracker_encoder_on_videos(
 
     if len(coords_pred_all) == 0:
         return {
-            'coords_pred': torch.empty((0, 0, 0, 3)),
+            'coords_pred': torch.empty((0, 0, 0, R)),
             'vis_pred': torch.empty((0, 0, 0, 1)),
             'conf_pred': torch.empty((0, 0, 0, 1)),
             'frame_numbers': torch.empty((0,), dtype=torch.int64),
@@ -525,28 +602,52 @@ def resolve_video_paths(video_paths):
 
 def load_trial(trial_path, start_frame=0):
     """Load metadata, video/image paths, and query points from a trial directory,
-    following the PosetailDataset convention."""
+    following the PosetailDataset convention.
 
+    Detects 2D vs 3D from which pose file is present: pose3d.npz -> 3D (multi-view,
+    metadata.yaml required), pose2d.npz -> 2D (single camera, metadata optional).
+    Query points have last dim 3 (3D world coords) or 2 (2D pixel coords) accordingly.
+    """
+
+    pose3d_path = os.path.join(trial_path, 'pose3d.npz')
+    pose2d_path = os.path.join(trial_path, 'pose2d.npz')
+    if os.path.exists(pose3d_path):
+        mode = '3d'
+        pose_path = pose3d_path
+    elif os.path.exists(pose2d_path):
+        mode = '2d'
+        pose_path = pose2d_path
+    else:
+        raise FileNotFoundError(f'No pose3d.npz or pose2d.npz found in {trial_path}')
+
+    # metadata.yaml required for 3D; optional for 2D (uncalibrated single camera)
     metadata_path = os.path.join(trial_path, 'metadata.yaml')
-    if not os.path.exists(metadata_path):
+    if mode == '3d' and not os.path.exists(metadata_path):
         raise FileNotFoundError(f'metadata.yaml not found in {trial_path}')
-
-    pose_path = os.path.join(trial_path, 'pose3d.npz')
-    if not os.path.exists(pose_path):
-        raise FileNotFoundError(f'pose3d.npz not found in {trial_path}')
+    if not os.path.exists(metadata_path):
+        metadata_path = None
 
     # determine image or video paths
     img_path = os.path.join(trial_path, 'img')
     vid_path = os.path.join(trial_path, 'vid')
 
-    # Load camera names from metadata to ensure proper ordering
-    with open(metadata_path, 'r') as f:
-        cam_metadata = yaml.safe_load(f)
-    cam_names = list(cam_metadata['intrinsic_matrices'].keys())
+    # Camera ordering: from metadata when available (3D, or calibrated 2D),
+    # otherwise from the img/ subdirectories (uncalibrated 2D -> single camera).
+    if metadata_path is not None:
+        with open(metadata_path, 'r') as f:
+            cam_metadata = yaml.safe_load(f)
+        cam_names = list(cam_metadata['intrinsic_matrices'].keys())
+    elif os.path.exists(img_path):
+        cam_names = [d for d in os.listdir(img_path)
+                     if os.path.isdir(os.path.join(img_path, d))]
+    else:
+        cam_names = [os.path.splitext(f)[0] for f in os.listdir(vid_path)]
     if all(n.isdigit() for n in cam_names):
         cam_names = sorted(cam_names, key=int)
     else:
         cam_names = sorted(cam_names)
+    if mode == '2d':
+        cam_names = cam_names[:1]  # 2D trials are always single-camera
 
     if os.path.exists(img_path) and len(os.listdir(img_path)) > 0:
         # Sort image subdirectories using camera names from metadata
@@ -565,13 +666,14 @@ def load_trial(trial_path, start_frame=0):
 
 
     data = np.load(pose_path)
-    coords = data['pose']  # (subjects, time, n_kpts, 3)
-    vis_gt = data['vis'] if 'vis' in data else None  # (subjects, time, n_kpts) or None
+    coords = data['pose']  # (subjects, time, n_kpts, R), R=3 for 3D / 2 for 2D
+    vis_gt = data['vis'] if 'vis' in data else None  # 2D trials never have vis
 
+    R = coords.shape[-1]
     n_subjects = coords.shape[0]
     n_kpts = coords.shape[2]
 
-    coords_at_start = coords[:, start_frame, :, :]  # (subjects, n_kpts, 3)
+    coords_at_start = coords[:, start_frame, :, :]  # (subjects, n_kpts, R)
 
     per_subject_queries = []
     per_subject_valid_masks = []
@@ -583,16 +685,16 @@ def load_trial(trial_path, start_frame=0):
             torch.as_tensor(subject_coords[valid], dtype=torch.float32)
         )
 
-    coords_flat = coords_at_start.reshape(-1, 3)
-    valid_flat = np.all(np.isfinite(coords_flat), axis=1)  
+    coords_flat = coords_at_start.reshape(-1, R)
+    valid_flat = np.all(np.isfinite(coords_flat), axis=1)
     coords_flat = coords_flat[valid_flat]
 
     if coords_flat.shape[0] == 0:
         raise ValueError(f'No valid (non-NaN) query points at frame {start_frame}')
 
-    query_points_3d = torch.as_tensor(coords_flat, dtype=torch.float32)
+    query_points = torch.as_tensor(coords_flat, dtype=torch.float32)
 
-    return (metadata_path, cam_names, video_paths, query_points_3d, per_subject_queries,
+    return (mode, metadata_path, cam_names, video_paths, query_points, per_subject_queries,
             coords, vis_gt, valid_flat, per_subject_valid_masks)
 
 
@@ -615,34 +717,50 @@ def parse_args():
     parser.add_argument('--checkpoint', type=int, default=None,
                         help='Optional checkpoint step number; if omitted, use latest checkpoint')
     parser.add_argument('--device', type=str, default=None)
+    parser.add_argument('--pred-key-3d', type=str, default='coords_pred',
+                        help="Which 3D model output to use as the prediction "
+                             "(e.g. 'coords_pred' or '3d_pred_triangulate')")
     parser.add_argument('--outpath', type=str, default=None,
                         help='Optional output .npz path')
 
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+def run_inference(
+    model,
+    config_path,
+    checkpoint_path,
+    trial_path,
+    start_frame=0,
+    n_frames=128,
+    n_overlap=2,
+    n_views=None,
+    view_seed=None,
+    max_kpts=None,
+    per_subject=False,
+    device=None,
+    outpath=None,
+    pred_key_3d='coords_pred',
+):
+    """Run inference on one trial with an already-loaded model.
 
-    if args.device is not None:
-        device = torch.device(args.device)
-    else:
-        device = None
-
-    model, config, config_path, checkpoint_path = load_model_from_base_folder(
-        args.base_folder,
-        checkpoint=args.checkpoint,
-        device=device,
-    )
-
+    Factored out of main() so a caller (e.g. a batch driver) can load the model
+    once and reuse it across many trials. If outpath is given the outputs are
+    saved as .npz; the outputs dict is always returned.
+    """
     if device is None:
         device = next(model.parameters()).device
 
-    (metadata_path, cam_names, video_paths, query_points_3d, per_subject_queries,
+    (mode, metadata_path, cam_names, video_paths, query_points_3d, per_subject_queries,
     coords_gt, vis_gt_raw, valid_flat, per_subject_valid_masks) = load_trial(
-            args.trial_path, start_frame=args.start_frame)
+            trial_path, start_frame=start_frame)
 
-    camera_group = load_camera_group_from_metadata(metadata_path, device='cpu')
+    R = coords_gt.shape[-1]
+
+    if mode == '2d':
+        camera_group = load_camera_group_2d(video_paths, metadata_path, device='cpu')
+    else:
+        camera_group = load_camera_group_from_metadata(metadata_path, device='cpu')
 
     if len(video_paths) != len(camera_group):
         raise ValueError(
@@ -655,16 +773,16 @@ def main():
     cam_indices_used = list(range(n_cams_total))
     cam_names_used = [cam_names[i] for i in cam_indices_used]
 
-    if args.n_views is not None and args.n_views < n_cams_total:
-        rng = np.random.default_rng(args.view_seed)
-        cam_indices_used = sorted(rng.choice(n_cams_total, args.n_views, replace=False).tolist())
-        print(f'Subsampling {args.n_views}/{n_cams_total} cameras: indices {cam_indices_used}')
+    if n_views is not None and n_views < n_cams_total:
+        rng = np.random.default_rng(view_seed)
+        cam_indices_used = sorted(rng.choice(n_cams_total, n_views, replace=False).tolist())
+        print(f'Subsampling {n_views}/{n_cams_total} cameras: indices {cam_indices_used}')
         camera_group = [camera_group[i] for i in cam_indices_used]
         video_paths  = [video_paths[i] for i in cam_indices_used]
-    elif args.n_views is not None:
-        print(f'--n-views={args.n_views} >= available cameras ({n_cams_total}); using all cameras')
+    elif n_views is not None:
+        print(f'--n-views={n_views} >= available cameras ({n_cams_total}); using all cameras')
 
-    if args.per_subject:
+    if per_subject:
         all_subject_outputs = []
         for subj_idx, subj_queries in enumerate(per_subject_queries):
             if subj_queries.shape[0] == 0:
@@ -676,11 +794,12 @@ def main():
                 video_paths=video_paths,
                 camera_group=camera_group,
                 query_points_3d=subj_queries,
-                start_frame=args.start_frame,
-                n_frames=args.n_frames,
-                n_overlap=args.n_overlap,
-                max_kpts=args.max_kpts,
+                start_frame=start_frame,
+                n_frames=n_frames,
+                n_overlap=n_overlap,
+                max_kpts=max_kpts,
                 device=device,
+                pred_key_3d=pred_key_3d,
             )
             subj_out['subject_idx'] = subj_idx
             all_subject_outputs.append(subj_out)
@@ -688,7 +807,7 @@ def main():
         # Combine per-subject results: stack along a new subject dimension
         if len(all_subject_outputs) == 0:
             outputs = {
-                'coords_pred': torch.empty((0, 0, 0, 3)),
+                'coords_pred': torch.empty((0, 0, 0, R)),
                 'vis_pred': torch.empty((0, 0, 0, 1)),
                 'conf_pred': torch.empty((0, 0, 0, 1)),
                 'frame_numbers': torch.empty((0,), dtype=torch.int64),
@@ -728,11 +847,12 @@ def main():
             video_paths=video_paths,
             camera_group=camera_group,
             query_points_3d=query_points_3d,
-            start_frame=args.start_frame,
-            n_frames=args.n_frames,
-            n_overlap=args.n_overlap,
-            max_kpts=args.max_kpts,
+            start_frame=start_frame,
+            n_frames=n_frames,
+            n_overlap=n_overlap,
+            max_kpts=max_kpts,
             device=device,
+            pred_key_3d=pred_key_3d,
         )
 
     # --- Ground-truth extraction ---
@@ -742,7 +862,7 @@ def main():
     n_time_gt = coords_gt.shape[1]
     frame_nums_gt = np.clip(frame_nums, 0, n_time_gt - 1)
 
-    if args.per_subject and 'subject_indices' in outputs:
+    if per_subject and 'subject_indices' in outputs:
         coords_true_parts, vis_true_parts = [], []
         for s_idx in outputs['subject_indices']:
             vmask = per_subject_valid_masks[s_idx]
@@ -763,12 +883,12 @@ def main():
     else:
         n_subj, n_time_full, n_kpts_full, _ = coords_gt.shape
 
-        # coords_gt is (n_subj, n_time, n_kpts, 3)
-        # transpose to (n_subj, n_kpts, n_time, 3) before flattening subjects+kpts
-        coords_flat_all = coords_gt.transpose(0, 2, 1, 3)                    # (n_subj, n_kpts, n_time, 3)
-        coords_flat_all = coords_flat_all.reshape(n_subj * n_kpts_full, n_time_full, 3)  # (S*K, n_time, 3)
-        coords_flat_all = coords_flat_all[valid_flat]                         # (K_valid, n_time, 3)
-        coords_true = coords_flat_all[:, frame_nums_gt, :].transpose(1, 0, 2)[np.newaxis]  # (1, T, K_valid, 3)
+        # coords_gt is (n_subj, n_time, n_kpts, R)
+        # transpose to (n_subj, n_kpts, n_time, R) before flattening subjects+kpts
+        coords_flat_all = coords_gt.transpose(0, 2, 1, 3)                    # (n_subj, n_kpts, n_time, R)
+        coords_flat_all = coords_flat_all.reshape(n_subj * n_kpts_full, n_time_full, R)  # (S*K, n_time, R)
+        coords_flat_all = coords_flat_all[valid_flat]                         # (K_valid, n_time, R)
+        coords_true = coords_flat_all[:, frame_nums_gt, :].transpose(1, 0, 2)[np.newaxis]  # (1, T, K_valid, R)
 
         if vis_gt_raw is not None:
             # vis_gt_raw is (n_subj, n_time, n_kpts, n_cams) — aggregate across cameras
@@ -783,14 +903,15 @@ def main():
     outputs['coords_true'] = coords_true   # (1, T, K, 3)
     outputs['vis_true'] = vis_true      # (1, T, K, 1)
     outputs['video_paths'] = np.array(video_paths, dtype=str)
-    outputs['metadata_path'] = metadata_path
-    outputs['trial_path'] = args.trial_path
+    outputs['mode'] = mode
+    outputs['metadata_path'] = metadata_path if metadata_path is not None else ''
+    outputs['trial_path'] = trial_path
     outputs['config_path'] = config_path
     outputs['checkpoint_path'] = checkpoint_path
-    outputs['start_frame'] = args.start_frame
-    outputs['n_frames_requested'] = args.n_frames
-    outputs['n_overlap'] = args.n_overlap
-    outputs['per_subject'] = args.per_subject
+    outputs['start_frame'] = start_frame
+    outputs['n_frames_requested'] = n_frames
+    outputs['n_overlap'] = n_overlap
+    outputs['per_subject'] = per_subject
     outputs['n_cams_total'] = len(camera_group)
     outputs['cam_names_used'] = np.array(cam_names_used, dtype=str)
 
@@ -799,7 +920,7 @@ def main():
     else:
         outputs['n_frames_returned'] = 0
 
-    if args.outpath is not None:
+    if outpath is not None:
         save_dict = {}
         for k, v in outputs.items():
             if isinstance(v, torch.Tensor):
@@ -817,16 +938,47 @@ def main():
         ]
         save_dict['crop_history'] = json.dumps(crop_history_serializable)
 
-        outdir = os.path.dirname(args.outpath)
+        outdir = os.path.dirname(outpath)
         if outdir != '':
             os.makedirs(outdir, exist_ok=True)
-        np.savez(args.outpath, **save_dict)
-        print(f'Saved outputs to {args.outpath}')
+        np.savez(outpath, **save_dict)
+        print(f'Saved outputs to {outpath}')
     else:
         print('Inference completed.')
         print(f'checkpoint_path: {checkpoint_path}')
         print(f'config_path: {config_path}')
         print(f'n_frames_returned: {outputs["coords_pred"].shape[1] if outputs["coords_pred"].ndim >= 2 else 0}')
+
+    return outputs
+
+
+def main():
+    args = parse_args()
+
+    device = torch.device(args.device) if args.device is not None else None
+
+    model, config, config_path, checkpoint_path = load_model_from_base_folder(
+        args.base_folder,
+        checkpoint=args.checkpoint,
+        device=device,
+    )
+
+    run_inference(
+        model=model,
+        config_path=config_path,
+        checkpoint_path=checkpoint_path,
+        trial_path=args.trial_path,
+        start_frame=args.start_frame,
+        n_frames=args.n_frames,
+        n_overlap=args.n_overlap,
+        n_views=args.n_views,
+        view_seed=args.view_seed,
+        max_kpts=args.max_kpts,
+        per_subject=args.per_subject,
+        device=device,
+        outpath=args.outpath,
+        pred_key_3d=args.pred_key_3d,
+    )
 
 
 if __name__ == '__main__':

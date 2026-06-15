@@ -9,7 +9,50 @@ import torch.nn.functional as F
 from einops import rearrange, einsum, repeat
 
 
-def project_volumes(volumes): 
+def log1mexp(a):
+    """Numerically stable ``log(1 - exp(a))`` for ``a <= 0``. Splits at -ln2
+    between the ``log(-expm1(a))`` and ``log1p(-exp(a))`` formulations, each of
+    which is accurate on its half."""
+    return torch.where(a > -0.6931471805599453,
+                       torch.log(-torch.expm1(a)),
+                       torch.log1p(-torch.exp(a)))
+
+
+def noisy_or_logit(logits, dim=0, clamp=30.0):
+    """Differentiable soft-OR over per-camera visibility logits.
+
+    Given per-camera logits ``z_c`` (with ``p_c = sigmoid(z_c)``), returns the
+    logit of the noisy-OR probability ``P_vis = 1 - prod_c (1 - p_c)`` over
+    ``dim``. Because ``sigmoid(noisy_or_logit(z)) == P_vis`` exactly, the result
+    can be fed straight into ``binary_cross_entropy_with_logits`` against the 3D
+    "visible in >=1 camera" label, and gradient flows to every camera (unlike a
+    hard ``amax``, which only updates the argmax). Single-camera input returns
+    ``z`` unchanged."""
+    log_p_occ = F.logsigmoid(-logits).sum(dim=dim)       # log prod(1 - p_c)
+    log_p_vis = log1mexp(log_p_occ.clamp(max=-1e-6))     # guard log(0)
+    return (log_p_vis - log_p_occ).clamp(-clamp, clamp)
+
+
+def signed_log1p(x, eps=1.0):
+    """Signed-log warp: map a value to a compressed coordinate with denser
+    resolution near 0. ``c = sign(x) * log1p(|x| / eps)``. Exact inverse of
+    ``signed_expm1``. Used by the ``log_3d_output`` 3D grid/regression warp
+    (the 3D head represents its output in this compressed space so the bins /
+    gradient concentrate near 0, where motion residuals live). Computed in fp32."""
+    x = x.float()
+    return torch.sign(x) * torch.log1p(torch.abs(x) / eps)
+
+
+def signed_expm1(c, eps=1.0):
+    """Inverse of ``signed_log1p``: map a compressed coordinate back to a value.
+    ``x = sign(c) * eps * expm1(|c|)``. With ``c_range = log1p(radius/eps)`` this
+    maps ``[-c_range, c_range] -> [-radius, radius]`` (denser near 0). Computed in
+    fp32; clamp the input to ``c_range`` to keep ``expm1`` (and its gradient) bounded."""
+    c = c.float()
+    return torch.sign(c) * eps * torch.expm1(torch.abs(c))
+
+
+def project_volumes(volumes):
     ''' 
     project volume to get the xy, xz, and yz planes 
     ''' 

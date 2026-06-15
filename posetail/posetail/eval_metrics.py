@@ -2,6 +2,13 @@ import torch
 import numpy as np
 from posetail.posetail.losses import get_vis_true
 
+
+def _sigmoid(x):
+    # vis_pred is emitted as a raw logit (max over per-camera logits, see
+    # tracker_tapnext.py); convert to a probability so the 0.5 threshold below
+    # matches the decision boundary the BCE-with-logits vis loss optimizes toward.
+    return 1.0 / (1.0 + np.exp(-x))
+
 def get_eval_metrics(vis_pred, vis_true, coords_pred, 
                      coords_true, thresholds = None, 
                      survival_threshold = 50, prefix = 'eval/'):
@@ -87,7 +94,7 @@ def get_occlusion_accuracy(vis_pred, vis_true):
         occlusion_acc (float)
     '''
 
-    occlusion_pred = vis_pred < 0.5
+    occlusion_pred = _sigmoid(vis_pred) < 0.5
     occlusion_true = ~vis_true
 
     occlusion_acc = np.mean(occlusion_pred == occlusion_true)
@@ -229,7 +236,7 @@ def get_average_jaccard(coords_pred, coords_true, vis_pred, vis_true, thresholds
         thresholds = [1, 2, 4, 8, 16]
 
     gt_vis  = np.squeeze(vis_true.astype(bool),  axis=-1)   # B, T, N
-    pred_vis = np.squeeze(vis_pred > 0.5,         axis=-1)   # B, T, N
+    pred_vis = np.squeeze(_sigmoid(vis_pred) > 0.5, axis=-1) # B, T, N
     dist    = np.linalg.norm(coords_pred - coords_true, axis=-1)  # B, T, N
     B, T, N = dist.shape
 

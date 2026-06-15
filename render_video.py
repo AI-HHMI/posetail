@@ -46,22 +46,28 @@ def generate_colors(n):
     return colors
 
 
-def render_keypoints_on_frame(frame, points_2d, conf, conf_threshold, colors, marker_size):
+def render_keypoints_on_frame(frame, points_2d, conf, conf_threshold, colors, marker_size, vis=None):
     """Draw keypoints on a single frame (BGR, uint8).
 
     Args:
         frame: (H, W, 3) BGR uint8 image (modified in-place).
         points_2d: (N, 2) projected 2D coordinates.
-        conf: (N,) confidence values.
-        conf_threshold: minimum confidence to draw a keypoint.
+        conf: (N,) confidence values (probabilities in [0, 1]).
+        conf_threshold: minimum confidence/visibility to draw a keypoint.
         colors: list of BGR tuples, one per keypoint.
         marker_size: radius of the circle marker.
+        vis: optional (N,) visibility probabilities in [0, 1]; gated like conf.
     """
     n_kpts = points_2d.shape[0]
     h, w = frame.shape[:2]
 
     for k in range(n_kpts):
         if conf[k] < conf_threshold:
+            continue
+        if vis is not None and vis[k] < conf_threshold:
+            continue
+        if not np.all(np.isfinite(points_2d[k])):
+            # NaN/inf coords (e.g. behind-camera or undefined projections); skip.
             continue
 
         x, y = int(round(points_2d[k, 0])), int(round(points_2d[k, 1]))
@@ -165,46 +171,69 @@ def main():
     # Load inference outputs
     data = np.load(args.input_npz, allow_pickle=True)
 
-    coords_pred = data['coords_pred']       # (1, T, N, 3)
-    conf_pred = data['conf_pred']           # (1, T, N, 1)
+    coords_pred = data['coords_pred']       # (1, T, N, R), R=3 (3D) or 2 (2D)
+    conf_pred = data['conf_pred']           # (1, T, N) or (1, T, N, 1), logits
+    vis_pred = data['vis_pred'] if 'vis_pred' in data else None  # (1, T, N, 1), logits
     frame_numbers = data['frame_numbers']   # (T,)
-    metadata_path = data['metadata_path'].item()
     video_paths = [str(p) for p in data['video_paths']]
     start_frame = int(data['start_frame']) if 'start_frame' in data else 0
     if 'fps' in data and args.fps == 30.0:
         args.fps = float(data['fps'])
 
-    # Override with trial path if provided
+    # 2D vs 3D: 2D predictions are already pixel coords (no projection / metadata).
+    is_2d = coords_pred.shape[-1] == 2
+
+    # Override with trial path if provided (recompute video paths from the trial)
     if args.trial_path is not None:
         from inference_video import load_trial
-        metadata_path, video_paths, _ = load_trial(args.trial_path, start_frame=start_frame)
+        _mode, metadata_path, _cam_names, video_paths, *_ = load_trial(
+            args.trial_path, start_frame=start_frame)
+    else:
+        metadata_path = data['metadata_path'].item() if 'metadata_path' in data else ''
 
     # Remove batch dimension
-    coords_pred = coords_pred[0]    # (T, N, 3)
-    conf_pred = conf_pred[0]        # (T, N, 1)
-    conf_pred = conf_pred[..., 0]   # (T, N)
+    coords_pred = coords_pred[0]    # (T, N, R)
+    conf_pred = conf_pred[0]        # (T, N) or (T, N, 1)
+    if conf_pred.ndim == 3:
+        conf_pred = conf_pred[..., 0]   # (T, N)
+
+    # conf/vis are stored as logits; map to [0, 1] probabilities so the
+    # conf_threshold (default 0.5) is meaningful.
+    def _sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-x))
+
+    conf_pred = _sigmoid(conf_pred)
+    if vis_pred is not None:
+        vis_pred = vis_pred[0]          # (T, N) or (T, N, 1)
+        if vis_pred.ndim == 3:
+            vis_pred = vis_pred[..., 0]
+        vis_pred = _sigmoid(vis_pred)   # (T, N)
 
     n_frames = coords_pred.shape[0]
     n_kpts = coords_pred.shape[1]
     n_cams = len(video_paths)
 
-    print(f'Loaded {n_frames} frames, {n_kpts} keypoints, {n_cams} cameras')
+    print(f'Loaded {n_frames} frames, {n_kpts} keypoints, {n_cams} cameras '
+          f'({"2D" if is_2d else "3D"})')
 
-    # Load camera group
-    camera_group = load_camera_group_from_metadata(metadata_path, device='cpu')
-    cam_names = [cam['name'] for cam in camera_group]
+    if is_2d:
+        # Single (uncalibrated) camera; predictions are pixel coords already.
+        cam_names = [os.path.splitext(os.path.basename(p))[0] for p in video_paths]
+        p2d = coords_pred[np.newaxis]  # (1, T, N, 2)
+    else:
+        # Load camera group and project predicted 3D points to each view.
+        camera_group = load_camera_group_from_metadata(metadata_path, device='cpu')
+        cam_names = [cam['name'] for cam in camera_group]
 
-    # Validate camera count matches video count
-    if n_cams != len(camera_group):
-        raise ValueError(
-            f'Number of video paths ({n_cams}) does not match '
-            f'number of cameras ({len(camera_group)}) in metadata'
-        )
+        if n_cams != len(camera_group):
+            raise ValueError(
+                f'Number of video paths ({n_cams}) does not match '
+                f'number of cameras ({len(camera_group)}) in metadata'
+            )
 
-    # Project all 3D points to 2D for all cameras
-    coords_3d_torch = torch.as_tensor(coords_pred, dtype=torch.float32)
-    p2d = project_points_torch(camera_group, coords_3d_torch)  # (n_cams, T, N, 2)
-    p2d = p2d.cpu().numpy()
+        coords_3d_torch = torch.as_tensor(coords_pred, dtype=torch.float32)
+        p2d = project_points_torch(camera_group, coords_3d_torch)  # (n_cams, T, N, 2)
+        p2d = p2d.cpu().numpy()
 
     # Compute crop boxes once for all frames
     if args.crop:
@@ -308,12 +337,14 @@ def main():
                     pts[:, 1] -= y1
 
                 conf = conf_pred[t]  # (N,)
+                vis = vis_pred[t] if vis_pred is not None else None  # (N,)
 
                 frame = render_keypoints_on_frame(
                     frame, pts, conf,
                     conf_threshold=args.conf_threshold,
                     colors=colors,
                     marker_size=args.marker_size,
+                    vis=vis,
                 )
 
                 writer.write(frame)

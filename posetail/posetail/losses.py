@@ -4,10 +4,52 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 
-from einops import rearrange, repeat
+from einops import rearrange, repeat, einsum
 from posetail.posetail.cube import get_camera_scale, project_points_torch, is_point_visible
+from posetail.posetail.cube import to_homogeneous, from_homogeneous, signed_log1p
 
 from collections import defaultdict
+
+
+def coordinate_softmax_loss(logits, target_xy, vis_mask, pixel_size=256):
+    """Cross-entropy on per-axis 2D position logits vs target pixels — the primary
+    2D objective in upstream TAPNext++ (torch_losses.coordinate_softmax). The
+    soft-argmax track-head emits ``2*P`` logits = [P x-bins | P y-bins]; we quantize
+    the target pixel (minus the 0.5 bin-centre offset the head adds) to a bin index
+    and apply masked CE. ``logits`` (..., 2P); ``target_xy`` (..., 2) pixels (x,y);
+    ``vis_mask`` (..., 1). Returns a scalar (unweighted)."""
+    P = logits.shape[-1] // 2
+    logits_x, logits_y = logits[..., :P], logits[..., P:]
+    finite = torch.isfinite(target_xy).all(dim=-1)
+    valid = (vis_mask[..., 0] > 0.5) & finite
+    tx = torch.round((torch.where(torch.isfinite(target_xy[..., 0]),
+                                  target_xy[..., 0], torch.zeros_like(target_xy[..., 0])) - 0.5)
+                     ).clamp(0, pixel_size - 1).long()
+    ty = torch.round((torch.where(torch.isfinite(target_xy[..., 1]),
+                                  target_xy[..., 1], torch.zeros_like(target_xy[..., 1])) - 0.5)
+                     ).clamp(0, pixel_size - 1).long()
+    ce_x = F.cross_entropy(logits_x.reshape(-1, P), tx.reshape(-1), reduction='none')
+    ce_y = F.cross_entropy(logits_y.reshape(-1, P), ty.reshape(-1), reduction='none')
+    ce = (ce_x + ce_y).reshape(valid.shape)
+    vf = valid.float()
+    return (ce * vf).sum() / (vf.sum() + 1e-6)
+
+
+def grid_softmax_loss(logits, target_values, lo, hi, vis_mask):
+    """Cross-entropy over a fixed bin grid for each coordinate dim — the grid-mode
+    analogue of ``coordinate_softmax_loss`` for the 3D (D=3) and depth (D=1) heads.
+    The bins are ``linspace(lo, hi, K)``; the continuous target is quantized to its
+    nearest bin and supervised with masked CE. ``logits`` (..., D, K);
+    ``target_values`` (..., D); ``vis_mask`` (..., 1). Returns a scalar (unweighted)."""
+    K = logits.shape[-1]
+    finite = torch.isfinite(target_values)
+    safe = torch.where(finite, target_values, torch.full_like(target_values, lo))
+    idx = torch.round((safe - lo) / (hi - lo) * (K - 1)).clamp(0, K - 1).long()  # (...,D)
+    ce = F.cross_entropy(logits.reshape(-1, K), idx.reshape(-1),
+                         reduction='none').reshape(idx.shape)                     # (...,D)
+    valid = (vis_mask > 0.5) & finite                                            # (...,D) bcast
+    vf = valid.float()
+    return (ce * vf).sum() / (vf.sum() + 1e-6)
 
 
 def normalize_by_mean_depth(x, vis, C, eps=1e-6):
@@ -25,14 +67,22 @@ def normalize_by_mean_depth(x, vis, C, eps=1e-6):
     else:
         d = x
         offset = 0.0
-    mean_depth = (d * vis).sum(dim=(-3, -2), keepdim=True) / (vis.sum(dim=(-3, -2), keepdim=True) + eps)
-    return (x - offset) / (mean_depth + eps), mean_depth
+    # Excise NaN before the reduction: a single missing keypoint-frame would make
+    # NaN * 0 = NaN, contaminating the whole (cam, B) mean_depth via .sum().
+    valid = (vis > 0.5) & torch.isfinite(d)
+    d_safe = torch.where(valid, d, torch.zeros_like(d))
+    vis_f = valid.float()
+    mean_depth = d_safe.sum(dim=(-3, -2), keepdim=True) / (vis_f.sum(dim=(-3, -2), keepdim=True) + eps)
+    # Keep NaN out of the normalized output too (loss masks these positions anyway).
+    x_safe = torch.where(torch.isfinite(x), x, torch.zeros_like(x))
+    return (x_safe - offset) / (mean_depth + eps), mean_depth
 
 
 class TotalLoss(nn.Module):
 
     def __init__(self, gamma = 0.8, pixel_thresh = 12, delta = 6,
                  use_huber_loss = False, vis_loss_weight = 1,
+                 vis_loss_3d_weight = 0.0,
                  conf_loss_weight = 1, coords_loss_weight = 1,
                  occluded_coords_loss_weight = 1,
                  feature_loss_weight = 0.5,
@@ -41,12 +91,19 @@ class TotalLoss(nn.Module):
                  coords_loss_triangulate_weight = 0.1,
                  coords_loss_2d_weight = 1,
                  coords_loss_depth_weight = 1,
+                 coords_loss_direct_reproj_weight = 0.0,
+                 coords_loss_rays_reproj_weight = 0.0,
                  conf_2d_loss_weight = 0,
                  per_camera_cube_scale = False,
                  smoothness_loss_3d_weight = 0,
                  smoothness_loss_2d_weight = 0,
                  smoothness_loss_order = 4,
-                 smoothness_loss_tolerance = 1.0):
+                 smoothness_loss_tolerance = 1.0,
+                 coords_3d_loss_scale = 1.0,
+                 cube_scale_floor = 0.0,
+                 coords_softmax_2d_weight = 0.0,
+                 coords_softmax_3d_weight = 0.0,
+                 depth_softmax_weight = 0.0):
         super().__init__()
 
         self.gamma = gamma
@@ -57,6 +114,7 @@ class TotalLoss(nn.Module):
 
         # weight for each loss (0 to not use or compute)
         self.vis_loss_weight = vis_loss_weight
+        self.vis_loss_3d_weight = vis_loss_3d_weight
         self.conf_loss_weight = conf_loss_weight
         self.coords_loss_weight = coords_loss_weight
         self.occluded_coords_loss_weight = occluded_coords_loss_weight
@@ -69,6 +127,8 @@ class TotalLoss(nn.Module):
         self.coords_loss_triangulate_weight = coords_loss_triangulate_weight
         self.coords_loss_2d_weight = coords_loss_2d_weight
         self.coords_loss_depth_weight = coords_loss_depth_weight
+        self.coords_loss_direct_reproj_weight = coords_loss_direct_reproj_weight
+        self.coords_loss_rays_reproj_weight = coords_loss_rays_reproj_weight
         self.per_camera_cube_scale = per_camera_cube_scale
 
         self.smoothness_loss_3d_weight = smoothness_loss_3d_weight
@@ -76,9 +136,43 @@ class TotalLoss(nn.Module):
         self.smoothness_loss_order = smoothness_loss_order
         self.smoothness_loss_tolerance = smoothness_loss_tolerance
 
+        # Constant, metric-preserving rescale of the regular (multi-cam) 3D loss
+        # branch. The regular branch measures absolute coordinate error / cube_scale
+        # (~0.11), which runs ~500x hotter than the per-scene-normalized 2D-query
+        # branch and dominates the gradient (corrupting the frozen 2D heads). We
+        # cannot normalize per scene/camera in the multi-cam case (it breaks
+        # cross-camera metric consistency), so we divide the regular-3D losses by a
+        # single global constant to match magnitudes while keeping absolute depth.
+        self.coords_3d_loss_scale = coords_3d_loss_scale
+
+        # Floor on per-camera cube_scale before it divides the regular-3D loss
+        # (_compute_loss: loss / scale). A degenerate crop (few near-coplanar points) makes the
+        # projection-Jacobian SVD blow up -> cube_scale = 1/sensitivity collapses toward 0 ->
+        # the loss divisor (cube_scale * coords_3d_loss_scale) shrinks -> depth/3d losses spike
+        # ~100-150x (grad_norm to thousands). Catastrophic spikes are all at cube_scale < ~0.02;
+        # the [0.02,0.05) band is already clean. Clamping the divisor from below caps that
+        # inflation. 0.0 disables (legacy behavior).
+        self.cube_scale_floor = cube_scale_floor
+
+        # Direct logit-classification objectives (cross-entropy on the position bins),
+        # mirroring upstream TAPNext++'s primary 2D loss. The 2D term supervises the
+        # pretrained track logits; the 3D/depth terms supervise the grid heads' bins
+        # (only fire when the model is in "grid" output_mode -> emits 'grid' / '2d_logits').
+        self.coords_softmax_2d_weight = coords_softmax_2d_weight
+        self.coords_softmax_3d_weight = coords_softmax_3d_weight
+        self.depth_softmax_weight = depth_softmax_weight
+
         self.bce_loss_vis = BCELossVis(
-            gamma = self.gamma, 
+            gamma = self.gamma,
             weight = self.vis_loss_weight
+        )
+
+        # separate-weight BCE for the aggregated 3D visibility (noisy-OR logit
+        # over cameras). weight 0 -> returns nan -> dropped from total_loss, so
+        # this is inert until a config opts in via vis_loss_3d_weight.
+        self.bce_loss_vis_3d = BCELossVis(
+            gamma = self.gamma,
+            weight = self.vis_loss_3d_weight
         )
 
         self.bce_loss_conf = BCELossConf(
@@ -116,10 +210,28 @@ class TotalLoss(nn.Module):
         )
         
         self.mae_loss_coords_2d = WeightedMAELoss(
-            gamma = self.gamma, 
-            delta = 16, 
-            use_huber_loss = True, 
+            gamma = self.gamma,
+            delta = 16,
+            use_huber_loss = True,
             weight = self.coords_loss_2d_weight / 16.0
+        )
+
+        # Reprojection of the fused 3D predictions back into each camera, supervised
+        # in pixel space against the projected GT. Multi-view consistency constrains
+        # depth-of-motion without any SVD/triangulation (no grad spikes). Pixel-space
+        # ⇒ mirror mae_loss_coords_2d (delta=16, huber, weight / 16).
+        self.mae_loss_direct_reproj = WeightedMAELoss(
+            gamma = self.gamma,
+            delta = 16,
+            use_huber_loss = True,
+            weight = self.coords_loss_direct_reproj_weight / 16.0
+        )
+
+        self.mae_loss_rays_reproj = WeightedMAELoss(
+            gamma = self.gamma,
+            delta = 16,
+            use_huber_loss = True,
+            weight = self.coords_loss_rays_reproj_weight / 16.0
         )
 
         self.mae_loss_coords_depth = WeightedMAELoss(
@@ -214,12 +326,17 @@ class TotalLoss(nn.Module):
         coords_loss_direct    = _nan()
         coords_loss_rays      = _nan()
         coords_loss_triangulate = _nan()
+        coords_loss_direct_reproj = _nan()
+        coords_loss_rays_reproj   = _nan()
         vis_loss              = _nan()
         vis_loss_cams         = _nan()
         conf_loss             = _nan()
         conf_loss_2d          = _nan()
         coords_loss_2d        = _nan()
         coords_loss_depth     = _nan()
+        coords_softmax_2d     = _nan()
+        coords_softmax_3d     = _nan()
+        depth_softmax         = _nan()
         smoothness_loss_3d    = _nan()
         smoothness_loss_2d    = _nan()
         feature_loss          = _nan()
@@ -243,6 +360,10 @@ class TotalLoss(nn.Module):
                     coords_true=coords_true_2d,
                     vis_true=vis_true_cams,
                     time_dim=2, scale=1.0, device=device)
+
+            if self.coords_softmax_2d_weight > 0 and '2d_logits' in outputs:
+                coords_softmax_2d = self.coords_softmax_2d_weight * coordinate_softmax_loss(
+                    outputs['2d_logits'], coords_true_2d, vis_true_cams)
 
         else:
             # 3D path (R==3): original synthetic-2D and pure-3D logic.
@@ -278,12 +399,19 @@ class TotalLoss(nn.Module):
             if not self.per_camera_cube_scale:
                 med = scale.median(dim=0).values  # (B,)
                 scale = med[None, :].expand_as(scale).contiguous()
+            # Clamp degenerate-crop cube_scale collapse (see __init__) so it can't blow up the
+            # /scale division in the regular-3D losses. Off when floor==0.
+            if self.cube_scale_floor > 0:
+                scale = scale.clamp_min(self.cube_scale_floor)
 
             occluded_true = ~vis_true
 
             if p2d is None:
-                scale_cb = rearrange(scale, 'cams b -> cams b 1 1 1')
-                scale_b  = scale.median(dim=0).values.reshape(B, 1, 1, 1)
+                # WeightedMAELoss divides the error by `scale`, so multiplying the
+                # cube_scale by the (>=1) constant scales the regular-3D loss DOWN
+                # to match the normalized 2D-query branch's magnitude.
+                scale_cb = rearrange(scale, 'cams b -> cams b 1 1 1') * self.coords_3d_loss_scale
+                scale_b  = scale.median(dim=0).values.reshape(B, 1, 1, 1) * self.coords_3d_loss_scale
             else:
                 scale_cb = 1.0
                 scale_b  = 1.0
@@ -312,7 +440,7 @@ class TotalLoss(nn.Module):
 
             # compute losses
             if valid_vis:
-                vis_loss = self.bce_loss_vis(
+                vis_loss = self.bce_loss_vis_3d(
                     vis_pred=vis_pred_iters if training_iters else vis_pred,
                     vis_true=vis_true_unrolled if training_iters else vis_true,
                     device=device)
@@ -449,6 +577,25 @@ class TotalLoss(nn.Module):
                     scale=scale_b,
                     device=device)
 
+            # Reprojection losses: project the fused 3D predictions into every camera
+            # and supervise the pixel error vs the projected GT. Multi-view geometry
+            # constrains depth-of-motion with bounded, parallax-scaled gradients (no
+            # SVD/triangulation). Pure-3D multi-cam case only (p2d is None), where
+            # coords_true_2d == project_points_torch(cgroup, coords_true) is (cams,b,t,n,2).
+            coords_loss_direct_reproj = torch.tensor(0.0, device=device)
+            coords_loss_rays_reproj   = torch.tensor(0.0, device=device)
+            if p2d is None:
+                if self.coords_loss_direct_reproj_weight > 0 and '3d_pred_direct' in outputs:
+                    reproj = project_points_torch(cgroup, outputs['3d_pred_direct'])
+                    coords_loss_direct_reproj = self.mae_loss_direct_reproj(
+                        coords_pred=reproj, coords_true=coords_true_2d,
+                        vis_true=vis_true_cams, scale=1.0, device=device)
+                if self.coords_loss_rays_reproj_weight > 0 and '3d_pred_rays' in outputs:
+                    reproj = project_points_torch(cgroup, outputs['3d_pred_rays'])
+                    coords_loss_rays_reproj = self.mae_loss_rays_reproj(
+                        coords_pred=reproj, coords_true=coords_true_2d,
+                        vis_true=vis_true_cams, scale=1.0, device=device)
+
             if coords_pred_2d is not None:
                 coords_loss_2d = self.mae_loss_coords_2d(
                     coords_pred=coords_pred_2d,
@@ -457,6 +604,57 @@ class TotalLoss(nn.Module):
                     device=device)
             else:
                 coords_loss_2d = torch.tensor(0.0, device=device)
+
+            # ----- direct logit-classification losses (coordinate softmax) -----
+            # 2D: supervise the pretrained track logits vs the projected GT pixels.
+            if self.coords_softmax_2d_weight > 0 and '2d_logits' in outputs:
+                coords_softmax_2d = self.coords_softmax_2d_weight * coordinate_softmax_loss(
+                    outputs['2d_logits'], coords_true_2d, vis_true_cams)
+
+            # 3D + depth grid bins: map GT world -> per-camera ray-local / normalized
+            # depth (the exact inverse of the forward's decode), quantize to bins, CE.
+            if 'grid' in outputs and (self.coords_softmax_3d_weight > 0
+                                      or self.depth_softmax_weight > 0):
+                g = outputs['grid']
+                rays_c = g['rays_c']                                   # (cams,4,4)
+                cs = g['cube_scale']                                   # (cams,B)
+                feff = g['f_eff']                                      # (cams,) or None
+                # GT world -> ray-local (cams,b,t,n,3); divide out the metric scaling
+                # the forward multiplies back in (cube_scale [* f_eff]).
+                gt_h = to_homogeneous(coords_true.to(torch.float32))   # (b,t,n,4)
+                p_raylocal = from_homogeneous(
+                    einsum(rays_c, gt_h, 'cams x r, b t n r -> cams b t n x'))
+                denom = rearrange(cs, 'cams b -> cams b 1 1 1')
+                denom_d = rearrange(cs, 'cams b -> cams b 1 1')
+                if feff is not None:
+                    denom = denom * rearrange(feff, 'cams -> cams 1 1 1 1').to(denom.dtype)
+                    denom_d = denom_d * rearrange(feff, 'cams -> cams 1 1 1').to(denom_d.dtype)
+
+                if self.coords_softmax_3d_weight > 0:
+                    if g.get('is_resid', False):
+                        # gridresid: the 3D bins encode the motion offset from the
+                        # per-track query anchor, normalized by cube*image_size
+                        # (~pixels; NO f_eff -> ortho-safe). Subtract the (detached)
+                        # anchor in ray-local space, then divide.
+                        denom_resid = rearrange(cs, 'cams b -> cams b 1 1 1') * g['image_size']
+                        target_3d = (p_raylocal - g['anchor_local']) / denom_resid
+                    else:
+                        target_3d = p_raylocal / denom                # absolute: / cube*f_eff
+                    lo3d, hi3d = g['g3d_lo'], g['g3d_hi']
+                    if g.get('log_warp', False):
+                        # quantize in the same signed-log space the warped bin
+                        # centres live in (monotonic -> nearest-in-warped == nearest
+                        # centre); range becomes [-c_range, c_range].
+                        target_3d = signed_log1p(target_3d, g['eps'])
+                        lo3d, hi3d = -g['c_range'], g['c_range']
+                    coords_softmax_3d = self.coords_softmax_3d_weight * grid_softmax_loss(
+                        g['logits_3d'], target_3d, lo3d, hi3d, vis_true_cams)
+
+                if self.depth_softmax_weight > 0:
+                    target_logd = torch.log(depths_true[..., 0] / denom_d + 1e-6)  # (cams,b,t,n)
+                    depth_softmax = self.depth_softmax_weight * grid_softmax_loss(
+                        g['logits_depth'][..., None, :], target_logd[..., None],
+                        g['gd_lo'], g['gd_hi'], vis_true_cams)
 
             if depth_pred is not None:
                 if p2d is not None:
@@ -517,11 +715,14 @@ class TotalLoss(nn.Module):
             coords_loss_direct,
             coords_loss_rays,
             coords_loss_triangulate,
-            # vis_loss, # replaced by vis_loss_cams
+            coords_loss_direct_reproj,
+            coords_loss_rays_reproj,
+            vis_loss,  # 3D noisy-OR visibility (inert unless vis_loss_3d_weight > 0)
             vis_loss_cams,
             conf_loss,
             conf_loss_2d,
             coords_loss_2d, coords_loss_depth,
+            coords_softmax_2d, coords_softmax_3d, depth_softmax,
             smoothness_loss_3d, smoothness_loss_2d,
             # occluded_coords_loss_2d, # too crazy
             feature_loss, bad_feature_loss
@@ -537,6 +738,8 @@ class TotalLoss(nn.Module):
         self.loss_history['3d_direct'].append(coords_loss_direct.item())
         self.loss_history['3d_rays'].append(coords_loss_rays.item())
         self.loss_history['3d_triangulate'].append(coords_loss_triangulate.item())
+        self.loss_history['3d_direct_reproj'].append(coords_loss_direct_reproj.item())
+        self.loss_history['3d_rays_reproj'].append(coords_loss_rays_reproj.item())
 
         self.loss_history['vis_loss'].append(vis_loss.item())
         self.loss_history['vis_2d_loss'].append(vis_loss_cams.item())
@@ -546,6 +749,10 @@ class TotalLoss(nn.Module):
 
         self.loss_history['2d_loss'].append(coords_loss_2d.item())
         self.loss_history['depth_loss'].append(coords_loss_depth.item())
+
+        self.loss_history['2d_softmax_loss'].append(coords_softmax_2d.item())
+        self.loss_history['3d_softmax_loss'].append(coords_softmax_3d.item())
+        self.loss_history['depth_softmax_loss'].append(depth_softmax.item())
 
         self.loss_history['smoothness_3d_loss'].append(smoothness_loss_3d.item())
         self.loss_history['smoothness_2d_loss'].append(smoothness_loss_2d.item())
@@ -609,19 +816,25 @@ class BCELossConf(nn.Module):
         self.pixel_thresh = pixel_thresh
         self.weight = weight
 
-    def _compute_loss(self, conf_pred, coords_pred, coords_true, vis_true, scale=1): 
+    def _compute_loss(self, conf_pred, coords_pred, coords_true, vis_true, scale=1):
 
-        dist = torch.sum((coords_pred - coords_true) ** 2, dim = -1) ** 0.5
+        # NaN-safe: zero the diff at invalid (occluded / non-finite GT) positions so
+        # NaN targets don't poison gradients (see WeightedMAELoss._compute_loss).
+        valid = (vis_true > 0.5) & torch.isfinite(coords_true[..., 0:1])
+        coords_true_safe = torch.where(valid, coords_true, coords_pred.detach())
+
+        dist = torch.sum((coords_pred - coords_true_safe) ** 2, dim = -1) ** 0.5
         mask = (dist <= self.pixel_thresh * scale).float().unsqueeze(dim = -1)
 
         loss = F.binary_cross_entropy_with_logits(
-            conf_pred, 
-            mask, 
-            reduction = 'mean')
+            conf_pred,
+            mask,
+            reduction = 'none')
 
-        loss = torch.nanmean(loss * vis_true)
+        valid_f = valid.float()
+        loss = (loss * valid_f).sum() / (valid_f.sum() + 1e-6)
 
-        return loss 
+        return loss
 
     def forward(self, conf_pred, coords_pred, coords_true, vis_true, scale=1, device = None): 
 
@@ -676,12 +889,20 @@ class WeightedMAELoss(nn.Module):
     
     def _compute_loss(self, coords_pred, coords_true, vis_true, scale=1.0):
 
-        if self.use_huber_loss:
-            loss = self.huber_loss(coords_pred, coords_true)
-        else:
-            loss = torch.abs(coords_pred - coords_true)
+        # validity = visible AND finite GT. vis alone is insufficient: it can be 1
+        # at NaN coords, and NaN targets poison the backward pass even when masked
+        # by multiplication (0 * NaN = NaN). torch.where zeroes the diff at invalid
+        # positions so NaN never enters a differentiable op (cf. SmoothnessLoss).
+        valid = (vis_true > 0.5) & torch.isfinite(coords_true[..., 0:1])
+        coords_true_safe = torch.where(valid, coords_true, coords_pred.detach())
 
-        loss = torch.nanmean((loss / scale) * vis_true)
+        if self.use_huber_loss:
+            loss = self.huber_loss(coords_pred, coords_true_safe)
+        else:
+            loss = torch.abs(coords_pred - coords_true_safe)
+
+        valid_f = valid.float()
+        loss = (loss / scale * valid_f).sum() / (valid_f.sum() * coords_pred.shape[-1] + 1e-6)
 
         return loss
 

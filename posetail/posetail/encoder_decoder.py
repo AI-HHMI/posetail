@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 
+import math
+
 import torch
-import torch.nn as nn 
+import torch.nn as nn
 import torch.nn.functional as F
 
 from posetail.posetail.networks import EmbedV2V
 from posetail.posetail.cube import is_point_visible, project_points_torch
 from posetail.posetail.cube import CameraSelfAttention
+from posetail.posetail.cube import signed_log1p, signed_expm1
 from posetail.posetail.utils import get_fourier_encoding, apply_rope_1d
 
 from einops import rearrange, repeat, einsum
@@ -635,6 +638,11 @@ class Decoder(nn.Module):
                  output_mode="direct",
                  head_3d_grid_size=8,
                  head_3d_grid_radius=1.0,
+                 log_3d_output=False,
+                 log_3d_eps=0.1,
+                 depth_log_min=-2.5,
+                 depth_log_max=2.0,
+                 image_size=256,
                  f_eff_scale=False):
         super().__init__()
 
@@ -647,11 +655,41 @@ class Decoder(nn.Module):
         self.f_eff_scale = f_eff_scale
         self.head_3d_grid_size = head_3d_grid_size
         self.head_3d_grid_radius = head_3d_grid_radius
+        self.image_size = image_size
+        # signed-log warp of the 3D output (3D only). See cube.signed_log1p/expm1.
+        self.log_3d_output = log_3d_output
+        self.log_3d_eps = log_3d_eps
+        self.log_3d_c_range = float(math.log1p(head_3d_grid_radius / log_3d_eps))
 
-        if output_mode == 'grid':
-            grid_1d = torch.linspace(-head_3d_grid_radius, head_3d_grid_radius, head_3d_grid_size)
-            grid_offsets = torch.cartesian_prod(grid_1d, grid_1d, grid_1d)  # [G**3, 3]
-            self.register_buffer("grid_offsets_3d", grid_offsets)
+        # Grid (classification) output modes, mirroring TrackerTapNext:
+        #   "grid"      = absolute ray-local position via per-axis marginal soft-argmax.
+        #   "gridresid" = the grid head emits a motion residual offset (added to the
+        #                 per-track query anchor); depth stays the absolute log grid.
+        # Both supervise the bins with cross-entropy (losses.py grid_softmax_loss).
+        self.is_grid = output_mode in ('grid', 'gridresid')
+        self.is_resid = output_mode in ('residual', 'resdirect', 'gridresid')
+
+        if self.is_grid:
+            G = head_3d_grid_size
+            # 3D bin centres: signed-log spaced (denser near 0) when log_3d_output,
+            # still spanning exactly [-radius, radius]; otherwise linear. Per-axis
+            # (marginal) — NOT the joint cartesian grid (that explodes as G**3 and is
+            # never CE-supervised).
+            if log_3d_output:
+                cr = self.log_3d_c_range
+                grid_1d = signed_expm1(torch.linspace(-cr, cr, G), log_3d_eps)
+            else:
+                grid_1d = torch.linspace(-head_3d_grid_radius, head_3d_grid_radius, G)
+            self.register_buffer("grid_1d", grid_1d)
+            # Depth grid is ALWAYS linear-in-log over [depth_log_min, depth_log_max]
+            # (its own representation; never touched by log_3d_output).
+            self.register_buffer("depth_grid", torch.linspace(depth_log_min, depth_log_max, G))
+            # 2D pixel bin centres at i+0.5 to match coordinate_softmax_loss's
+            # round(target-0.5) quantization (losses.py:25-30).
+            P = image_size
+            self.register_buffer("pix_grid", torch.arange(P, dtype=torch.float32) + 0.5)
+            self.g3d_lo, self.g3d_hi = -head_3d_grid_radius, head_3d_grid_radius
+            self.gd_lo, self.gd_hi = depth_log_min, depth_log_max
 
         if self.use_camera_self_attention:
             self.camera_attns = nn.ModuleList([
@@ -696,8 +734,13 @@ class Decoder(nn.Module):
             ])
             self.norm_ts = nn.ModuleList([AdaptiveLayerNorm(embed_dim) for _ in range(num_layers)])
 
-        # Per-mode output heads: index 0 = 2D, index 1 = 3D
-        head_3d_out = head_3d_grid_size ** 3 if output_mode == 'grid' else 3
+        # Per-mode output heads: index 0 = 2D, index 1 = 3D.
+        # In grid mode the heads emit per-axis bin logits (marginal soft-argmax):
+        #   3D    -> 3*G logits,  depth -> G logits,  2D -> 2*P pixel logits.
+        # Otherwise they regress 3 / 1 / 2 values directly.
+        head_3d_out    = 3 * head_3d_grid_size if self.is_grid else 3
+        head_2d_out    = 2 * image_size        if self.is_grid else 2
+        head_depth_out = head_3d_grid_size     if self.is_grid else 1
 
         def _make_heads(out_dim):
             return nn.ModuleList([
@@ -706,10 +749,10 @@ class Decoder(nn.Module):
             ])
 
         self.heads_3d      = _make_heads(head_3d_out)
-        self.heads_2d      = _make_heads(2)
+        self.heads_2d      = _make_heads(head_2d_out)
         self.heads_vis     = _make_heads(1)
         self.heads_conf    = _make_heads(1)
-        self.heads_depth   = _make_heads(1)
+        self.heads_depth   = _make_heads(head_depth_out)
         self.heads_conf_3d = _make_heads(1)
 
         # Variance-matched, dimension-invariant head init.
@@ -722,18 +765,19 @@ class Decoder(nn.Module):
         reg_std = HEAD_OUT_STD_REG / (self.embed_dim ** 0.5)
         logit_std = HEAD_OUT_STD_LOGIT / (self.embed_dim ** 0.5)
 
-        # Weight init — applied to both mode heads
+        # Weight init — applied to both mode heads. In grid mode the 3D/2D/depth heads
+        # are zero-init so the per-axis softmax starts uniform -> the decoded value is
+        # the grid centre (0 ray-local / image centre / mid log-depth), mirroring
+        # tracker_tapnext.py:194-197.
         for m in range(2):
-            for head in [self.heads_2d[m][1], self.heads_depth[m][1]]:
-                nn.init.normal_(head.weight, std=reg_std)
-                nn.init.zeros_(head.bias)
-
-            if output_mode == 'grid':
-                nn.init.zeros_(self.heads_3d[m][1].weight)
-                nn.init.zeros_(self.heads_3d[m][1].bias)
+            if self.is_grid:
+                for head in [self.heads_3d[m][1], self.heads_2d[m][1], self.heads_depth[m][1]]:
+                    nn.init.zeros_(head.weight)
+                    nn.init.zeros_(head.bias)
             else:
-                nn.init.normal_(self.heads_3d[m][1].weight, std=reg_std)
-                nn.init.zeros_(self.heads_3d[m][1].bias)
+                for head in [self.heads_2d[m][1], self.heads_depth[m][1], self.heads_3d[m][1]]:
+                    nn.init.normal_(head.weight, std=reg_std)
+                    nn.init.zeros_(head.bias)
 
             for head in [self.heads_vis[m][1], self.heads_conf[m][1], self.heads_conf_3d[m][1]]:
                 nn.init.normal_(head.weight, mean=0.0, std=logit_std)
@@ -756,7 +800,13 @@ class Decoder(nn.Module):
         # checkpoints load and infer identically.
         abs_scale = 1.0 if self.f_eff_scale else 1000.0
 
-        if self.output_mode in ('direct', 'grid'):
+        if self.is_grid:
+            # Grid modes: the bins carry the metric magnitude, so these scales are
+            # unused in the forward. Defined (harmless) only so attribute access and
+            # checkpoint round-trips stay uniform across modes.
+            self.scale_3d = nn.Parameter(torch.tensor([abs_scale]))
+            self.scale_2d = nn.Parameter(torch.tensor([128.0]))
+        elif self.output_mode == 'direct':
             self.scale_3d = nn.Parameter(torch.tensor([abs_scale]))
             self.scale_2d = nn.Parameter(torch.tensor([128.0]))
         elif self.output_mode == 'residual':
@@ -768,6 +818,20 @@ class Decoder(nn.Module):
             self.scale_2d = nn.Parameter(torch.tensor([6.0]))
 
         self.scale_depth = nn.Parameter(torch.tensor([abs_scale]))
+
+    def _grid_decode(self, logits, grid_values):
+        """Per-axis masked soft-argmax over a fixed grid of bin centres (threshold 20
+        bins, temperature 0.5), mirroring tracker_tapnext.py:379-392. ``logits``
+        (..., K), ``grid_values`` (K,) -> decoded value (...)."""
+        soft_argmax_threshold = 20
+        softmax_temperature = 0.5
+        K = logits.shape[-1]
+        argmax = logits.argmax(dim=-1, keepdim=True)
+        index = torch.arange(K, device=logits.device)
+        mask = (torch.abs(argmax - index) <= soft_argmax_threshold).float()
+        probs = F.softmax(logits * softmax_temperature, dim=-1) * mask
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        return (probs * grid_values.to(probs.dtype)).sum(dim=-1)
 
     def forward(self, scene_features, query_embeds, rays, mode_idx):
         """
@@ -812,19 +876,53 @@ class Decoder(nn.Module):
             x = x + self.mlps[layer_idx](self.norm2s[layer_idx](x, mode_idx))
 
         m = mode_idx.item()
-        if self.output_mode == 'grid':
-            logits_3d = self.heads_3d[m](x)
-            prob_3d = F.softmax(logits_3d, dim=-1)
-            out_3d = (prob_3d @ self.grid_offsets_3d) * self.scale_3d
+        grid_logits = None
+        if self.is_grid:
+            # Per-axis marginal soft-argmax over fixed bins, mirroring TrackerTapNext.
+            # The decoded values carry their own metric magnitude, so the learnable
+            # scale_3d/scale_2d/scale_depth are bypassed. Raw bin logits are returned
+            # for the cross-entropy supervision in losses.py.
+            G = self.head_3d_grid_size
+            raw_3d = self.heads_3d[m](x)                                    # (..., 3G)
+            logits_3d = rearrange(raw_3d, '... (d k) -> ... d k', d=3, k=G)  # (..., 3, G)
+            out_3d = self._grid_decode(logits_3d, self.grid_1d)            # (..., 3)
+
+            logits_depth = self.heads_depth[m](x)                          # (..., G)
+            # decode log-depth then exp -> normalized depth (>0); tracker_encoder
+            # multiplies by cube_scale [* f_eff] and must NOT softplus this.
+            out_depth = torch.exp(self._grid_decode(logits_depth, self.depth_grid))[..., None]
+
+            raw_2d = self.heads_2d[m](x)                                    # (..., 2P) [x|y]
+            logits_2d_da = rearrange(raw_2d, '... (a p) -> ... a p', a=2, p=self.image_size)
+            out_2d = self._grid_decode(logits_2d_da, self.pix_grid)        # (..., 2) abs pixels
+
+            # Reshape from the flat (cams b)(t k) working layout to b t k cams ...,
+            # matching `output` below (tracker_encoder then moves cams to the front).
+            grid_logits = {
+                'logits_3d': rearrange(logits_3d, '(cams b) (t k) d g -> b t k cams d g',
+                                       cams=N_cams, b=B, t=T, k=K),     # (b,t,k,cams,3,G)
+                'logits_depth': rearrange(logits_depth, '(cams b) (t k) g -> b t k cams g',
+                                          cams=N_cams, b=B, t=T, k=K),  # (b,t,k,cams,G)
+                'logits_2d': rearrange(raw_2d, '(cams b) (t k) p -> b t k cams p',
+                                       cams=N_cams, b=B, t=T, k=K),     # (b,t,k,cams,2P)
+            }
         else:
-            scale_3d = self.scale_3d[m] if self.output_mode == 'resdirect' else self.scale_3d
-            out_3d = self.heads_3d[m](x) * scale_3d
-        out_2d      = self.heads_2d[m](x) * self.scale_2d
+            if self.log_3d_output:
+                # Continuous warp: value = signed_expm1(compressed head output). Clamp to
+                # c_range + fp32 keep expm1/its gradient bounded; scale_3d is dropped (eps
+                # sets the slope, the clamp the reach). Init head ~0 -> output 0 (parity).
+                cr = self.log_3d_c_range
+                out_3d = signed_expm1(self.heads_3d[m](x).clamp(-cr, cr), self.log_3d_eps).to(x.dtype)
+            else:
+                scale_3d = self.scale_3d[m] if self.output_mode == 'resdirect' else self.scale_3d
+                out_3d = self.heads_3d[m](x) * scale_3d
+            out_2d    = self.heads_2d[m](x) * self.scale_2d
+            out_depth = self.heads_depth[m](x) * self.scale_depth
         out_vis     = self.heads_vis[m](x)
         out_conf    = self.heads_conf[m](x)
-        out_depth   = self.heads_depth[m](x) * self.scale_depth
         out_conf_3d = self.heads_conf_3d[m](x)
         output = torch.cat([out_3d, out_2d, out_vis, out_conf, out_depth, out_conf_3d], dim=-1)
 
-        return rearrange(output, '(cams b) (t k) dim -> b t k cams dim',
-                         cams=N_cams, b=B, t=T, k=K)
+        output = rearrange(output, '(cams b) (t k) dim -> b t k cams dim',
+                           cams=N_cams, b=B, t=T, k=K)
+        return output, grid_logits

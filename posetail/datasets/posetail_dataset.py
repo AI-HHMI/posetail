@@ -356,6 +356,11 @@ class PosetailDataset(Dataset):
         self.enable_kpt_filtering = config.dataset[split].get('enable_kpt_filtering', False)
         self.query_anytime = config.dataset[split].get('query_anytime', False)
         self.query_edge_bias = config.dataset[split].get('query_edge_bias', 3.0)
+        # Causal masking (for the causal TAPNext tracker): NaN the trajectory
+        # target for frames before each point's query time so pre-query frames
+        # are excluded from the loss via the existing isfinite mask. Default off
+        # keeps TrackerEncoder behavior identical.
+        self.causal_masking = config.dataset[split].get('causal_masking', False)
         self.no_nan_coords = config.dataset[split].get('no_nan_coords', True)
 
         # 3D sphere subvolume crop augmentation
@@ -422,31 +427,45 @@ class PosetailDataset(Dataset):
         return len(self.metadata)
 
 
+    # max distinct samples to try within a single __getitem__ call before
+    # giving up and returning None (only hit if a dataset is genuinely empty)
+    GETITEM_MAX_RETRIES = 200
+
     def __getitem__(self, idx):
+        # The retry loop is LOCAL to this call: we track tried indices in a
+        # per-call `tried` set instead of mutating the persistent `good_index`.
+        # get_item_actual returns None for *stochastic* reasons (random camera
+        # subsampling, visibility/motion filters), which are NOT a property of the
+        # sample — retrying it on a future draw may well succeed. Permanently
+        # disabling such a sample (the old behaviour) silently drained small
+        # multiview datasets out of validation, since persistent_workers keep that
+        # state for the whole run. So we only clear good_index on a genuine load
+        # *exception* (corrupt/missing file); soft None rejections just retry.
+        tried = set()
         start = idx
-        out = None
-        while True:
-            if self.good_index[start]:
+        for _ in range(self.GETITEM_MAX_RETRIES):
+            if self.good_index[start] and start not in tried:
                 try:
                     out = self.get_item_actual(start)
+                    if out is not None:
+                        return out
+                    # soft rejection: leave good_index untouched, retry elsewhere
                 except Exception:
-                    out = None
-            if out is not None:
-                return out
+                    self.good_index[start] = False  # hard failure: disable permanently
+                    if np.sum(self.good_index) == 0:
+                        return None  # no valid samples anywhere
+            tried.add(start)
 
-            self.good_index[start] = False
-            if np.sum(self.good_index) == 0:
-                return None  # no valid samples anywhere
-
-            # prefer another good sample from the SAME dataset as the failed one
+            # prefer another good, not-yet-tried sample from the SAME dataset
             dataset = self.metadata['dataset'].values[start]
             same = self.dataset_indices[dataset]
-            good_same = same[self.good_index[same]]
+            good_same = [int(i) for i in same[self.good_index[same]] if int(i) not in tried]
             if len(good_same) > 0:
                 start = int(np.random.choice(good_same))
             else:
-                # this dataset is exhausted of good samples — fall back globally
+                # this dataset is exhausted for this call — fall back globally
                 start = np.random.randint(len(self.metadata))
+        return None
 
         
     def get_item_actual(self, idx):
@@ -804,7 +823,22 @@ class PosetailDataset(Dataset):
 
 
         # p2d = project_points_torch(cgroup, coords) # (cams, t, n_kpts, 2)
-        
+
+        # Causal masking: a point queried at frame `qt` is tracked forward only;
+        # NaN the trajectory target for t < qt so those frames drop out of every
+        # coordinate loss via the central isfinite mask. The query-frame coords
+        # (the model input, extracted at qt downstream) stay finite.
+        if self.causal_masking:
+            Tn = coords.shape[0]
+            # pre[t, n] = True for frames strictly before that point's query time
+            pre = torch.arange(Tn, device=coords.device)[:, None] < query_times[None, :].to(torch.long)
+            coords = coords.clone()
+            coords[pre] = float('nan')
+            if p2d is not None:
+                # p2d: (cams, t, n, 2)
+                p2d = p2d.clone()
+                p2d[:, pre] = float('nan')
+
         return views, coords, vis, fnums, cgroup, row, query_times, vis_2d, p2d
 
 
