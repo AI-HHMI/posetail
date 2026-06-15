@@ -205,18 +205,10 @@ def run(config_path, fabric):
     # leaving behavior unchanged. When the encoder is frozen this group simply
     # has nothing to update; it activates once unfreeze_video_encoder fires.
     encoder_lr_scale = config.training.optimizer.get('encoder_lr_scale', 1.0)
-    if encoder_lr_scale != 1.0:
-        encoder_param_ids = {id(p) for p in model.scene_encoder.encoder.parameters()}
-        encoder_params = [p for p in model.parameters() if id(p) in encoder_param_ids]
-        other_params = [p for p in model.parameters() if id(p) not in encoder_param_ids]
-        encoder_lr = lr * encoder_lr_scale
-        params = [{'params': other_params, 'lr': lr},
-                  {'params': encoder_params, 'lr': encoder_lr}]
-        if fabric.is_global_zero:
-            print(f"Discriminative LR enabled: encoder_lr_scale={encoder_lr_scale} "
-                  f"-> encoder lr={encoder_lr:.3e}, other lr={lr:.3e}")
-    else:
-        params = model.parameters()
+    params = build_optimizer_param_groups(model, config, base_lr=lr)
+    if encoder_lr_scale != 1.0 and fabric.is_global_zero:
+        print(f"Discriminative LR enabled: encoder_lr_scale={encoder_lr_scale} "
+              f"-> encoder lr={lr * encoder_lr_scale:.3e}, other lr={lr:.3e}")
 
     # set up optimizer
     if config.training.scheduler_type == 'schedulefree':
@@ -406,14 +398,14 @@ def run(config_path, fabric):
                            (i + 1 == iters_per_gpu))
 
         if checkpoint_cond and fabric.is_global_zero:
-            save_checkpoint(model, optimizer, prefix = exp_dir, i = global_i)
+            save_checkpoint(model, optimizer, prefix = exp_dir, i = global_i, config = config)
 
         train_loss.reset_history()
         val_loss.reset_history()
 
     # save checkpoint on interrupt
     if interrupted and fabric.is_global_zero:
-        save_checkpoint(model, optimizer, prefix = exp_dir, i = global_i)
+        save_checkpoint(model, optimizer, prefix = exp_dir, i = global_i, config = config)
 
     if fabric.is_global_zero:
         wandb.finish()

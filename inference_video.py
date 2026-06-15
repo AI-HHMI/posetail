@@ -557,16 +557,26 @@ def run_tracker_encoder_on_videos(
     }
 
 
-def load_tracker_encoder_checkpoint(checkpoint_path, model_kwargs, device=None):
+def load_tracker_encoder_checkpoint(checkpoint_path, model_kwargs, device=None,
+                                    config_path=None):
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    model = TrackerEncoder(**model_kwargs)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model = TrackerEncoder(**model_kwargs).to(device)
 
+    # When a config is available, route through load_checkpoint so schedule-free runs get the
+    # averaged EVAL weights (eval_weights defaults to 'auto' -> swaps since optimizer is None).
+    if config_path is not None:
+        load_checkpoint(config_path, checkpoint_path, model=model, device=device)
+        model.eval()
+        return model
+
+    # No config: fall back to a raw model_state load (uses raw training weights for schedule-free).
+    print('  [warn] no config_path given; loading raw model_state '
+          '(schedule-free averaged eval weights will NOT be applied)')
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint.get('model_state', checkpoint)
     model.load_state_dict(state_dict, strict=False)
-    model.to(device)
     model.eval()
 
     return model

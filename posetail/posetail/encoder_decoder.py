@@ -291,6 +291,16 @@ class QueryEncoder(nn.Module):
             nn.Linear(embed_dim * 4, decoder_dim),
         )
 
+    def _interp_time_embed(self, emb, times, n_frames):
+        """emb(times) with the learned time table linearly resized to n_frames first, so clips
+        longer/shorter than the trained n_frames work (the table is a 1-D position encoding over
+        frames). Backward-compatible no-op when n_frames == the stored table size."""
+        if n_frames == emb.num_embeddings:
+            return emb(times)
+        w = F.interpolate(emb.weight.t().unsqueeze(0), size=n_frames,
+                          mode='linear', align_corners=False).squeeze(0).t()
+        return F.embedding(times, w)
+
     def forward(self, preprocessed_views, camera_group,
                 query_coords, query_time, target_time,
                 cube_scale):
@@ -371,10 +381,12 @@ class QueryEncoder(nn.Module):
         embed_patch = rearrange(embed_flat, '(cams b t) d -> b t cams d',
                                 cams=n_cams, b=B, t=T_query)
 
-        # Time embeddings (shared)
-        embed_query_time  = repeat(self.t_query_embed(query_time),
+        # Time embeddings (shared). Resize the learned time tables to the actual clip length so
+        # n_frames can differ from training (no-op when it matches).
+        n_frames_cur = preprocessed_views[0].shape[1]
+        embed_query_time  = repeat(self._interp_time_embed(self.t_query_embed, query_time, n_frames_cur),
                                    'b t d -> b t cams d', cams=n_cams)
-        embed_target_time = repeat(self.t_target_embed(target_time),
+        embed_target_time = repeat(self._interp_time_embed(self.t_target_embed, target_time, n_frames_cur),
                                    'b t d -> b t cams d', cams=n_cams)
 
         # Depth, visibility, volume: computed for 3D; missing tokens for 2D
@@ -489,6 +501,14 @@ class SceneRepresentation(nn.Module):
         )
         nn.init.trunc_normal_(self.pos_embed, mean=0.0, std=0.02, a=-2 * 0.02, b=2 * 0.02)
 
+        # Canonical (T',H',W') grid the pos_embed param was allocated for. forward()
+        # trilinearly interpolates the pos_embed to the actual input grid when they differ, so
+        # n_frames / image_size can change at finetune/inference WITHOUT resizing the parameter
+        # (checkpoints still load; identity / no-op when the grids match -> backward-compatible).
+        self._pe_grid = (n_frames // self.tubelet_size,
+                         image_size // self.patch_size,
+                         image_size // self.patch_size)
+
         if decoder_dim is not None:
             in_dim = self.embed_dim
 
@@ -555,6 +575,17 @@ class SceneRepresentation(nn.Module):
 
         self.freeze_encoder = not requires_grad
 
+    def _pos_embed_for(self, gT, gH, gW):
+        """pos_embed resized to grid (gT,gH,gW): trilinear interp over time+space when the
+        requested grid differs from the stored one, identity otherwise (backward-compatible)."""
+        sT, sH, sW = self._pe_grid
+        if (gT, gH, gW) == (sT, sH, sW):
+            return self.pos_embed
+        D = self.pos_embed.shape[-1]
+        pe = self.pos_embed.reshape(1, sT, sH, sW, D).permute(0, 4, 1, 2, 3)
+        pe = F.interpolate(pe, size=(gT, gH, gW), mode='trilinear', align_corners=False)
+        return pe.permute(0, 2, 3, 4, 1).reshape(1, gT * gH * gW, D)
+
     def forward(self, views):
         """
         Args:
@@ -568,7 +599,10 @@ class SceneRepresentation(nn.Module):
         for view in views:
             xr = rearrange(view, 'b t c h w -> b c t h w')
             feat = self.encoder(xr)  # [B, n_tokens, embed_dim]
-            feat = feat + self.pos_embed
+            gT = view.shape[1] // self.tubelet_size
+            gH = view.shape[3] // self.patch_size
+            gW = view.shape[4] // self.patch_size
+            feat = feat + self._pos_embed_for(gT, gH, gW)
             if self.kv_proj is not None:
                 if self.pre_norms is not None:
                     chunks = torch.chunk(feat, self.n_proj_levels, dim=-1)

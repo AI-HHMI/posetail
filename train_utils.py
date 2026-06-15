@@ -20,8 +20,10 @@ from posetail.datasets.utils import safe_make
 from posetail.posetail.cube import get_camera_scale
 from posetail.posetail.eval_metrics import get_eval_metrics
 from posetail.posetail.losses import get_vis_true, unroll_batch, normalize_by_mean_depth
-from posetail.posetail.tracker import Tracker 
+from posetail.posetail.tracker import Tracker
 from posetail.posetail.tracker_encoder import TrackerEncoder
+
+from schedulefree import AdamWScheduleFree
 
 from einops import rearrange
 
@@ -96,26 +98,143 @@ def write_json(json_path, results):
         json_file.write(json.dumps(results) + '\n')
 
 
-def save_checkpoint(model, optimizer, prefix, i): 
+def build_optimizer_param_groups(model, config, base_lr):
+    """Build the optimizer param list for `model`, matching the structure used in train.py.
+
+    When `encoder_lr_scale != 1.0` the (pretrained) video encoder gets its own param group at a
+    scaled LR, producing a 2-group optimizer. This grouping MUST be reproduced verbatim when
+    reconstructing an optimizer to load a saved `optimizer_state` (e.g. for the schedule-free
+    eval-weight swap), otherwise `load_state_dict` fails on a param-group mismatch. Returns
+    `model.parameters()` for the default single-group case."""
+    encoder_lr_scale = config.training.optimizer.get('encoder_lr_scale', 1.0)
+    if encoder_lr_scale != 1.0 and hasattr(model, 'scene_encoder'):
+        encoder_param_ids = {id(p) for p in model.scene_encoder.encoder.parameters()}
+        encoder_params = [p for p in model.parameters() if id(p) in encoder_param_ids]
+        other_params = [p for p in model.parameters() if id(p) not in encoder_param_ids]
+        return [{'params': other_params, 'lr': base_lr},
+                {'params': encoder_params, 'lr': base_lr * encoder_lr_scale}]
+    return model.parameters()
+
+
+def apply_eval_weights(model, checkpoint, config, device):
+    """Swap `model`'s params in place to the schedule-free *averaged* (eval) weights.
+
+    The saved `model_state` holds the raw training weights; the averaged weights only exist
+    inside the optimizer state. This reconstructs the schedule-free optimizer, loads the saved
+    `optimizer_state`, and calls `.eval()` (which swaps the model's own parameter tensors in
+    place). No-op (returns False) when the run is not schedule-free or `optimizer_state` is
+    absent, and falls back gracefully (warn, return False) on any reconstruction error so an
+    inference load never crashes."""
+    if config.training.get('scheduler_type', None) != 'schedulefree':
+        return False
+    optimizer_state = checkpoint.get('optimizer_state', None)
+    if optimizer_state is None:
+        return False
+    try:
+        params = build_optimizer_param_groups(model, config, base_lr=1e-4)
+        opt = AdamWScheduleFree(params, lr=1e-4)
+        opt.load_state_dict(optimizer_state)
+        for state in opt.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+        opt.eval()
+        return True
+    except Exception as e:
+        print(f'  [warn] could not apply schedule-free eval-weight swap ({e}); '
+              f'using raw model_state weights')
+        return False
+
+
+def save_checkpoint(model, optimizer, prefix, i, config = None):
 
     checkpoint_dir = safe_make(os.path.join(prefix, 'checkpoints'))
 
-    checkpoint_path = os.path.join(checkpoint_dir, 
+    checkpoint_path = os.path.join(checkpoint_dir,
         f'checkpoint_{str(i).zfill(8)}.pth')
-    
+
     state_dict = {
         'iteration': i,
         'model_state': model.state_dict(),
         'optimizer_state': optimizer.state_dict(),
     }
 
+    # For schedule-free runs, also bake the averaged (eval) weights into the checkpoint so
+    # downstream inference can use them without reconstructing the optimizer. model_state above is
+    # captured first (raw training weights); we then swap to eval weights, snapshot, and restore
+    # train mode unconditionally (this also fixes the pre-existing nondeterminism where the save
+    # could land on a val iteration with the optimizer already in eval mode).
+    if config is not None and config.training.get('scheduler_type', None) == 'schedulefree':
+        sf = optimizer.optimizer if hasattr(optimizer, 'optimizer') else optimizer
+        sf.eval()
+        state_dict['model_state_eval'] = {k: v.detach().cpu().clone()
+                                          for k, v in model.state_dict().items()}
+        sf.train()
+
     torch.save(state_dict, checkpoint_path)
 
 
-def load_checkpoint(config_path, checkpoint_path, model = None, 
-                    optimizer = None, device = None):
+def _interp_res_params(param_dict, model):
+    """Backward-compatible load-time interpolation of the few resolution-dependent params of
+    TrackerEncoder, so a checkpoint trained at one image_size can be loaded into a model
+    configured at another (e.g. 256 -> 384 to finetune at higher resolution for finer features).
+    No-op for every tensor whose shape already matches; only the known res-coupled tensors
+    (encoder pos_embed, decoder heads_2d, pix_grid buffer) are touched on a shape mismatch."""
+    import math
+    import torch.nn.functional as F
+    msd = model.state_dict()
+    out = dict(param_dict)
+    changed = False
+    for k, v in list(param_dict.items()):
+        if k not in msd or tuple(msd[k].shape) == tuple(v.shape):
+            continue
+        changed = True
+        tgt = msd[k]
+        if k.endswith('scene_encoder.pos_embed'):
+            # [1, T'*H'*W', D] grid; interpolate spatially (and temporally) to the model's grid.
+            sT, sH, sW = model.scene_encoder._pe_grid
+            D = v.shape[-1]; old_n = v.shape[1]
+            oldHW = int(round(math.sqrt(old_n / sT)))   # n_frames (=> T') assumed unchanged
+            if sT * oldHW * oldHW != old_n:
+                continue
+            pe = v.reshape(1, sT, oldHW, oldHW, D).permute(0, 4, 1, 2, 3).float()
+            pe = F.interpolate(pe, size=(sT, sH, sW), mode='trilinear', align_corners=False)
+            out[k] = pe.permute(0, 2, 3, 4, 1).reshape(1, sT * sH * sW, D).to(v.dtype)
+            print(f'  res-interp {k}: {tuple(v.shape)} -> {tuple(out[k].shape)}')
+        elif 'heads_2d' in k and k.endswith('.1.weight'):
+            # Linear out = 2*image_size logits ([x|y] x P bins); resample the P-bin dim.
+            oldP = v.shape[0] // 2; newP = tgt.shape[0] // 2; D = v.shape[1]
+            w = v.reshape(2, oldP, D).permute(0, 2, 1).float()      # [2, D, oldP]
+            w = F.interpolate(w, size=newP, mode='linear', align_corners=False)
+            out[k] = w.permute(0, 2, 1).reshape(2 * newP, D).to(v.dtype)
+            print(f'  res-interp {k}: {tuple(v.shape)} -> {tuple(out[k].shape)}')
+        elif 'heads_2d' in k and k.endswith('.1.bias'):
+            oldP = v.shape[0] // 2; newP = tgt.shape[0] // 2
+            b = v.reshape(2, oldP).unsqueeze(1).float()             # [2, 1, oldP]
+            b = F.interpolate(b, size=newP, mode='linear', align_corners=False)
+            out[k] = b.squeeze(1).reshape(2 * newP).to(v.dtype)
+            print(f'  res-interp {k}: {tuple(v.shape)} -> {tuple(out[k].shape)}')
+        elif k.endswith('pix_grid'):
+            out.pop(k)   # deterministic buffer (arange(image_size)); keep the model's own
+            print(f'  res-interp drop {k} (recomputed buffer)')
+    return out, changed
 
-    config = load_config(config_path) 
+
+def load_checkpoint(config_path, checkpoint_path, model = None,
+                    optimizer = None, device = None, eval_weights = 'auto'):
+    """Load a checkpoint into a model (and optionally an optimizer for resuming training).
+
+    eval_weights controls whether the schedule-free *averaged* (eval) weights are applied
+    instead of the raw training weights stored in `model_state`:
+      - 'auto' (default): apply eval weights iff `optimizer is None` (the inference/eval path).
+        When an optimizer is passed (train.py resume/finetune), never swap -- training must
+        continue from the raw weights and reloaded optimizer state.
+      - True: always apply eval weights.
+      - False: never apply eval weights (raw training weights; useful for debugging / smoke tests).
+    Prefers a baked `model_state_eval` snapshot when present; otherwise reconstructs the
+    optimizer to swap (works retroactively on older checkpoints)."""
+
+    config = load_config(config_path)
 
     # configure device
     if device is None: 
@@ -138,11 +257,31 @@ def load_checkpoint(config_path, checkpoint_path, model = None,
     checkpoint = torch.load(checkpoint_path, map_location = device)
     param_dict = checkpoint['model_state']
 
+    # interpolate resolution-dependent params if the checkpoint was trained at a different
+    # image_size (no-op when shapes already match -> backward-compatible)
+    param_dict, res_changed = _interp_res_params(param_dict, model)
+
     missing_keys, unexpected_keys = model.load_state_dict(param_dict, strict = False)
     print(f'received missing keys: {missing_keys}')
     print(f'received unexpected keys: {unexpected_keys}')
 
     checkpoint_dict = {'model': model}
+
+    # apply schedule-free averaged (eval) weights for the inference/eval path. Skip entirely when
+    # resolution interpolation changed any tensor shape: the optimizer's averaged buffers / baked
+    # snapshot are at the original resolution and would shape-mismatch the interpolated params.
+    do_swap = (eval_weights is True) or (eval_weights == 'auto' and optimizer is None)
+    if do_swap and res_changed:
+        print('  [warn] resolution-interp changed param shapes; skipping eval-weight swap '
+              '(using interpolated raw model_state)')
+    elif do_swap:
+        eval_param_dict = checkpoint.get('model_state_eval', None)
+        if eval_param_dict is not None:
+            # baked fast path: no optimizer reconstruction needed
+            eval_param_dict, _ = _interp_res_params(eval_param_dict, model)
+            model.load_state_dict(eval_param_dict, strict = False)
+        else:
+            apply_eval_weights(model, checkpoint, config, device)
 
     # continue training 
     if optimizer is not None: 
