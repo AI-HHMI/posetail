@@ -448,10 +448,47 @@ class QueryEncoder(nn.Module):
         return self.fusion_mlp(combined_embed)
 
 
+class DeltaEncoder(nn.Module):
+    """Small high-res CNN that predicts a RESIDUAL added to the (frozen) VJEPA scene features --
+    a Delta-DINO-style fine-feature branch:  scene = scene_vjepa + delta(views).
+
+    The frozen VJEPA's 16px patch embedding caps spatial resolution (the kubric lever); this conv
+    branch sees full-res RGB and encodes fine sub-patch detail, WITHOUT finetuning the big encoder.
+    Per-frame 2D convs downsample by patch_size to the VJEPA spatial token grid; frames are averaged
+    within tubelets to match the temporal token count; the output projection is ZERO-INITIALIZED so
+    the branch starts as a no-op (residual 0 == identical to the current model -> backward-compatible).
+    It can also be fed higher-resolution views than the encoder (the convs adapt-pool to gH x gW)."""
+
+    def __init__(self, out_dim, patch_size, tubelet_size, in_ch=3, hidden=(64, 128, 256)):
+        super().__init__()
+        self.tubelet_size = tubelet_size
+        n_down = max(1, int(round(math.log2(patch_size))))  # 16px patch -> 4 stride-2 convs
+        chans = (list(hidden) + [hidden[-1]] * n_down)[:n_down]
+        layers, c = [], in_ch
+        for oc in chans:
+            layers += [nn.Conv2d(c, oc, 3, stride=2, padding=1), nn.GroupNorm(8, oc), nn.GELU()]
+            c = oc
+        self.convs = nn.Sequential(*layers)
+        self.norm = nn.LayerNorm(c)
+        self.proj = nn.Linear(c, out_dim)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, view, gT, gH, gW):
+        # view: [B, T, C, H, W] -> residual [B, gT*gH*gW, out_dim] in the VJEPA (gT,gH,gW) token order
+        B, T, C, H, W = view.shape
+        x = self.convs(view.reshape(B * T, C, H, W))              # [B*T, c, ~H/ps, ~W/ps]
+        x = F.adaptive_avg_pool2d(x, (gH, gW))                    # align spatially -> [B*T, c, gH, gW]
+        x = x.reshape(B, gT, self.tubelet_size, x.shape[1], gH, gW).mean(2)  # tubelet temporal pool
+        x = rearrange(x, 'b gt c gh gw -> b (gt gh gw) c')
+        return self.proj(self.norm(x))                           # [B, n_tokens, out_dim]
+
+
 class SceneRepresentation(nn.Module):
     def __init__(self, version='large', freeze_encoder=True, n_frames=16, image_size=256,
                  hierarchical_features=True, decoder_dim=None,
-                 video_encoder_finetune_last_n_layers=None):
+                 video_encoder_finetune_last_n_layers=None,
+                 use_delta_encoder=False, delta_hidden=(64, 128, 256)):
         super().__init__()
 
         # Initialize encoder
@@ -518,6 +555,10 @@ class SceneRepresentation(nn.Module):
             self.kv_proj = None
             self.kv_norm = None
 
+        # Delta-DINO-style fine-feature residual branch (added to the final scene feature dim).
+        self.delta_encoder = DeltaEncoder(self.embed_dim, self.patch_size, self.tubelet_size,
+                                          hidden=tuple(delta_hidden)) if use_delta_encoder else None
+
     def set_encoder_requires_grad(self, requires_grad):
         """Toggle gradients for the underlying video encoder, e.g. to unfreeze
         it partway through training. When finetune_last_n_layers is set and
@@ -570,9 +611,15 @@ class SceneRepresentation(nn.Module):
             gH = view.shape[3] // self.patch_size
             gW = view.shape[4] // self.patch_size
             feat = feat + self._pos_embed_for(gT, gH, gW)
+            # Add the zero-init fine-feature residual BEFORE kv_norm so the LayerNorm re-normalizes
+            # the sum (scale-controlled -> gentler on the pretrained decoder). Same token layout.
             if self.kv_proj is not None:
                 feat = self.kv_proj(feat)
+                if self.delta_encoder is not None:
+                    feat = feat + self.delta_encoder(view, gT, gH, gW)
                 feat = self.kv_norm(feat)
+            elif self.delta_encoder is not None:
+                feat = feat + self.delta_encoder(view, gT, gH, gW)
             encoded_list.append(feat)
         encoded = torch.stack(encoded_list)  # [cams, B, n_tokens, embed_dim]
 

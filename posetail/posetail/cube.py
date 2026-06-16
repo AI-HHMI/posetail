@@ -88,8 +88,14 @@ def project_cam(cam, p3d_t, downsample_factor = 1, max_normalized = 3.0):
     dist = cam['dist']
     cam_type = cam['type'] # pinhole, fisheye # TODO: implement functionality for different camera types
 
-    p2d_proj_raw = torch.matmul(to_homogeneous(p3d_t), ext_t.T)
-    p2d_proj_raw = from_homogeneous(p2d_proj_raw[..., :3])
+    p2d_proj_cam = torch.matmul(to_homogeneous(p3d_t), ext_t.T)[..., :3]
+    # Clamp the projective depth magnitude (sign-preserving) before the perspective division so
+    # its gradient stays bounded; near-zero predicted depth otherwise spikes reprojection grads
+    # (the reason rays_reproj was disabled). Only affects degenerate near-camera points -> valid
+    # points (depth O(1+)) are unchanged.
+    z = p2d_proj_cam[..., 2:3]
+    z_safe = torch.where(z < 0, -1.0, 1.0) * z.abs().clamp(min=1e-2)
+    p2d_proj_raw = p2d_proj_cam[..., :2] / z_safe
 
     # handle points way outside of the frame
     p2d_proj_raw = torch.clamp(p2d_proj_raw, -max_normalized, max_normalized)
@@ -221,20 +227,33 @@ def triangulate_simple_batch_reg(points, camera_mats, weights):
     
     A = rearrange([eq_x, eq_y], 'two n c 1 j -> n (c two) j')
     
-    # Use eigendecomposition of A^T A instead of SVD
-    # This is more numerically stable for gradients
+    # Use eigendecomposition of A^T A instead of SVD: more numerically stable for gradients.
     ATA = torch.bmm(A.transpose(-2, -1), A)
-    
-    # Add small regularization
-    eps = 1e-6
+
+    # Regularize so the smallest eigenvalues are separated from 0 (eigh's iterative solver fails
+    # to converge on ill-conditioned / repeated-eigenvalue ATA, e.g. near-zero-confidence or
+    # degenerate-geometry points). eye*I preserves eigenvectors (adds a constant to all
+    # eigenvalues), so it does not change the solution.
+    eps = 1e-4
     ATA = ATA + eps * torch.eye(4, device=A.device, dtype=A.dtype)
-    
-    # Smallest eigenvalue's eigenvector
-    eigenvalues, eigenvectors = torch.linalg.eigh(ATA)
-    p3d_homogeneous = eigenvectors[:, :, 0]  # eigenvector for smallest eigenvalue
-    
-    p3d = from_homogeneous(p3d_homogeneous)
-    
+
+    try:
+        eigenvalues, eigenvectors = torch.linalg.eigh(ATA)
+        p3d_homogeneous = eigenvectors[:, :, 0]  # eigenvector for smallest eigenvalue (unit norm)
+    except Exception:
+        # eigh failed to converge on a degenerate batch element -> fall back to SVD of A (its
+        # forward never fails). Rare; the affected points are degenerate anyway.
+        _, _, vh = torch.linalg.svd(A)
+        p3d_homogeneous = vh[:, -1, :]
+
+    # Clamp the homogeneous scale (sign-preserving, min 1e-2) before dividing. The eigenvector is
+    # unit-norm, so a near-zero 4th coord (degenerate / early-training geometry, point near
+    # infinity) makes the triangulated point blow up -> huge loss/grad. Valid points have w ~ O(0.1)
+    # so they're unchanged; this just bounds the degenerate tail (point magnitude <= ~100).
+    w = p3d_homogeneous[:, 3:4]
+    w_safe = torch.where(w < 0, -1.0, 1.0) * w.abs().clamp(min=1e-2)
+    p3d = p3d_homogeneous[:, :3] / w_safe
+
     return p3d
 
 

@@ -99,6 +99,37 @@ def parse_args():
 
     return args
 
+def make_run_note(config):
+    """Auto-generate a short wandb note (~2-6 words) summarizing the run's recipe, so every
+    run is labeled in the wandb UI without a manual step. Backward-compatible: returns None
+    (no note) if anything is missing/unexpected."""
+    try:
+        o = config.training.optimizer
+        parts = []
+        if o.get('muon_schedulefree'):
+            parts.append('SF-Muon')
+        elif o.get('scheduler_type') == 'muon':
+            parts.append('Muon')
+        else:
+            parts.append('AdamW')
+        enc = o.get('encoder_lr_scale', 1.0)
+        parts.append(f'enc{enc:g}')
+        wd = o.get('weight_decay')
+        if wd is not None and float(wd) != 0.01:  # 0.01 is the common default; only note deviations
+            parts.append(f'wd{float(wd):g}')
+        wu = o.get('muon_warmup_steps', 0)
+        if wu:
+            parts.append(f'wu{int(wu)}')
+        try:
+            excl = [d for d in (config.dataset.get('datasets_to_exclude', []) or []) if d != 'johnson-fly']
+        except Exception:
+            excl = []
+        if excl:
+            parts.append('excl-' + '+'.join(s.split('-')[0] for s in excl))
+        return ' '.join(parts) or None
+    except Exception:
+        return None
+
 def run(config_path, fabric):
 
     # mp.set_start_method('spawn', force = True)
@@ -171,6 +202,7 @@ def run(config_path, fabric):
             project = config.wandb.project_name,
             dir = config.wandb.path,
             mode = config.wandb.mode,
+            notes = make_run_note(config),
             config = config)
 
     exp_dir = ''
@@ -211,7 +243,75 @@ def run(config_path, fabric):
               f"-> encoder lr={lr * encoder_lr_scale:.3e}, other lr={lr:.3e}")
 
     # set up optimizer
-    if config.training.scheduler_type == 'schedulefree':
+    if config.training.scheduler_type == 'muon':
+        # Official torch.optim.Muon (orthogonalized momentum) on the 2D transformer matrices of the
+        # decoder AND the encoder blocks; AdamW on everything else (heads/embeddings/norms/biases/
+        # query-encoder + the kubric-critical patch_embed[5D]/pos_embed[3D], which aren't 2D anyway).
+        # match_rms_adamw scaling makes Muon REUSE the AdamW lr. Two optimizers wrapped as one.
+        from torch.optim import Muon as TorchMuon
+        from posetail.posetail.muon import DualOptimizer
+        adj = config.training.optimizer.get('muon_adjust_lr_fn', 'match_rms_adamw')
+        muon_scale = config.training.optimizer.get('muon_lr_scale', 1.0)
+        wd = config.training.optimizer.weight_decay
+        dec_substr = ('decoder.cross_attns', 'decoder.mlps', 'decoder.camera_attns',
+                      'decoder.temporal_attns')
+        scene_ids = {id(p) for p in model.scene_encoder.parameters()} \
+            if hasattr(model, 'scene_encoder') else set()
+        muon_dec, muon_enc, adamw_slow, adamw_base = [], [], [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            is2d = (p.ndim == 2 and name.endswith('.weight'))
+            if is2d and 'scene_encoder.encoder.blocks' in name:
+                muon_enc.append(p)
+            elif is2d and any(s in name for s in dec_substr):
+                muon_dec.append(p)
+            elif id(p) in scene_ids:
+                adamw_slow.append(p)
+            else:
+                adamw_base.append(p)
+        muon_groups = [{'params': muon_dec, 'lr': lr * muon_scale, 'weight_decay': wd}]
+        if muon_enc:
+            muon_groups.append({'params': muon_enc, 'lr': lr * encoder_lr_scale, 'weight_decay': wd})
+        adamw_groups = [{'params': adamw_base, 'lr': lr, 'weight_decay': wd}]
+        if adamw_slow:
+            adamw_groups.append({'params': adamw_slow, 'lr': lr * encoder_lr_scale, 'weight_decay': wd})
+        if fabric.is_global_zero:
+            print(f"Muon ({adj}): dec {len(muon_dec)} @ {lr*muon_scale:.2e} | enc {len(muon_enc)} @ "
+                  f"{lr*encoder_lr_scale:.2e} | adamw_base {len(adamw_base)} @ {lr:.2e} | adamw_slow "
+                  f"{len(adamw_slow)} @ {lr*encoder_lr_scale:.2e}")
+        # muon_schedulefree: wrap Muon in the official ScheduleFreeWrapper (schedule-free averaging
+        # on top of orthogonalized momentum) + AdamWScheduleFree for the rest -- the apples-to-apples
+        # comparison vs the AdamW-schedule-free baseline, and the best-of-both (Muon geometry + SF avg).
+        sf = config.training.optimizer.get('muon_schedulefree', False)
+        warmup = total_to_per_gpu(config.training.optimizer.get('warmup_steps', 0), fabric.world_size)
+        if fabric.is_global_zero:
+            print(f"  muon_schedulefree={sf}")
+        if sf:
+            # ScheduleFreeWrapper isn't an Optimizer subclass, so fabric.setup the BASE Muon first,
+            # then wrap it. AdamWScheduleFree IS an Optimizer subclass -> setup normally.
+            from schedulefree import ScheduleFreeWrapper  # AdamWScheduleFree imported at top (line 53)
+            base_muon = TorchMuon(muon_groups, lr=lr, weight_decay=0.0,
+                                  momentum=config.training.optimizer.get('muon_momentum', 0.95),
+                                  adjust_lr_fn=adj)
+            opt_adam = AdamWScheduleFree(adamw_groups, lr=lr, weight_decay=wd, warmup_steps=warmup,
+                                         betas=(config.training.optimizer.get('beta1', 0.9),
+                                                config.training.optimizer.get('beta2', 0.999)))
+            base_muon, opt_adam = fabric.setup_optimizers(base_muon, opt_adam)
+            opt_muon = ScheduleFreeWrapper(base_muon, momentum=0.9, weight_decay_at_y=wd)
+        else:
+            opt_muon = TorchMuon(muon_groups, lr=lr, weight_decay=wd,
+                                 momentum=config.training.optimizer.get('muon_momentum', 0.95),
+                                 adjust_lr_fn=adj)
+            opt_adam = torch.optim.AdamW(adamw_groups, lr=lr, weight_decay=wd,
+                                         betas=(config.training.optimizer.get('beta1', 0.9),
+                                                config.training.optimizer.get('beta2', 0.95)))
+            opt_muon, opt_adam = fabric.setup_optimizers(opt_muon, opt_adam)
+        optimizer = DualOptimizer(opt_muon, opt_adam,
+                                  muon_warmup_steps=total_to_per_gpu(
+                                      config.training.optimizer.get('muon_warmup_steps', 0),
+                                      fabric.world_size))
+    elif config.training.scheduler_type == 'schedulefree':
         warmup_steps = total_to_per_gpu(
             config.training.optimizer.get('warmup_steps', 0),
             fabric.world_size)
@@ -231,7 +331,9 @@ def run(config_path, fabric):
             amsgrad=config.training.optimizer.amsgrad,
             fused=True)
 
-    optimizer = fabric.setup_optimizers(optimizer)
+    # DualOptimizer (muon) sets up its two inner optimizers via fabric internally; others here.
+    if not hasattr(optimizer, '_opts'):
+        optimizer = fabric.setup_optimizers(optimizer)
 
     # optionally load a model checkpoint 
     checkpoint_path = config.training.get('checkpoint_path', None)
