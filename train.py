@@ -225,29 +225,57 @@ def run(config_path, fabric):
                       'decoder.temporal_attns')
         scene_ids = {id(p) for p in model.scene_encoder.parameters()} \
             if hasattr(model, 'scene_encoder') else set()
-        muon_dec, muon_enc, adamw_slow, adamw_base = [], [], [], []
+        # Per-encoder-param LR scale (on top of encoder_lr_scale). Two optional, BACKWARD-COMPATIBLE
+        # knobs (both default to the no-op value, leaving every encoder param at encoder_lr_scale):
+        #   encoder_llrd_gamma (default 1.0): layer-wise LR decay -- block i gets
+        #     encoder_lr_scale * gamma^(n_blocks-1-i), so top blocks adapt and early blocks stay near
+        #     pretrained (standard ViT-finetune trick; gamma 0.65-0.8 typical).
+        #   patch_embed_lr_scale (default 1.0): a SEPARATE multiplier for patch_embed/pos_embed. These
+        #     are the kubric-resolution lever (the 16px patch-embedding), but they're the BOTTOM of the
+        #     net so LLRD would crush them -- carving them out lets us push them UP independently.
+        import re as _re
+        n_enc_blocks = len(model.scene_encoder.encoder.blocks) if (
+            hasattr(model, 'scene_encoder') and hasattr(model.scene_encoder, 'encoder')
+            and hasattr(model.scene_encoder.encoder, 'blocks')) else 0
+        llrd_gamma = config.training.optimizer.get('encoder_llrd_gamma', 1.0)
+        pe_scale = config.training.optimizer.get('patch_embed_lr_scale', 1.0)
+        def _enc_scale(nm):
+            if 'patch_embed' in nm or 'pos_embed' in nm:
+                return encoder_lr_scale * pe_scale
+            m = _re.search(r'\.blocks\.(\d+)\.', nm)
+            if m and llrd_gamma != 1.0 and n_enc_blocks:
+                return encoder_lr_scale * (llrd_gamma ** (n_enc_blocks - 1 - int(m.group(1))))
+            return encoder_lr_scale
+        muon_dec, adamw_base = [], []
+        muon_enc_by_scale, adamw_slow_by_scale = {}, {}  # rounded lr-scale -> [params]
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
             is2d = (p.ndim == 2 and name.endswith('.weight'))
             if is2d and 'scene_encoder.encoder.blocks' in name:
-                muon_enc.append(p)
+                muon_enc_by_scale.setdefault(round(_enc_scale(name), 8), []).append(p)
             elif is2d and any(s in name for s in dec_substr):
                 muon_dec.append(p)
             elif id(p) in scene_ids:
-                adamw_slow.append(p)
+                adamw_slow_by_scale.setdefault(round(_enc_scale(name), 8), []).append(p)
             else:
                 adamw_base.append(p)
         muon_groups = [{'params': muon_dec, 'lr': lr * muon_scale, 'weight_decay': wd}]
-        if muon_enc:
-            muon_groups.append({'params': muon_enc, 'lr': lr * encoder_lr_scale, 'weight_decay': wd})
+        for sc, ps in sorted(muon_enc_by_scale.items()):
+            muon_groups.append({'params': ps, 'lr': lr * sc, 'weight_decay': wd})
         adamw_groups = [{'params': adamw_base, 'lr': lr, 'weight_decay': wd}]
-        if adamw_slow:
-            adamw_groups.append({'params': adamw_slow, 'lr': lr * encoder_lr_scale, 'weight_decay': wd})
+        for sc, ps in sorted(adamw_slow_by_scale.items()):
+            adamw_groups.append({'params': ps, 'lr': lr * sc, 'weight_decay': wd})
         if fabric.is_global_zero:
-            print(f"Muon ({adj}): dec {len(muon_dec)} @ {lr*muon_scale:.2e} | enc {len(muon_enc)} @ "
-                  f"{lr*encoder_lr_scale:.2e} | adamw_base {len(adamw_base)} @ {lr:.2e} | adamw_slow "
-                  f"{len(adamw_slow)} @ {lr*encoder_lr_scale:.2e}")
+            n_enc = sum(len(v) for v in muon_enc_by_scale.values())
+            n_slow = sum(len(v) for v in adamw_slow_by_scale.values())
+            enc_str = ', '.join(f'{lr*s:.2e}x{len(p)}' for s, p in sorted(muon_enc_by_scale.items()))
+            print(f"Muon ({adj}): dec {len(muon_dec)} @ {lr*muon_scale:.2e} | enc {n_enc} [{enc_str}] "
+                  f"| adamw_base {len(adamw_base)} @ {lr:.2e} | adamw_slow {n_slow}")
+            if llrd_gamma != 1.0 or pe_scale != 1.0:
+                slow_str = ', '.join(f'{lr*s:.2e}x{len(p)}' for s, p in sorted(adamw_slow_by_scale.items()))
+                print(f"  LLRD gamma={llrd_gamma} (n_blocks={n_enc_blocks}) | patch_embed_lr_scale={pe_scale}"
+                      f" | adamw_slow scales: {slow_str}")
         # muon_schedulefree: wrap Muon in the official ScheduleFreeWrapper (schedule-free averaging
         # on top of orthogonalized momentum) + AdamWScheduleFree for the rest -- the apples-to-apples
         # comparison vs the AdamW-schedule-free baseline, and the best-of-both (Muon geometry + SF avg).
