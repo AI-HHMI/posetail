@@ -99,37 +99,6 @@ def parse_args():
 
     return args
 
-def make_run_note(config):
-    """Auto-generate a short wandb note (~2-6 words) summarizing the run's recipe, so every
-    run is labeled in the wandb UI without a manual step. Backward-compatible: returns None
-    (no note) if anything is missing/unexpected."""
-    try:
-        o = config.training.optimizer
-        parts = []
-        if o.get('muon_schedulefree'):
-            parts.append('SF-Muon')
-        elif o.get('scheduler_type') == 'muon':
-            parts.append('Muon')
-        else:
-            parts.append('AdamW')
-        enc = o.get('encoder_lr_scale', 1.0)
-        parts.append(f'enc{enc:g}')
-        wd = o.get('weight_decay')
-        if wd is not None and float(wd) != 0.01:  # 0.01 is the common default; only note deviations
-            parts.append(f'wd{float(wd):g}')
-        wu = o.get('muon_warmup_steps', 0)
-        if wu:
-            parts.append(f'wu{int(wu)}')
-        try:
-            excl = [d for d in (config.dataset.get('datasets_to_exclude', []) or []) if d != 'johnson-fly']
-        except Exception:
-            excl = []
-        if excl:
-            parts.append('excl-' + '+'.join(s.split('-')[0] for s in excl))
-        return ' '.join(parts) or None
-    except Exception:
-        return None
-
 def run(config_path, fabric):
 
     # mp.set_start_method('spawn', force = True)
@@ -202,7 +171,6 @@ def run(config_path, fabric):
             project = config.wandb.project_name,
             dir = config.wandb.path,
             mode = config.wandb.mode,
-            notes = make_run_note(config),
             config = config)
 
     exp_dir = ''
