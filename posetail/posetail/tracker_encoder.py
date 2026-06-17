@@ -47,7 +47,10 @@ class TrackerEncoder(nn.Module):
                  depth_log_min = -2.5,
                  depth_log_max = 2.0,
                  f_eff_scale = False,
-                 use_delta_encoder = False):
+                 use_delta_encoder = False,
+                 soft_argmax_temperature = 0.5,
+                 soft_argmax_threshold = 20,
+                 soft_argmax_temperature_learnable = False):
         super().__init__()
 
         self.mode_3d = mode_3d
@@ -155,6 +158,9 @@ class TrackerEncoder(nn.Module):
             depth_log_max=depth_log_max,
             image_size=self.image_size,
             f_eff_scale=f_eff_scale,
+            soft_argmax_temperature=soft_argmax_temperature,
+            soft_argmax_threshold=soft_argmax_threshold,
+            soft_argmax_temperature_learnable=soft_argmax_temperature_learnable,
         )
 
     def unfreeze_video_encoder(self, iteration):
