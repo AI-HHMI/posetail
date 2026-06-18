@@ -21,6 +21,7 @@ class TrackerEncoder(nn.Module):
 
     def __init__(self, image_size = 256,
                  stride_length = 16, stride_overlap = None,
+                 unroll_windows = False,
                  video_encoder_version = 'giant',
                  video_encoder_requires_grad = False,
                  video_encoder_hierarchical = True,
@@ -60,10 +61,17 @@ class TrackerEncoder(nn.Module):
         self.image_size = image_size
 
         
-        if stride_overlap is None: 
+        if stride_overlap is None:
             self.stride_overlap = self.S // 2
         else:
-            self.stride_overlap = stride_overlap 
+            self.stride_overlap = stride_overlap
+
+        # Training-only: when windowing is active, carry cross-window state (re-anchored
+        # query + decoder latent) with the autograd graph connected (BPTT through the
+        # window chain) instead of detaching it. Default False = detached (cheap)
+        # variant. Inert at inference -- detach is a no-op without a backward, so
+        # predictions are identical either way.
+        self.unroll_windows = unroll_windows
         
         # encoder params
         # video_encoder_requires_grad may be a bool (freeze/unfreeze for the whole
@@ -189,7 +197,7 @@ class TrackerEncoder(nn.Module):
         print("  scene representation params: {:,d}".format(count_parameters(self.scene_encoder)))
         print("  decoder params: {:,d}".format(count_parameters(self.decoder)))
         
-    def forward(self, views, coords, camera_group, query_times=None):
+    def forward(self, views, coords, camera_group, query_times=None, init_latent=None):
         '''
         B: batch size
         T: number of frames in video
@@ -225,6 +233,7 @@ class TrackerEncoder(nn.Module):
         # world->pixels, leaving a leftover f_eff factor in the absolute-depth outputs; scaling
         # those by f_eff (~= scene depth Z) makes the head targets O(1) uniformly across datasets.
         # Gated on R==3 like cube_scale (the 2D-only path keeps cube_scale==1, so f_eff==1).
+        f_eff = None
         if self.f_eff_scale:
             if R == 3:
                 f_eff = torch.stack([
@@ -244,6 +253,8 @@ class TrackerEncoder(nn.Module):
         # the encoded camera positions origin- and focal-invariant and O(1) across
         # datasets, while preserving relative camera-rig geometry. Gated by config;
         # default off keeps the legacy cube_scale/200 normalization bit-identical.
+        scene_center = None
+        scene_radius = None
         if self.metric_ray_translation:
             centers_w = torch.stack([cam['center'] for cam in camera_group])  # (cams, 3)
             if R == 3:
@@ -269,6 +280,214 @@ class TrackerEncoder(nn.Module):
             frames = rearrange(frames, 'b t h w c -> b t c h w')
             frames = self.transform_norm(frames)
             views_norm.append(frames)
+
+        return self._forward_windows(
+            views_norm, coords, query_times, camera_group,
+            cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
+            init_latent=init_latent)
+
+    def _forward_windows(self, views_norm, coords, query_times, camera_group,
+                         cube_scale, cube_scale_shared, f_eff,
+                         scene_center, scene_radius, init_latent=None):
+        """Run the encoder/decoder over the clip, optionally as a sliding window.
+
+        When self.S >= T (window covers the whole clip) this is a single pass,
+        identical to the original non-windowed forward. Otherwise we slide a window
+        of length self.S with step (self.S - self.stride_overlap), re-anchoring each
+        new window's query on the previous window's prediction at the first frame of
+        the next window. That re-anchoring warm-starts each window from the previous
+        one's state and is what curbs long-horizon drift.
+
+        Tracking is forward-only: each track is seeded in the window containing its
+        query frame and propagated forward, so query_anytime queries land in-range
+        per window. Frames before a track's query frame are not produced and must be
+        dropped from the loss (causal_masking=true) when query_anytime=true; with all
+        queries at frame 0 this is moot and the path reduces to the original behavior.
+
+        Cross-window state (re-anchored query + carried latent) is detached by default,
+        so windowed training is the cheap variant (each window's backward is
+        independent, same memory as a single pass) yet still learns to use the carry.
+        Set unroll_windows=True to keep the graph connected across windows (BPTT through
+        the window chain) so the model also learns to produce good carry states; peak
+        memory then scales ~n_windows x.
+        """
+        device = coords.device
+        B, N, R = coords.shape
+        T = views_norm[0].shape[1]
+        S = self.S
+
+        # Window >= clip: single pass, bit-identical to the original forward.
+        # (prev_latent stays None -> latent_carry is a no-op; latent return discarded.)
+        if S >= T:
+            result, latent = self._forward_window(
+                views_norm, coords, query_times, camera_group,
+                cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
+                prev_latent=init_latent)
+            # Expose the latent so a caller can thread it into a following chunk
+            # (cross-chunk carry); harmless for the non-windowed model whose
+            # latent_carry is untrained (a no-op).
+            result['final_latent'] = latent
+            return result
+
+        stride_remainder = S - self.stride_overlap
+        assert stride_remainder >= 1, "stride_overlap must be < stride_length"
+        # ceil((T - S) / stride_remainder) + 1 windows to cover all T frames.
+        n_windows = (T - S + stride_remainder - 1) // stride_remainder + 1
+        T_full = stride_remainder * (n_windows - 1) + S
+        n_pad = T_full - T
+
+        # Pad the (already normalized) frames by repeating the last frame so the
+        # final window is full length; outputs are trimmed back to T at the end.
+        if n_pad > 0:
+            views_norm = [
+                torch.cat([v, v[:, -1:].expand(-1, n_pad, *([-1] * (v.dim() - 2)))], dim=1)
+                for v in views_norm
+            ]
+
+        # Frame (t) axis of every time-indexed output, used to stitch windows.
+        t_axis = {
+            'coords_pred': 1, '3d_pred_direct': 1, '3d_pred_rays': 1,
+            '3d_pred_triangulate': 1, 'vis_pred': 1, 'conf_pred': 1,
+            '3d_pred_cams_direct': 2, '3d_pred_cams_rays': 2, 'conf_3d': 2,
+            '2d_pred': 2, 'vis_pred_2d': 2, 'conf_pred_2d': 2, 'depth_pred': 2,
+            '2d_logits': 2,
+        }
+        grid_t_axis = {'logits_3d': 2, 'logits_depth': 2, 'anchor_local': 2}
+
+        def _put(store, key, src, axis, start, full):
+            # Write a window's output slice into the full-length accumulator across
+            # many keys with non-uniform time axes: lazily allocate the full-length
+            # output on first sight, then write this window's slice. Later windows
+            # overwrite earlier ones in the overlap region.
+            if src is None:
+                store[key] = None
+                return
+            if store.get(key) is None:
+                shape = list(src.shape)
+                shape[axis] = full
+                store[key] = src.new_zeros(shape)
+            idx = [slice(None)] * src.dim()
+            idx[axis] = slice(start, start + src.shape[axis])
+            store[key][tuple(idx)] = src
+
+        acc = {}
+        q = query_times                 # (B, N) absolute query-frame index per track
+        reanchor = None                 # (B, N, R) predicted coords at this window's first frame
+        carry = init_latent             # (B, S, N, cams, D) carried latent; init_latent threads
+                                        # state in from a previous chunk (cross-chunk carry)
+        for w in range(n_windows):
+            ix = stride_remainder * w
+            before = q < ix                       # (B, N) track appeared in an earlier window
+            in_win = (q >= ix) & (q < ix + S)     # query frame lands in this window (seed here)
+
+            # Per-track forward-only seeding: a track tracked from an earlier window is
+            # re-anchored on the carried prediction; a track whose query frame is in (or
+            # still after) this window uses its original query. Query time is the
+            # in-window offset for seeds, else 0. Tracks whose query frame is after this
+            # window are placeholders -- their pre-query frames are dropped by the loss
+            # (requires causal_masking). Reduces exactly to the uniform frame-0 case
+            # when every query is at frame 0.
+            if reanchor is None:
+                coords_w = coords
+            else:
+                coords_w = torch.where(before.unsqueeze(-1), reanchor, coords)
+            times_w = torch.where(in_win, (q - ix).clamp(0, S - 1),
+                                  torch.zeros_like(q)).to(torch.int32)
+            # Carried latent only feeds re-anchored (already-active) tracks; zero it for
+            # seeds / not-yet-appeared tracks so their carry is a no-op. Exception:
+            # window 0's carry comes from a previous chunk (init_latent) and represents
+            # continuations, so feed it to all tracks (no `before` mask).
+            if carry is None:
+                carry_w = None
+            elif w == 0:
+                carry_w = carry
+            else:
+                carry_w = carry * before.to(carry.dtype).view(B, 1, N, 1, 1)
+
+            views_w = [v[:, ix:ix + S] for v in views_norm]
+            res, latent = self._forward_window(
+                views_w, coords_w, times_w, camera_group,
+                cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
+                prev_latent=carry_w)
+
+            for key, ax in t_axis.items():
+                if key in res:
+                    _put(acc, key, res[key], ax, ix, T_full)
+            if 'grid' in res:
+                acc.setdefault('grid', {})
+                for key, val in res['grid'].items():
+                    if key in grid_t_axis:
+                        _put(acc['grid'], key, val, grid_t_axis[key], ix, T_full)
+                    else:
+                        acc['grid'][key] = val  # window-independent metadata
+
+            # Cross-window state is detached unless unroll_windows is set, in which
+            # case the graph stays connected for BPTT through the window chain.
+            detach = not self.unroll_windows
+
+            # Build the latent carry from this window: the overlap frames
+            # [stride_remainder:S] become the first `stride_overlap` frames of the next
+            # window; the remaining future frames are seeded with the last overlap frame.
+            # Built every window so the last one's carry is returned as final_latent (to
+            # thread into a following chunk). No overlap -> nothing to carry.
+            if self.stride_overlap >= 1:
+                overlap_latent = latent[:, stride_remainder:S]  # (b, overlap, n, cams, d)
+                pad = overlap_latent[:, -1:].expand(
+                    -1, S - overlap_latent.shape[1], -1, -1, -1)
+                carry = torch.cat([overlap_latent, pad], dim=1)
+                if detach:
+                    carry = carry.detach()
+            else:
+                carry = None
+
+            if w < n_windows - 1:
+                # Re-anchor the next window's query on this window's prediction at its
+                # first frame (relative index = stride_remainder).
+                rel = min(stride_remainder, S - 1)
+                if R == 3:
+                    reanchor = res['coords_pred'][:, rel]
+                else:
+                    reanchor = res['2d_pred'][0, :, rel]
+                if detach:
+                    reanchor = reanchor.detach()
+
+        # The carry from the last window is the state to thread into a following chunk.
+        acc['final_latent'] = carry
+
+        # Trim the padded frames back to the true clip length T.
+        if n_pad > 0:
+            for key, ax in t_axis.items():
+                if acc.get(key) is not None:
+                    idx = [slice(None)] * acc[key].dim()
+                    idx[ax] = slice(0, T)
+                    acc[key] = acc[key][tuple(idx)]
+            if 'grid' in acc:
+                for key, ax in grid_t_axis.items():
+                    if acc['grid'].get(key) is not None:
+                        idx = [slice(None)] * acc['grid'][key].dim()
+                        idx[ax] = slice(0, T)
+                        acc['grid'][key] = acc['grid'][key][tuple(idx)]
+
+        return acc
+
+    def _forward_window(self, views_norm, coords, query_times, camera_group,
+                        cube_scale, cube_scale_shared, f_eff,
+                        scene_center, scene_radius, prev_latent=None):
+        """Single encoder/decoder pass over one window (or the whole clip).
+
+        views_norm frames are already normalized/padded ('b t c h w'); coords are the
+        per-window query anchor (B, N, R) and query_times their frame index within the
+        window. Scene-level scalars (cube_scale, f_eff, scene_center/radius) are
+        precomputed once in forward() and passed through unchanged. prev_latent is the
+        previous window's final decoder latent (frame-aligned, B,T,N,cams,D) or None.
+
+        Returns (result_dict, latent) where latent is this window's final decoder
+        latent, to be carried into the next window.
+        """
+        device = coords.device
+        B, N, R = coords.shape
+        T = views_norm[0].shape[1]
+        n_cams = len(views_norm)
 
         scene_features = self.scene_encoder(views_norm)
 
@@ -310,7 +529,8 @@ class TrackerEncoder(nn.Module):
         query_rays = rearrange(query_rays_flat, 'cams b (t n) d e -> b t n cams d e', t=T, n=N)
 
         mode_idx = torch.tensor([1 if R == 3 else 0], dtype=torch.long, device=query_embeds.device)
-        outputs, grid_logits = self.decoder(scene_features, query_embeds, query_rays, mode_idx)
+        outputs, grid_logits, latent = self.decoder(
+            scene_features, query_embeds, query_rays, mode_idx, prev_latent=prev_latent)
         outputs = rearrange(outputs, 'b t n cams outdim -> cams b t n outdim')
 
         points_3d_raw, points_pred, vis_pred_2d_logits, conf_pred_2d_logits, depth_pred, conf_3d_logits = torch.split(
@@ -500,4 +720,4 @@ class TrackerEncoder(nn.Module):
             
         #     result_dict.update(train_dict)
 
-        return result_dict 
+        return result_dict, latent

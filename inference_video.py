@@ -340,6 +340,7 @@ def run_tracker_encoder_on_videos(
     max_kpts=None,
     device=None,
     pred_key_3d='coords_pred',
+    clip_len=None,
 ):
 
     # Dimensionality of the queries: R==3 -> 3D world coords (multi-view), R==2 ->
@@ -370,6 +371,7 @@ def run_tracker_encoder_on_videos(
                 max_kpts=None,
                 device=device,
                 pred_key_3d=pred_key_3d,
+                clip_len=clip_len,
             )
             chunk_outputs.append(chunk_out)
         return {
@@ -419,12 +421,17 @@ def run_tracker_encoder_on_videos(
     frame_numbers_all = []
     crop_history = []
     query_times = None
+    # Latent threaded across chunks (cross-chunk carry). For windowed models, feed more
+    # than stride_length frames per forward (clip_len > model.n_frames) so the internal
+    # windowing + latent carry actually engage within each chunk.
+    init_latent = None
+    clip_len = clip_len if clip_len is not None else model.n_frames
 
     with torch.no_grad():
         pbar = tqdm(total=end_frame - start_frame, desc='Tracking', unit='frames')
         while current_frame < end_frame:
             remaining = end_frame - current_frame
-            current_clip_len = model.n_frames
+            current_clip_len = clip_len
 
             camera_group_chunk, crop_boxes = crop_camera_group_to_queries(
                 camera_group=camera_group,
@@ -493,6 +500,7 @@ def run_tracker_encoder_on_videos(
                 coords=queries_model,
                 query_times=query_times,
                 camera_group=camera_group_chunk,
+                init_latent=init_latent,
             )
 
             if is_2d:
@@ -520,6 +528,10 @@ def run_tracker_encoder_on_videos(
             frame_numbers_all.append(torch.arange(current_frame + discard, current_frame + keep_len, dtype=torch.int64))
 
             current_queries = coords_pred[:, -1]
+
+            # Thread the decoder latent into the next chunk so the carry spans the whole
+            # video (not just within a chunk). None for non-windowed models / single-pass.
+            init_latent = outputs.get('final_latent', None)
 
             query_times = torch.full(
                 (current_queries.shape[0], current_queries.shape[1]),
@@ -730,6 +742,12 @@ def parse_args():
     parser.add_argument('--pred-key-3d', type=str, default='coords_pred',
                         help="Which 3D model output to use as the prediction "
                              "(e.g. 'coords_pred' or '3d_pred_triangulate')")
+    parser.add_argument('--clip-len', type=int, default=None,
+                        help='Frames fed to the model per forward. Defaults to '
+                             'model.n_frames (= stride_length). For a windowed model set '
+                             'this > stride_length (e.g. 16) so internal windowing + the '
+                             'latent carry engage per chunk; the latent is also threaded '
+                             'across chunks.')
     parser.add_argument('--outpath', type=str, default=None,
                         help='Optional output .npz path')
 
@@ -751,6 +769,7 @@ def run_inference(
     device=None,
     outpath=None,
     pred_key_3d='coords_pred',
+    clip_len=None,
 ):
     """Run inference on one trial with an already-loaded model.
 
@@ -810,6 +829,7 @@ def run_inference(
                 max_kpts=max_kpts,
                 device=device,
                 pred_key_3d=pred_key_3d,
+                clip_len=clip_len,
             )
             subj_out['subject_idx'] = subj_idx
             all_subject_outputs.append(subj_out)
@@ -863,6 +883,7 @@ def run_inference(
             max_kpts=max_kpts,
             device=device,
             pred_key_3d=pred_key_3d,
+            clip_len=clip_len,
         )
 
     # --- Ground-truth extraction ---
@@ -988,6 +1009,7 @@ def main():
         device=device,
         outpath=args.outpath,
         pred_key_3d=args.pred_key_3d,
+        clip_len=args.clip_len,
     )
 
 

@@ -66,6 +66,10 @@ def parse_args():
     parser.add_argument('--n-views', type=int, default=None, help='Evaluate on a subset of cameras')
     parser.add_argument('--view-seed', type=int, default=None, help='Random seed for subsampling cameras')
     parser.add_argument('--max-kpts', type=int, default=None, help='Max keypoints per forward pass')
+    parser.add_argument('--clip-len', type=int, default=None,
+                        help='Frames fed to the model per forward (passed to inference_video). '
+                             'Defaults to model.n_frames; set > stride_length (e.g. 16) for '
+                             'windowed models so internal windowing + latent carry engage.')
     parser.add_argument('--per-subject', action='store_true', default=False)
     parser.add_argument('--device', type=str, default=None)
 
@@ -214,6 +218,8 @@ def main():
             cmd += ['--view-seed', str(args.view_seed)]
         if args.max_kpts is not None:
             cmd += ['--max-kpts', str(args.max_kpts)]
+        if args.clip_len is not None:
+            cmd += ['--clip-len', str(args.clip_len)]
         if args.per_subject:
             cmd += ['--per-subject']
 
