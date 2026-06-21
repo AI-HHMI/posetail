@@ -93,6 +93,7 @@ class TotalLoss(nn.Module):
                  coords_loss_depth_weight = 1,
                  coords_loss_direct_reproj_weight = 0.0,
                  coords_loss_rays_reproj_weight = 0.0,
+                 coords_loss_triangulate_reproj_weight = 0.0,
                  conf_2d_loss_weight = 0,
                  per_camera_cube_scale = False,
                  smoothness_loss_3d_weight = 0,
@@ -129,6 +130,7 @@ class TotalLoss(nn.Module):
         self.coords_loss_depth_weight = coords_loss_depth_weight
         self.coords_loss_direct_reproj_weight = coords_loss_direct_reproj_weight
         self.coords_loss_rays_reproj_weight = coords_loss_rays_reproj_weight
+        self.coords_loss_triangulate_reproj_weight = coords_loss_triangulate_reproj_weight
         self.per_camera_cube_scale = per_camera_cube_scale
 
         self.smoothness_loss_3d_weight = smoothness_loss_3d_weight
@@ -236,6 +238,19 @@ class TotalLoss(nn.Module):
             weight = self.coords_loss_rays_reproj_weight / 16.0
         )
 
+        # Reproject the *triangulated* 3D point into each camera and supervise in pixels.
+        # The triangulation's ill-conditioned direction (depth-of-motion for small-baseline /
+        # far-from-scene geometry) is exactly the direction reprojection is insensitive to, so
+        # the gradient stays bounded regardless of conditioning -- unlike the direct
+        # 3d_triangulate loss whose gradient ~ 1/parallax^2. Upweight this instead of
+        # 3d_triangulate when triangulation supervision is wanted. Mirror direct_reproj.
+        self.mae_loss_triangulate_reproj = WeightedMAELoss(
+            gamma = self.gamma,
+            delta = 16,
+            use_huber_loss = True,
+            weight = self.coords_loss_triangulate_reproj_weight / 16.0
+        )
+
         self.mae_loss_coords_depth = WeightedMAELoss(
             gamma = self.gamma, 
             delta = self.delta, 
@@ -330,6 +345,7 @@ class TotalLoss(nn.Module):
         coords_loss_triangulate = _nan()
         coords_loss_direct_reproj = _nan()
         coords_loss_rays_reproj   = _nan()
+        coords_loss_triangulate_reproj = _nan()
         vis_loss              = _nan()
         vis_loss_cams         = _nan()
         conf_loss             = _nan()
@@ -610,6 +626,7 @@ class TotalLoss(nn.Module):
             # coords_true_2d == project_points_torch(cgroup, coords_true) is (cams,b,t,n,2).
             coords_loss_direct_reproj = torch.tensor(0.0, device=device)
             coords_loss_rays_reproj   = torch.tensor(0.0, device=device)
+            coords_loss_triangulate_reproj = torch.tensor(0.0, device=device)
             if p2d is None:
                 if self.coords_loss_direct_reproj_weight > 0 and '3d_pred_direct' in outputs:
                     reproj = project_points_torch(cgroup, outputs['3d_pred_direct'])
@@ -619,6 +636,12 @@ class TotalLoss(nn.Module):
                 if self.coords_loss_rays_reproj_weight > 0 and '3d_pred_rays' in outputs:
                     reproj = project_points_torch(cgroup, outputs['3d_pred_rays'])
                     coords_loss_rays_reproj = self.mae_loss_rays_reproj(
+                        coords_pred=reproj, coords_true=coords_true_2d,
+                        vis_true=vis_true_cams, scale=1.0, device=device)
+                if self.coords_loss_triangulate_reproj_weight > 0 and \
+                        outputs.get('3d_pred_triangulate') is not None:
+                    reproj = project_points_torch(cgroup, outputs['3d_pred_triangulate'])
+                    coords_loss_triangulate_reproj = self.mae_loss_triangulate_reproj(
                         coords_pred=reproj, coords_true=coords_true_2d,
                         vis_true=vis_true_cams, scale=1.0, device=device)
 
@@ -749,6 +772,7 @@ class TotalLoss(nn.Module):
             coords_loss_triangulate,
             coords_loss_direct_reproj,
             coords_loss_rays_reproj,
+            coords_loss_triangulate_reproj,
             vis_loss,  # 3D noisy-OR visibility (inert unless vis_loss_3d_weight > 0)
             vis_loss_cams,
             conf_loss,
@@ -772,6 +796,7 @@ class TotalLoss(nn.Module):
         self.loss_history['3d_triangulate'].append(coords_loss_triangulate.item())
         self.loss_history['3d_direct_reproj'].append(coords_loss_direct_reproj.item())
         self.loss_history['3d_rays_reproj'].append(coords_loss_rays_reproj.item())
+        self.loss_history['3d_triangulate_reproj'].append(coords_loss_triangulate_reproj.item())
 
         self.loss_history['vis_loss'].append(vis_loss.item())
         self.loss_history['vis_2d_loss'].append(vis_loss_cams.item())
