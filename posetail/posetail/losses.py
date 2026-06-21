@@ -145,13 +145,15 @@ class TotalLoss(nn.Module):
         # single global constant to match magnitudes while keeping absolute depth.
         self.coords_3d_loss_scale = coords_3d_loss_scale
 
-        # Floor on per-camera cube_scale before it divides the regular-3D loss
-        # (_compute_loss: loss / scale). A degenerate crop (few near-coplanar points) makes the
-        # projection-Jacobian SVD blow up -> cube_scale = 1/sensitivity collapses toward 0 ->
-        # the loss divisor (cube_scale * coords_3d_loss_scale) shrinks -> depth/3d losses spike
-        # ~100-150x (grad_norm to thousands). Catastrophic spikes are all at cube_scale < ~0.02;
-        # the [0.02,0.05) band is already clean. Clamping the divisor from below caps that
-        # inflation. 0.0 disables (legacy behavior).
+        # Floor on per-camera cube_scale before it normalizes the regular-3D loss
+        # error (_compute_loss now divides the error by cube_scale *before* the Huber,
+        # so a collapsed cube_scale is squared; coords_3d_loss_scale is applied after).
+        # A degenerate crop (few near-coplanar points) makes the projection-Jacobian
+        # SVD blow up -> cube_scale = 1/sensitivity collapses toward 0 -> the normalized
+        # error (and depth/3d loss) spikes. Huber's linear regime caps the per-element
+        # gradient, but clamping cube_scale from below removes the spike at the source.
+        # Catastrophic spikes are all at cube_scale < ~0.02; the [0.02,0.05) band is
+        # already clean. 0.0 disables (legacy behavior).
         self.cube_scale_floor = cube_scale_floor
 
         # Direct logit-classification objectives (cross-entropy on the position bins),
@@ -407,14 +409,32 @@ class TotalLoss(nn.Module):
             occluded_true = ~vis_true
 
             if p2d is None:
-                # WeightedMAELoss divides the error by `scale`, so multiplying the
-                # cube_scale by the (>=1) constant scales the regular-3D loss DOWN
-                # to match the normalized 2D-query branch's magnitude.
-                scale_cb = rearrange(scale, 'cams b -> cams b 1 1 1') * self.coords_3d_loss_scale
-                scale_b  = scale.median(dim=0).values.reshape(B, 1, 1, 1) * self.coords_3d_loss_scale
+                # cube_scale only (world units per pixel). The metric MAE/Huber losses
+                # divide the *error* by this BEFORE the robust loss (so the Huber knee
+                # acts in pixels and the square leaves no residual cube_scale), then
+                # divide by coords_3d_loss_scale AFTER (passed as loss_scale) to match
+                # the normalized 2D-query branch's magnitude. The linear smoothness
+                # consumer below still takes cube_scale * coords_3d_loss_scale directly.
+                scale_cb = rearrange(scale, 'cams b -> cams b 1 1 1')
+                scale_b  = scale.median(dim=0).values.reshape(B, 1, 1, 1)
+                loss_scale_3d = self.coords_3d_loss_scale
+                # Depth (range) ~ cube_scale * f_eff, so the depth error must be
+                # normalized by cube_scale * f_eff (-> relative depth error) to be
+                # scale-invariant, mirroring the depth-softmax denom (cube_scale *
+                # f_eff). Dividing by cube_scale alone leaves an f_eff factor (which
+                # spans >100x across datasets) and makes the Huber knee inconsistent.
+                # f_eff is None when grid/f_eff_scale is off -> fall back to cube_scale.
+                f_eff = outputs.get('grid', {}).get('f_eff', None)
+                if f_eff is not None:
+                    scale_cb_depth = scale_cb * rearrange(
+                        f_eff, 'cams -> cams 1 1 1 1').to(scale_cb.dtype)
+                else:
+                    scale_cb_depth = scale_cb
             else:
                 scale_cb = 1.0
                 scale_b  = 1.0
+                loss_scale_3d = 1.0
+                scale_cb_depth = 1.0
 
             if p2d is not None:
                 coords_true_n, _ = normalize_by_mean_depth(coords_true, vis_true, centers[0])
@@ -507,6 +527,7 @@ class TotalLoss(nn.Module):
                     coords_true=coords_true_unrolled if training_iters else coords_true,
                     vis_true=vis_true_unrolled if training_iters else vis_true,
                     scale=scale_b,
+                    loss_scale=loss_scale_3d,
                     device=device)
 
             coords_loss_direct = torch.tensor(0.0, device=device)
@@ -525,6 +546,7 @@ class TotalLoss(nn.Module):
                         coords_true=coords_true_cams,
                         vis_true=vis_true_cams,
                         scale=scale_cb,
+                        loss_scale=loss_scale_3d,
                         device=device)
 
             if '3d_pred_direct' in outputs:
@@ -539,6 +561,7 @@ class TotalLoss(nn.Module):
                         coords_true=coords_true,
                         vis_true=vis_true,
                         scale=scale_b,
+                        loss_scale=loss_scale_3d,
                         device=device)
 
             if '3d_pred_cams_rays' in outputs:
@@ -553,6 +576,7 @@ class TotalLoss(nn.Module):
                         coords_true=coords_true_cams,
                         vis_true=vis_true_cams,
                         scale=scale_cb,
+                        loss_scale=loss_scale_3d,
                         device=device)
 
             if '3d_pred_rays' in outputs:
@@ -567,6 +591,7 @@ class TotalLoss(nn.Module):
                         coords_true=coords_true,
                         vis_true=vis_true,
                         scale=scale_b,
+                        loss_scale=loss_scale_3d,
                         device=device)
 
             if '3d_pred_triangulate' in outputs and outputs['3d_pred_triangulate'] is not None:
@@ -575,6 +600,7 @@ class TotalLoss(nn.Module):
                     coords_true=coords_true,
                     vis_true=vis_true,
                     scale=scale_b,
+                    loss_scale=loss_scale_3d,
                     device=device)
 
             # Reprojection losses: project the fused 3D predictions into every camera
@@ -667,7 +693,8 @@ class TotalLoss(nn.Module):
                         coords_pred=depth_pred,
                         coords_true=depths_true,
                         vis_true=vis_true_cams,
-                        scale=scale_cb,
+                        scale=scale_cb_depth,
+                        loss_scale=loss_scale_3d,
                         device=device)
             else:
                 coords_loss_depth = torch.tensor(0.0, device=device)
@@ -678,9 +705,13 @@ class TotalLoss(nn.Module):
                     coords_pred=pred_n_smooth, coords_true=coords_true_n,
                     vis_true=vis_true, time_dim=1, scale=1.0, device=device)
             else:
+                # SmoothnessLoss is linear (hinge on |derivative|), so one power of
+                # cube_scale is correct; it keeps cube_scale * coords_3d_loss_scale
+                # (scale_b is now cube_scale only).
                 smoothness_loss_3d = self.smoothness_loss_3d(
                     coords_pred=coords_pred, coords_true=coords_true,
-                    vis_true=vis_true, time_dim=1, scale=scale_b, device=device)
+                    vis_true=vis_true, time_dim=1,
+                    scale=scale_b * self.coords_3d_loss_scale, device=device)
 
             if coords_pred_2d is not None:
                 smoothness_loss_2d = self.smoothness_loss_2d(
@@ -695,6 +726,7 @@ class TotalLoss(nn.Module):
                     coords_true=coords_true_unrolled if training_iters else coords_true,
                     vis_true=occluded_true_unrolled if training_iters else occluded_true,
                     scale=scale_b,
+                    loss_scale=loss_scale_3d,
                     device=device)
             else:
                 occluded_coords_loss = torch.tensor(0.0, device=device)
@@ -875,9 +907,8 @@ class WeightedMAELoss(nn.Module):
         self.use_huber_loss = use_huber_loss
         self.weight = weight
 
-    def huber_loss(self, coords_pred, coords_true):
+    def huber_loss(self, diff):
 
-        diff = coords_pred - coords_true
         mask = torch.abs(diff) <= self.delta
         
         loss_masked = 0.5 * ((diff * mask) ** 2) 
@@ -887,7 +918,7 @@ class WeightedMAELoss(nn.Module):
 
         return total_loss
     
-    def _compute_loss(self, coords_pred, coords_true, vis_true, scale=1.0):
+    def _compute_loss(self, coords_pred, coords_true, vis_true, scale=1.0, loss_scale=1.0):
 
         # validity = visible AND finite GT. vis alone is insufficient: it can be 1
         # at NaN coords, and NaN targets poison the backward pass even when masked
@@ -896,24 +927,37 @@ class WeightedMAELoss(nn.Module):
         valid = (vis_true > 0.5) & torch.isfinite(coords_true[..., 0:1])
         coords_true_safe = torch.where(valid, coords_true, coords_pred.detach())
 
+        # Normalize the error by `scale` BEFORE the robust loss, then divide by the
+        # magnitude knob `loss_scale` AFTER. In 3D mode scale == cube_scale (world
+        # units per pixel), so the error enters the Huber in pixels and `delta` is a
+        # pixel threshold. This is what makes the metric losses scale-invariant: the
+        # Huber square now acts on the pixel error, so no power of cube_scale leaks
+        # through (the old `huber(world_err) / (cube_scale * k)` was effectively
+        # 0.5 * cube_scale * pixel_err^2 / k -- one un-cancelled cube_scale, so the
+        # loss vanished for small-cube datasets like tuthill-fly). For L1
+        # (use_huber_loss=False) dividing before vs after is identical; only the
+        # Huber path changes. loss_scale is applied linearly so it cannot
+        # reintroduce a scale dependence.
+        diff = (coords_pred - coords_true_safe) / scale
+
         if self.use_huber_loss:
-            loss = self.huber_loss(coords_pred, coords_true_safe)
+            loss = self.huber_loss(diff)
         else:
-            loss = torch.abs(coords_pred - coords_true_safe)
+            loss = torch.abs(diff)
 
         valid_f = valid.float()
-        loss = (loss / scale * valid_f).sum() / (valid_f.sum() * coords_pred.shape[-1] + 1e-6)
+        loss = (loss / loss_scale * valid_f).sum() / (valid_f.sum() * coords_pred.shape[-1] + 1e-6)
 
         return loss
 
-    def forward(self, coords_pred, coords_true, vis_true, scale=1.0, device=None):
+    def forward(self, coords_pred, coords_true, vis_true, scale=1.0, loss_scale=1.0, device=None):
 
         # don't compute if the weight is 0
         if self.weight == 0:
             return torch.tensor(float('nan'), device = device)
 
         if isinstance(coords_pred, torch.Tensor):
-            total_loss = self._compute_loss(coords_pred, coords_true, vis_true, scale)
+            total_loss = self._compute_loss(coords_pred, coords_true, vis_true, scale, loss_scale)
             return self.weight * total_loss
 
         n_strides = len(coords_pred)
@@ -924,7 +968,7 @@ class WeightedMAELoss(nn.Module):
 
         for i in range(n_strides):
             for j in range(n_iters):
-                losses[i, j] = self._compute_loss(coords_pred[i][j], coords_true[i], vis_true[i], scale)
+                losses[i, j] = self._compute_loss(coords_pred[i][j], coords_true[i], vis_true[i], scale, loss_scale)
 
         total_loss = self.weight * torch.nanmean(weights * torch.nanmean(losses, axis = 0), axis = 0)
 
