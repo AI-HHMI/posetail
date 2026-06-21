@@ -640,7 +640,10 @@ class Decoder(nn.Module):
                  depth_log_min=-2.5,
                  depth_log_max=2.0,
                  image_size=256,
-                 f_eff_scale=False):
+                 f_eff_scale=False,
+                 soft_argmax_temperature=0.5,
+                 soft_argmax_threshold=20,
+                 soft_argmax_temperature_learnable=False):
         super().__init__()
 
         self.embed_dim = embed_dim
@@ -653,6 +656,15 @@ class Decoder(nn.Module):
         self.head_3d_grid_size = head_3d_grid_size
         self.head_3d_grid_radius = head_3d_grid_radius
         self.image_size = image_size
+        # Soft-argmax decode knobs (per-axis local-window expectation in _grid_decode). Defaults
+        # (temp 0.5, window 20, fixed) reproduce the original hardcoded behavior exactly. The
+        # temperature is the soft-argmax sharpness ("beta"); learnable lets it adapt per the data
+        # (1 extra scalar param, loaded fresh under strict=False, no effect when not learnable).
+        self.soft_argmax_threshold = int(soft_argmax_threshold)
+        self._soft_argmax_temp_fixed = float(soft_argmax_temperature)
+        self.log_soft_argmax_temp = (
+            nn.Parameter(torch.tensor(math.log(float(soft_argmax_temperature))))
+            if soft_argmax_temperature_learnable else None)
         # signed-log warp of the 3D output (3D only). See cube.signed_log1p/expm1.
         self.log_3d_output = log_3d_output
         self.log_3d_eps = log_3d_eps
@@ -820,8 +832,10 @@ class Decoder(nn.Module):
         """Per-axis masked soft-argmax over a fixed grid of bin centres (threshold 20
         bins, temperature 0.5), mirroring tracker_tapnext.py:379-392. ``logits``
         (..., K), ``grid_values`` (K,) -> decoded value (...)."""
-        soft_argmax_threshold = 20
-        softmax_temperature = 0.5
+        soft_argmax_threshold = self.soft_argmax_threshold
+        softmax_temperature = (torch.exp(self.log_soft_argmax_temp)
+                               if self.log_soft_argmax_temp is not None
+                               else self._soft_argmax_temp_fixed)
         K = logits.shape[-1]
         argmax = logits.argmax(dim=-1, keepdim=True)
         index = torch.arange(K, device=logits.device)
