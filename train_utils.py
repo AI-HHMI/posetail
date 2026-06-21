@@ -461,9 +461,15 @@ def train_iteration(config, model, fabric, batch,
     #                                error_if_nonfinite = False)
 
     try:
-        fabric.clip_gradients(model, optimizer, 
-            max_norm = config.training.max_grad_norm, 
-            error_if_nonfinite = True)
+        if hasattr(optimizer, '_opts'):
+            # DualOptimizer (muon+adamw): fabric.clip_gradients takes a single optimizer, so clip
+            # the model's grads directly (no AMP unscale needed at 32/bf16 precision).
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm,
+                                           error_if_nonfinite=True)
+        else:
+            fabric.clip_gradients(model, optimizer,
+                max_norm = config.training.max_grad_norm,
+                error_if_nonfinite = True)
 
         optimizer.step()
     except:
