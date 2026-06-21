@@ -88,8 +88,14 @@ def project_cam(cam, p3d_t, downsample_factor = 1, max_normalized = 3.0):
     dist = cam['dist']
     cam_type = cam['type'] # pinhole, fisheye # TODO: implement functionality for different camera types
 
-    p2d_proj_raw = torch.matmul(to_homogeneous(p3d_t), ext_t.T)
-    p2d_proj_raw = from_homogeneous(p2d_proj_raw[..., :3])
+    p2d_proj_cam = torch.matmul(to_homogeneous(p3d_t), ext_t.T)[..., :3]
+    # Clamp the projective depth magnitude (sign-preserving) before the perspective division so
+    # its gradient stays bounded; near-zero predicted depth otherwise spikes reprojection grads
+    # (the reason rays_reproj was disabled). Only affects degenerate near-camera points -> valid
+    # points (depth O(1+)) are unchanged.
+    z = p2d_proj_cam[..., 2:3]
+    z_safe = torch.where(z < 0, -1.0, 1.0) * z.abs().clamp(min=1e-2)
+    p2d_proj_raw = p2d_proj_cam[..., :2] / z_safe
 
     # handle points way outside of the frame
     p2d_proj_raw = torch.clamp(p2d_proj_raw, -max_normalized, max_normalized)
@@ -209,32 +215,50 @@ def triangulate_simple_batch_reg(points, camera_mats, weights):
     '''
     C, N, _ = points.shape
 
-    points = rearrange(points, 'c n r -> n c r')
-    cam_mats = repeat(camera_mats, 'c i j -> n c i j', n=N)
-    
-    x = points[:, :, 0:1, None]
-    y = points[:, :, 1:2, None]
-    w = rearrange(weights, 'c n -> n c 1 1')
-    
-    eq_x = w * (x * cam_mats[:, :, 2:3, :] - cam_mats[:, :, 0:1, :])
-    eq_y = w * (y * cam_mats[:, :, 2:3, :] - cam_mats[:, :, 1:2, :])
-    
-    A = rearrange([eq_x, eq_y], 'two n c 1 j -> n (c two) j')
-    
-    # Use eigendecomposition of A^T A instead of SVD
-    # This is more numerically stable for gradients
-    ATA = torch.bmm(A.transpose(-2, -1), A)
-    
-    # Add small regularization
-    eps = 1e-6
-    ATA = ATA + eps * torch.eye(4, device=A.device, dtype=A.dtype)
-    
-    # Smallest eigenvalue's eigenvector
-    eigenvalues, eigenvectors = torch.linalg.eigh(ATA)
-    p3d_homogeneous = eigenvectors[:, :, 0]  # eigenvector for smallest eigenvalue
-    
-    p3d = from_homogeneous(p3d_homogeneous)
-    
+    # Inhomogeneous DLT (solve directly for [X,Y,Z]) rather than the homogeneous null vector
+    # [X,Y,Z,W] / W. The homogeneous form divides by W, which collapses toward 0 whenever the
+    # scene sits far from the world origin (W ~ 1/|coord|) or the geometry is ill-conditioned
+    # (small-baseline stereo far from the scene) -> the triangulated point blows up by orders of
+    # magnitude (3d_triangulate exploded for allen/johnson(-fly)/3dpop/cmu, and for any
+    # far-away-stereo pair). The inhomogeneous form has no such divide: the world-origin offset
+    # lands entirely in the RHS `b` (out of the design matrix `M`), so conditioning is
+    # origin-independent, and ill-conditioned depth stays bounded by the eps regularization
+    # instead of exploding. We still recentre on the camera centroid first (constant w.r.t. the
+    # 2D inputs -> gradient-safe) to keep `b` small for float32.
+    R_ext = camera_mats[:, :3, :3]
+    t_ext = camera_mats[:, :3, 3]
+    c_world = (-torch.einsum('cji,cj->ci', R_ext, t_ext)).mean(0)     # camera centroid = mean(-R^T t)
+    cm = camera_mats.clone()
+    cm[:, :3, 3] = t_ext + torch.einsum('cij,j->ci', R_ext, c_world)  # shift world origin to centroid
+
+    # Each (camera, point) contributes two rows linear in X=[X,Y,Z]:
+    #   (x*row2 - row0)[:3] . X = -(x*row2 - row0)[3]   (and likewise y with row1).
+    x = points[..., 0:1]; y = points[..., 1:2]                       # (C,N,1)
+    P0 = cm[:, None, 0, :]; P1 = cm[:, None, 1, :]; P2 = cm[:, None, 2, :]   # (C,1,4)
+    ax = x * P2 - P0                                                  # (C,N,4)
+    ay = y * P2 - P1
+    w = weights[..., None]                                            # (C,N,1)
+    M = rearrange(torch.stack([ax[..., :3] * w, ay[..., :3] * w]),
+                  'two c n three -> n (c two) three')                 # (N, 2C, 3)
+    b = rearrange(torch.stack([-ax[..., 3] * weights, -ay[..., 3] * weights]),
+                  'two c n -> n (c two)')                             # (N, 2C)
+
+    MtM = torch.einsum('nij,nik->njk', M, M)                          # (N,3,3)
+    Mtb = torch.einsum('nij,ni->nj', M, b)                            # (N,3)
+    # Scale-aware ridge: separates the smallest eigenvalue from 0 (degenerate / near-parallel
+    # rays / zero-weight points) without biasing well-conditioned ones. The factor sets the
+    # tolerated condition number (~1e8): only geometry more ill-conditioned than that gets pulled
+    # toward the camera centroid; everything realistic (incl. small-baseline stereo with depth up
+    # to ~1e3 x baseline) stays unbiased. Too large a factor biases the depth of *correctly*
+    # predicted far points -> spurious loss; the floor keeps fully-unobserved points solvable.
+    reg = (1e-8 * MtM.diagonal(dim1=-2, dim2=-1).mean(-1)).clamp(min=1e-10)
+    MtM = MtM + reg[:, None, None] * torch.eye(3, device=M.device, dtype=M.dtype)
+    try:
+        X = torch.linalg.solve(MtM, Mtb.unsqueeze(-1)).squeeze(-1)    # (N,3)
+    except Exception:
+        X = torch.linalg.lstsq(MtM, Mtb.unsqueeze(-1)).solution.squeeze(-1)
+
+    p3d = X + c_world                                                 # undo the recentre
     return p3d
 
 
