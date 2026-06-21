@@ -15,6 +15,13 @@ Example with cropping around tracked points:
         --output-dir /path/to/rendered/ \
         --crop --crop-padding 80
 
+Example with motion trails (so a screenshot conveys tracking):
+
+    python render_video.py \
+        --input-npz /path/to/output.npz \
+        --output-dir /path/to/rendered/ \
+        --trails --trail-length 30
+
 Reads the output .npz from inference_video.py, loads the corresponding
 video/image data, projects predicted 3D keypoints onto each camera view,
 and saves rendered videos with overlaid keypoints.
@@ -46,6 +53,22 @@ def generate_colors(n):
     return colors
 
 
+def _point_visible(point, conf_val, conf_threshold, w, h, vis_val=None):
+    """Whether a single keypoint should be drawn at the given frame.
+
+    Gates on confidence, optional visibility, finite coords, and in-bounds.
+    """
+    if conf_val < conf_threshold:
+        return False
+    if vis_val is not None and vis_val < conf_threshold:
+        return False
+    if not np.all(np.isfinite(point)):
+        # NaN/inf coords (e.g. behind-camera or undefined projections); skip.
+        return False
+    x, y = point[0], point[1]
+    return 0 <= x < w and 0 <= y < h
+
+
 def render_keypoints_on_frame(frame, points_2d, conf, conf_threshold, colors, marker_size, vis=None):
     """Draw keypoints on a single frame (BGR, uint8).
 
@@ -62,21 +85,67 @@ def render_keypoints_on_frame(frame, points_2d, conf, conf_threshold, colors, ma
     h, w = frame.shape[:2]
 
     for k in range(n_kpts):
-        if conf[k] < conf_threshold:
-            continue
-        if vis is not None and vis[k] < conf_threshold:
-            continue
-        if not np.all(np.isfinite(points_2d[k])):
-            # NaN/inf coords (e.g. behind-camera or undefined projections); skip.
+        vis_val = vis[k] if vis is not None else None
+        if not _point_visible(points_2d[k], conf[k], conf_threshold, w, h, vis_val):
             continue
 
         x, y = int(round(points_2d[k, 0])), int(round(points_2d[k, 1]))
-
-        if not (0 <= x < w and 0 <= y < h):
-            continue
-
         color = colors[k % len(colors)]
         cv2.circle(frame, (x, y), marker_size, color, -1, lineType=cv2.LINE_AA)
+
+    return frame
+
+
+def render_trails_on_frame(frame, trail_pts, conf_window, conf_threshold, colors,
+                           vis_window=None, thickness=2):
+    """Draw fading motion trails for each keypoint on a single frame.
+
+    Connects each keypoint's recent past positions with a polyline that fades
+    from faint (oldest) to fully opaque (newest), in the keypoint's color.
+
+    Args:
+        frame: (H, W, 3) BGR uint8 image.
+        trail_pts: (L, N, 2) 2D coords for the window, ordered oldest->newest,
+            already crop-offset-adjusted.
+        conf_window: (L, N) confidence probabilities in [0, 1].
+        conf_threshold: minimum confidence/visibility to draw a segment endpoint.
+        colors: list of BGR tuples, one per keypoint.
+        vis_window: optional (L, N) visibility probabilities; gated like conf.
+        thickness: polyline width in pixels.
+
+    Returns:
+        The frame with trails blended in.
+    """
+    L, n_kpts = trail_pts.shape[0], trail_pts.shape[1]
+    n_seg = L - 1
+    if n_seg < 1:
+        return frame
+    h, w = frame.shape[:2]
+
+    # Each segment s connects frame s -> s+1. Older segments (small s) are
+    # fainter. Blend one overlay per segment so non-line pixels stay untouched.
+    for s in range(n_seg):
+        alpha = (s + 1) / n_seg
+        overlay = frame.copy()
+        drew = False
+        for k in range(n_kpts):
+            vis0 = vis_window[s, k] if vis_window is not None else None
+            vis1 = vis_window[s + 1, k] if vis_window is not None else None
+            if not _point_visible(trail_pts[s, k], conf_window[s, k],
+                                  conf_threshold, w, h, vis0):
+                continue
+            if not _point_visible(trail_pts[s + 1, k], conf_window[s + 1, k],
+                                  conf_threshold, w, h, vis1):
+                continue
+
+            p0 = (int(round(trail_pts[s, k, 0])), int(round(trail_pts[s, k, 1])))
+            p1 = (int(round(trail_pts[s + 1, k, 0])), int(round(trail_pts[s + 1, k, 1])))
+            cv2.line(overlay, p0, p1, colors[k % len(colors)], thickness,
+                     lineType=cv2.LINE_AA)
+            drew = True
+
+        if drew:
+            frame = cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0)
 
     return frame
 
@@ -104,6 +173,12 @@ def parse_args():
                         help='Crop each camera view around the tracked keypoints')
     parser.add_argument('--crop-padding', type=int, default=50,
                         help='Padding in pixels around the bounding box of projected keypoints')
+    parser.add_argument('--trails', action='store_true', default=False,
+                        help='Draw fading motion trails showing each point\'s recent path')
+    parser.add_argument('--trail-length', type=int, default=30,
+                        help='Number of past frames (incl. current) to include in each trail')
+    parser.add_argument('--trail-thickness', type=int, default=2,
+                        help='Width in pixels of the trail polyline')
 
     return parser.parse_args()
 
@@ -265,6 +340,9 @@ def main():
         'codec': args.codec,
         'crop': args.crop,
         'crop_padding': args.crop_padding,
+        'trails': args.trails,
+        'trail_length': args.trail_length,
+        'trail_thickness': args.trail_thickness,
     }
     with open(os.path.join(args.output_dir, 'render_info.json'), 'w') as f:
         json.dump(render_info, f, indent=2)
@@ -338,6 +416,21 @@ def main():
 
                 conf = conf_pred[t]  # (N,)
                 vis = vis_pred[t] if vis_pred is not None else None  # (N,)
+
+                if args.trails:
+                    start = max(0, t - args.trail_length + 1)
+                    trail_pts = p2d[cam_idx, start:t + 1].copy()  # (L, N, 2)
+                    if crop_box is not None:
+                        trail_pts[..., 0] -= x1
+                        trail_pts[..., 1] -= y1
+                    conf_window = conf_pred[start:t + 1]  # (L, N)
+                    vis_window = vis_pred[start:t + 1] if vis_pred is not None else None
+                    frame = render_trails_on_frame(
+                        frame, trail_pts, conf_window,
+                        conf_threshold=args.conf_threshold,
+                        colors=colors, vis_window=vis_window,
+                        thickness=args.trail_thickness,
+                    )
 
                 frame = render_keypoints_on_frame(
                     frame, pts, conf,
