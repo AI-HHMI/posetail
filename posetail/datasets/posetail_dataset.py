@@ -380,6 +380,9 @@ class PosetailDataset(Dataset):
         # for balancing datasets
         self.balance_datasets = config.dataset[split].get('balance_datasets', True)
         self.n_samples_per_dataset = config.dataset[split].get('n_samples_per_dataset', -1) # default balances based on dataset with the most samples
+        # optional per-dataset upsampling multiplier applied on top of balancing, e.g.
+        # {"kubric-multiview": 2.0}. Absent / weight 1.0 -> exact uniform-balance behavior.
+        self.dataset_weights = dict(config.dataset[split].get('dataset_weights', {}) or {})
 
         
         # per-camera augmentations: same parameters applied to all frames of one camera
@@ -1355,14 +1358,16 @@ class PosetailDataset(Dataset):
         if n_samples == -1: 
             n_samples = self.metadata.groupby('dataset2').size().max()
 
-        # balance and sample based on a predefined number of samples
+        # balance and sample based on a predefined number of samples; an optional
+        # per-dataset weight upsamples specific datasets relative to the balanced count.
+        weights = getattr(self, 'dataset_weights', {}) or {}
         df_balanced = (self.metadata.groupby('dataset2')
-                           .apply(lambda x: self._balance_group(x, 
-                                                                n_samples = n_samples, 
-                                                                random_state = random_state), 
+                           .apply(lambda x: self._balance_group(x,
+                                                                n_samples = max(1, int(round(n_samples * weights.get(x.name, 1.0)))),
+                                                                random_state = random_state),
                                                                 include_groups = False)
                            .reset_index(drop = True))
-        
+
         return df_balanced
 
     # def _get_scale(self, row): 
