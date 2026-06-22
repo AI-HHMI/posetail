@@ -9,16 +9,25 @@ def _sigmoid(x):
     # matches the decision boundary the BCE-with-logits vis loss optimizes toward.
     return 1.0 / (1.0 + np.exp(-x))
 
-def get_eval_metrics(vis_pred, vis_true, coords_pred, 
-                     coords_true, thresholds = None, 
-                     survival_threshold = 50, prefix = 'eval/'):
+def get_eval_metrics(vis_pred, vis_true, coords_pred,
+                     coords_true, thresholds = None,
+                     survival_threshold = 50, prefix = 'eval/',
+                     cube_scale = None, delta_x_multiplier = 1.0):
 
+    # cube_scale: optional (B,) world-units-per-pixel (median over cameras). When given, the
+    # delta_x thresholds become k * cube_scale * delta_x_multiplier world units, i.e. delta_x_k
+    # = "fraction within (k * multiplier) pixels at the model's resolution" -- cross-dataset
+    # comparable (multiplier=1 -> the standard TAP-Vid pixel thresholds). None -> raw world-unit
+    # thresholds (backward compatible).
     if vis_true is None:
-        vis_true = get_vis_true(coords_true) 
+        vis_true = get_vis_true(coords_true)
 
     if thresholds is None:
         thresholds = [1, 2, 4, 8, 16]
-    
+
+    if cube_scale is not None and isinstance(cube_scale, torch.Tensor):
+        cube_scale = cube_scale.detach().cpu().to(torch.float32).numpy()
+
     vis_pred = vis_pred.detach().cpu().to(torch.float32).numpy()
     vis_true = vis_true.detach().cpu().numpy().astype(bool)
     coords_pred = coords_pred.detach().cpu().to(torch.float32).numpy()
@@ -30,14 +39,16 @@ def get_eval_metrics(vis_pred, vis_true, coords_pred,
 
     mpjpe = get_mpjpe(coords_pred, coords_true, vis_pred, vis_true)
 
-    delta_x_avg, delta_x_dict = get_delta_x_avg(coords_pred, 
-        coords_true, vis_true, thresholds = thresholds)
+    delta_x_avg, delta_x_dict = get_delta_x_avg(coords_pred,
+        coords_true, vis_true, thresholds = thresholds,
+        cube_scale = cube_scale, multiplier = delta_x_multiplier)
     
     survival_rate = get_survival_rate(coords_pred, 
         coords_true, vis_true, threshold = survival_threshold)
     
-    avg_jaccard, avg_jaccard_dict = get_average_jaccard(coords_pred, 
-        coords_true, vis_pred, vis_true, thresholds=thresholds)
+    avg_jaccard, avg_jaccard_dict = get_average_jaccard(coords_pred,
+        coords_true, vis_pred, vis_true, thresholds=thresholds,
+        cube_scale=cube_scale, multiplier=delta_x_multiplier)
 
     metrics = {f'{prefix}mte': mte, 
                f'{prefix}delta_x_avg': delta_x_avg, 
@@ -102,42 +113,55 @@ def get_occlusion_accuracy(vis_pred, vis_true):
     return occlusion_acc
 
 
-def get_delta_x(coords_pred, coords_true, vis_true, threshold):
-    ''' 
-    for points that are visible, measures the fraction of 
-    points that are within a distance delta pixels from 
+def get_delta_x(coords_pred, coords_true, vis_true, threshold,
+                cube_scale = None, multiplier = 1.0):
+    '''
+    for points that are visible, measures the fraction of
+    points that are within a distance delta pixels from
     their ground truth
 
-    parameters: 
+    parameters:
         coords_pred: B, T, N, 3
         coords_true: B, T, N, 3
         vis_true: B, T, N, 1
+        cube_scale: optional (B,) world-units-per-pixel; when given the threshold is
+            threshold * multiplier * cube_scale[b] (world units), i.e. a fixed PIXEL
+            threshold comparable across datasets. None -> raw world-unit threshold.
+    '''
 
-    ''' 
-
-    within_thresh = np.sum((coords_pred - coords_true) ** 2, axis=-1) < (threshold ** 2)
+    dist2 = np.sum((coords_pred - coords_true) ** 2, axis=-1)              # (B, T, N)
+    if cube_scale is not None:
+        B = coords_pred.shape[0]
+        thr = (threshold * multiplier
+               * np.asarray(cube_scale, dtype=np.float64).reshape(B, 1, 1))  # (B,1,1) world units
+        within_thresh = dist2 < (thr ** 2)
+    else:
+        within_thresh = dist2 < (threshold ** 2)
     good = within_thresh[..., None] & vis_true
     delta_x = np.sum(good, axis = (0, 1, 2)) / np.sum(vis_true)
 
-    return delta_x 
+    return delta_x
 
 
-def get_delta_x_avg(coords_pred, coords_true, 
-                    vis_true, thresholds = None): 
+def get_delta_x_avg(coords_pred, coords_true,
+                    vis_true, thresholds = None,
+                    cube_scale = None, multiplier = 1.0):
 
     delta_xs = []
-    
+
     # initialize to default values
-    if thresholds is None: 
+    if thresholds is None:
         thresholds = [1, 2, 4, 8, 16]
 
     for thresh in thresholds:
 
         delta_x = get_delta_x(
-            coords_pred = coords_pred, 
-            coords_true = coords_true, 
-            vis_true = vis_true, 
-            threshold = thresh)
+            coords_pred = coords_pred,
+            coords_true = coords_true,
+            vis_true = vis_true,
+            threshold = thresh,
+            cube_scale = cube_scale,
+            multiplier = multiplier)
 
         delta_xs.append(delta_x)
 
@@ -322,7 +346,8 @@ def get_survival_rate(coords_pred, coords_true, vis_true, threshold = 50):
     return float(np.mean(survival_ratios))
 
 
-def get_average_jaccard(coords_pred, coords_true, vis_pred, vis_true, thresholds=None):
+def get_average_jaccard(coords_pred, coords_true, vis_pred, vis_true, thresholds=None,
+                        cube_scale=None, multiplier=1.0):
     '''
     Average Jaccard (MVTracker / TAP-Vid definition).
 
@@ -339,6 +364,9 @@ def get_average_jaccard(coords_pred, coords_true, vis_pred, vis_true, thresholds
         coords_true: B, T, N, 3
         vis_pred:    B, T, N, 1  float in [0, 1]
         vis_true:    B, T, N, 1  bool
+        cube_scale:  optional (B,) world-units-per-pixel; when given, the closeness
+            threshold per track b is thresh * multiplier * cube_scale[b] world units
+            (a fixed PIXEL threshold, comparable across datasets, matching delta_x).
     '''
     if thresholds is None:
         thresholds = [1, 2, 4, 8, 16]
@@ -347,6 +375,8 @@ def get_average_jaccard(coords_pred, coords_true, vis_pred, vis_true, thresholds
     pred_vis = np.squeeze(_sigmoid(vis_pred) > 0.5, axis=-1) # B, T, N
     dist    = np.linalg.norm(coords_pred - coords_true, axis=-1)  # B, T, N
     B, T, N = dist.shape
+    cs = (np.asarray(cube_scale, dtype=np.float64).reshape(B) if cube_scale is not None
+          else np.ones(B))
 
     per_thresh = {t: [] for t in thresholds}
 
@@ -357,7 +387,7 @@ def get_average_jaccard(coords_pred, coords_true, vis_pred, vis_true, thresholds
             d  = dist[b, :, n]      # (T,)
 
             for thresh in thresholds:
-                alpha = d < thresh  # (T,) bool
+                alpha = d < (thresh * multiplier * cs[b])  # (T,) bool; cs[b]=1 if no cube_scale
 
                 tp    = np.sum(vt & vh & alpha)
                 denom = np.sum(vt) + np.sum(~vt & vh) + np.sum(vt & vh & ~alpha)

@@ -395,6 +395,15 @@ def dict_to_device(dd, device):
 
     return dout
 
+
+def _eval_cube_scale(cgroup, query_coords):
+    """median-over-cameras world-units-per-pixel (B,) for cross-dataset delta_x/jaccard
+    normalization. Returns None on failure (-> raw world-unit thresholds)."""
+    try:
+        return torch.median(get_camera_scale(cgroup, query_coords), dim=0).values
+    except Exception:
+        return None
+
 def total_to_per_gpu(i, world_size): 
     per_gpu = (i + world_size - 1) // world_size
     return per_gpu
@@ -497,7 +506,8 @@ def train_iteration(config, model, fabric, batch,
             vis_true = vis,
             coords_pred = coords_pred,
             coords_true = coords,
-            prefix = prefix
+            prefix = prefix,
+            cube_scale = _eval_cube_scale(cgroup, query_coords),
         )
         metric_dicts.append(metrics_dict)
 
@@ -636,7 +646,8 @@ def train_epoch(config, model, fabric, dataloader,
                 vis_true = vis,
                 coords_pred = coords_pred,
                 coords_true = coords,
-                prefix = prefix
+                prefix = prefix,
+                cube_scale = _eval_cube_scale(cgroup, query_coords),
             )
             metric_dicts.append(metrics_dict)
 
@@ -783,19 +794,17 @@ def test_epoch(config, model, dataloader, loss = None,
                 _, tgt_md  = normalize_by_mean_depth(coords, vis_for_norm, C)
                 coords_pred = C + (coords_pred - C) * (tgt_md / pred_md)
 
+            cube_scale = _eval_cube_scale(cgroup, query_coords)
             metrics_dict = get_eval_metrics(
                 vis_pred = vis_pred,
                 vis_true = vis,
                 coords_pred = coords_pred,
                 coords_true = coords,
-                prefix = prefix
+                prefix = prefix,
+                cube_scale = cube_scale,
             )
             # Fast-motion breakdown: error by cube_scale-normalized displacement-from-query,
             # so val/mte_mo_fast etc. are a watchable, cross-dataset-comparable "fast motion" signal.
-            try:
-                cube_scale = torch.median(get_camera_scale(cgroup, query_coords), dim=0).values
-            except Exception:
-                cube_scale = None
             metrics_dict.update(get_metrics_by_motion(
                 coords_pred = coords_pred,
                 coords_true = coords,
