@@ -18,7 +18,7 @@ from easydict import EasyDict
 # from posetail.datasets.datasets import Rat7mIterableDataset
 from posetail.datasets.utils import safe_make
 from posetail.posetail.cube import get_camera_scale
-from posetail.posetail.eval_metrics import get_eval_metrics, get_metrics_by_horizon, get_metrics_by_motion
+from posetail.posetail.eval_metrics import get_eval_metrics, get_metrics_by_motion
 from posetail.posetail.cube import get_camera_scale
 from posetail.posetail.losses import get_vis_true, unroll_batch, normalize_by_mean_depth
 from posetail.posetail.tracker import Tracker
@@ -790,19 +790,6 @@ def test_epoch(config, model, dataloader, loss = None,
                 coords_true = coords,
                 prefix = prefix
             )
-            # Per-horizon drift breakdown (error vs |t - t_src|). The aggregate
-            # delta_x_avg above averages over all frames and HIDES drift; these
-            # expose it. emit_all keeps the key set stable for average_metrics.
-            horizons = [h for h in (1, 2, 4, 8, 16, 24, 32) if h < coords.shape[1]]
-            metrics_dict.update(get_metrics_by_horizon(
-                coords_pred = coords_pred,
-                coords_true = coords,
-                vis_true = vis,
-                query_times = query_times,
-                horizons = horizons,
-                prefix = prefix,
-                emit_all = True,
-            ))
             # Fast-motion breakdown: error by cube_scale-normalized displacement-from-query,
             # so val/mte_mo_fast etc. are a watchable, cross-dataset-comparable "fast motion" signal.
             try:

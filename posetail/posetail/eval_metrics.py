@@ -228,8 +228,8 @@ def get_metrics_by_motion(coords_pred, coords_true, vis_true, query_times=None,
     '''Error binned by each point's DISPLACEMENT from its query frame, normalized by
     cube_scale (world-units-per-pixel) so "fast motion" is in pixel-equivalent units and
     comparable across datasets. This is the watchable "how good on fast motion" signal:
-    mte_mo_{slow,med,fast,vfast} (median px error) and dx4_mo_* (fraction within 4 px).
-    Bins (px displacement-from-query): slow <4, med 4-16, fast 16-64, vfast >=64.
+    mte_mo_{slow,med,fast,vfast} (median px error). Bins (px displacement-from-query):
+    slow <4, med 4-16, fast 16-64, vfast >=64.
 
     cube_scale: (B,) world units per pixel (median over cameras); None -> 1 (raw units).
     Keys are STABLE (NaN for empty bins) so average_metrics can aggregate them.'''
@@ -251,10 +251,7 @@ def get_metrics_by_motion(coords_pred, coords_true, vis_true, query_times=None,
     for lo, hi, name in [(0, 4, 'slow'), (4, 16, 'med'), (16, 64, 'fast'), (64, 1e18, 'vfast')]:
         sel = (disp >= lo) & (disp < hi) & vis & finite
         n = int(sel.sum())
-        e = err[sel]
-        metrics[f'{prefix}mte_mo_{name}'] = float(np.median(e)) if n else float('nan')
-        metrics[f'{prefix}dx4_mo_{name}'] = float(np.mean(e < 4)) if n else float('nan')
-        metrics[f'{prefix}n_mo_{name}'] = n
+        metrics[f'{prefix}mte_mo_{name}'] = float(np.median(err[sel])) if n else float('nan')
     return metrics
 
 
