@@ -18,10 +18,12 @@ from easydict import EasyDict
 # from posetail.datasets.datasets import Rat7mIterableDataset
 from posetail.datasets.utils import safe_make
 from posetail.posetail.cube import get_camera_scale
-from posetail.posetail.eval_metrics import get_eval_metrics
+from posetail.posetail.eval_metrics import get_eval_metrics, get_metrics_by_horizon, get_metrics_by_motion
+from posetail.posetail.cube import get_camera_scale
 from posetail.posetail.losses import get_vis_true, unroll_batch, normalize_by_mean_depth
 from posetail.posetail.tracker import Tracker
 from posetail.posetail.tracker_encoder import TrackerEncoder
+from posetail.posetail.tracker_tapnext import TrackerTapNext
 
 from schedulefree import AdamWScheduleFree
 
@@ -248,6 +250,8 @@ def load_checkpoint(config_path, checkpoint_path, model = None,
 
         if config.model.mode_3d == 'encoder':
             model = TrackerEncoder(**config.model)
+        elif config.model.mode_3d == 'tapnext':
+            model = TrackerTapNext(**config.model)
         else:
             model = Tracker(**config.model)
 
@@ -314,6 +318,8 @@ def load_checkpoint_no_inductor(config_path, checkpoint_path):
 
     if config.model.mode_3d == 'encoder':
         model = TrackerEncoder(**config.model)
+    elif config.model.mode_3d == 'tapnext':
+        model = TrackerTapNext(**config.model)
     else:
         model = Tracker(**config.model) 
 
@@ -784,6 +790,33 @@ def test_epoch(config, model, dataloader, loss = None,
                 coords_true = coords,
                 prefix = prefix
             )
+            # Per-horizon drift breakdown (error vs |t - t_src|). The aggregate
+            # delta_x_avg above averages over all frames and HIDES drift; these
+            # expose it. emit_all keeps the key set stable for average_metrics.
+            horizons = [h for h in (1, 2, 4, 8, 16, 24, 32) if h < coords.shape[1]]
+            metrics_dict.update(get_metrics_by_horizon(
+                coords_pred = coords_pred,
+                coords_true = coords,
+                vis_true = vis,
+                query_times = query_times,
+                horizons = horizons,
+                prefix = prefix,
+                emit_all = True,
+            ))
+            # Fast-motion breakdown: error by cube_scale-normalized displacement-from-query,
+            # so val/mte_mo_fast etc. are a watchable, cross-dataset-comparable "fast motion" signal.
+            try:
+                cube_scale = torch.median(get_camera_scale(cgroup, query_coords), dim=0).values
+            except Exception:
+                cube_scale = None
+            metrics_dict.update(get_metrics_by_motion(
+                coords_pred = coords_pred,
+                coords_true = coords,
+                vis_true = vis,
+                query_times = query_times,
+                cube_scale = cube_scale,
+                prefix = prefix,
+            ))
             metric_dicts.append(metrics_dict)
             metric_datasets.append(batch.sample_info.get('dataset', 'unknown'))
 
