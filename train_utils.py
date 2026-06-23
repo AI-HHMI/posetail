@@ -82,9 +82,14 @@ def load_config(config_path, easy = True):
 #     return config
 
 
-def save_config(config_path, new_config_path):
+def save_config(config_path, new_config_path, extra=None):
 
     config = load_config(config_path, easy = False)
+
+    # Merge in runtime-only fields (e.g. wandb run_id/run_dir) under [wandb] so the
+    # saved config.toml records which run produced it.
+    if extra:
+        config.setdefault('wandb', {}).update(extra)
 
     with open(new_config_path, 'w') as toml_file:
         toml.dump(config, toml_file)
@@ -172,6 +177,8 @@ def save_checkpoint(model, optimizer, prefix, i, config = None):
         sf.train()
 
     torch.save(state_dict, checkpoint_path)
+
+    return checkpoint_path
 
 
 def _interp_res_params(param_dict, model):
