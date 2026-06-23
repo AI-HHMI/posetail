@@ -451,6 +451,7 @@ class QueryEncoder(nn.Module):
 class SceneRepresentation(nn.Module):
     def __init__(self, version='large', freeze_encoder=True, n_frames=16, image_size=256,
                  hierarchical_features=True, decoder_dim=None,
+                 proj_prenorm=False, proj_mlp=False,
                  video_encoder_finetune_last_n_layers=None):
         super().__init__()
 
@@ -509,14 +510,46 @@ class SceneRepresentation(nn.Module):
                          image_size // self.patch_size)
 
         if decoder_dim is not None:
-            self.kv_proj = nn.Linear(self.embed_dim, decoder_dim)
-            nn.init.xavier_uniform_(self.kv_proj.weight)
-            nn.init.zeros_(self.kv_proj.bias)
+            in_dim = self.embed_dim
+
+            # Optional per-level pre-projection normalization. With hierarchical
+            # features the scene vector is N VJEPA levels concatenated along the
+            # feature dim, so we LayerNorm each level's chunk independently before
+            # projecting -- targeting the cross-depth scale mismatch. Gracefully
+            # degrades to a single LayerNorm when features are not hierarchical.
+            if proj_prenorm:
+                self.n_proj_levels = 4 if hierarchical_features else 1
+                assert in_dim % self.n_proj_levels == 0
+                level_dim = in_dim // self.n_proj_levels
+                self.pre_norms = nn.ModuleList(
+                    [nn.LayerNorm(level_dim) for _ in range(self.n_proj_levels)])
+            else:
+                self.n_proj_levels = 1
+                self.pre_norms = None
+
+            # Projection from the (concatenated) encoder dim down to decoder_dim:
+            # either a single Linear or a small MLP bottleneck (Linear-GELU-Linear).
+            if proj_mlp:
+                self.kv_proj = nn.Sequential(
+                    nn.Linear(in_dim, decoder_dim),
+                    nn.GELU(),
+                    nn.Linear(decoder_dim, decoder_dim),
+                )
+                for m in self.kv_proj:
+                    if isinstance(m, nn.Linear):
+                        nn.init.xavier_uniform_(m.weight)
+                        nn.init.zeros_(m.bias)
+            else:
+                self.kv_proj = nn.Linear(in_dim, decoder_dim)
+                nn.init.xavier_uniform_(self.kv_proj.weight)
+                nn.init.zeros_(self.kv_proj.bias)
+
             self.kv_norm = nn.LayerNorm(decoder_dim)
             self.embed_dim = decoder_dim
         else:
             self.kv_proj = None
             self.kv_norm = None
+            self.pre_norms = None
 
     def set_encoder_requires_grad(self, requires_grad):
         """Toggle gradients for the underlying video encoder, e.g. to unfreeze
@@ -571,6 +604,10 @@ class SceneRepresentation(nn.Module):
             gW = view.shape[4] // self.patch_size
             feat = feat + self._pos_embed_for(gT, gH, gW)
             if self.kv_proj is not None:
+                if self.pre_norms is not None:
+                    chunks = torch.chunk(feat, self.n_proj_levels, dim=-1)
+                    feat = torch.cat(
+                        [norm(c) for norm, c in zip(self.pre_norms, chunks)], dim=-1)
                 feat = self.kv_proj(feat)
                 feat = self.kv_norm(feat)
             encoded_list.append(feat)
@@ -743,6 +780,19 @@ class Decoder(nn.Module):
             ])
             self.norm_ts = nn.ModuleList([AdaptiveLayerNorm(embed_dim) for _ in range(num_layers)])
 
+        # Sliding-window latent hand-off: fuse the previous window's final decoder
+        # latent (for the overlap frames) into this window's query tokens before the
+        # transformer stack. LayerNorm gives the carried latent unit scale; the Linear
+        # is zero-initialised so the hand-off is a no-op at load time -- a model
+        # warm-started from a non-windowed checkpoint behaves identically until this
+        # learns to use the carried state. No-op (and skipped) when prev_latent is None.
+        self.latent_carry = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        nn.init.zeros_(self.latent_carry[1].weight)
+        nn.init.zeros_(self.latent_carry[1].bias)
+
         # Per-mode output heads: index 0 = 2D, index 1 = 3D.
         # In grid mode the heads emit per-axis bin logits (marginal soft-argmax):
         #   3D    -> 3*G logits,  depth -> G logits,  2D -> 2*P pixel logits.
@@ -844,15 +894,22 @@ class Decoder(nn.Module):
         probs = probs / probs.sum(dim=-1, keepdim=True)
         return (probs * grid_values.to(probs.dtype)).sum(dim=-1)
 
-    def forward(self, scene_features, query_embeds, rays, mode_idx):
+    def forward(self, scene_features, query_embeds, rays, mode_idx, prev_latent=None):
         """
         Args:
             scene_features: [N_cams, B, N_tokens, encoder_dim] from SceneRepresentation
             query_embeds: [B, T, K, N_cams, embed_dim]  T=frames, K=points
             rays: [B, T, K, N_cams, 4, 4]
             mode_idx: LongTensor of shape [1] — 0 for 2D queries, 1 for 3D queries
+            prev_latent: [B, T, K, N_cams, embed_dim] or None — the previous sliding
+                window's final decoder latent, frame-aligned to this window, fused into
+                the query tokens before the stack (sliding-window hand-off). None for the
+                first window / non-windowed pass.
         Returns:
             outputs: [B, T, K, N_cams, out_dim]
+            grid_logits: dict or None
+            latent: [B, T, K, N_cams, embed_dim] — this window's final decoder latent,
+                to carry into the next window.
         """
         B, T, K, N_cams, embed_dim = query_embeds.shape
         assert embed_dim == self.embed_dim
@@ -860,6 +917,12 @@ class Decoder(nn.Module):
         kv = rearrange(scene_features, 'cams b tokens dim -> (cams b) tokens dim')
         x = rearrange(query_embeds, 'b t k cams dim -> (cams b) (t k) dim')
         rays_r = rearrange(rays, 'b t k cams d e -> (b t k) cams d e')
+
+        # Sliding-window hand-off: add the carried latent into the query tokens.
+        # Zero-init Linear -> no-op until trained (warm-start safe); see __init__.
+        if prev_latent is not None:
+            carry = rearrange(prev_latent, 'b t k cams dim -> (cams b) (t k) dim')
+            x = x + self.latent_carry(carry)
 
         for layer_idx in range(self.num_layers):
             if self.use_camera_self_attention:
@@ -936,4 +999,6 @@ class Decoder(nn.Module):
 
         output = rearrange(output, '(cams b) (t k) dim -> b t k cams dim',
                            cams=N_cams, b=B, t=T, k=K)
-        return output, grid_logits
+        latent = rearrange(x, '(cams b) (t k) dim -> b t k cams dim',
+                           cams=N_cams, b=B, t=T, k=K)
+        return output, grid_logits, latent

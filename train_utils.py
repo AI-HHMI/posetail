@@ -193,15 +193,31 @@ def _interp_res_params(param_dict, model):
         changed = True
         tgt = msd[k]
         if k.endswith('scene_encoder.pos_embed'):
-            # [1, T'*H'*W', D] grid; interpolate spatially (and temporally) to the model's grid.
+            # [1, T'*H'*W', D] grid; interpolate spatially and/or temporally to the
+            # model's grid. Handles an image_size change (T' fixed, the original case)
+            # and an n_frames change (H'/W' fixed, e.g. a non-windowed 16-frame
+            # checkpoint loaded into an 8-frame windowed model). Recover the
+            # checkpoint's (T',H',W') grid -- spatial is square (H'==W') -- by trying
+            # spatial-unchanged first, then temporal-unchanged.
             sT, sH, sW = model.scene_encoder._pe_grid
             D = v.shape[-1]; old_n = v.shape[1]
-            oldHW = int(round(math.sqrt(old_n / sT)))   # n_frames (=> T') assumed unchanged
-            if sT * oldHW * oldHW != old_n:
+            if old_n % (sH * sW) == 0:
+                oldT, oldHW = old_n // (sH * sW), sH      # n_frames changed
+            else:
+                oldT, oldHW = sT, int(round(math.sqrt(old_n / sT)))  # image_size changed
+            if oldT * oldHW * oldHW != old_n:
                 continue
-            pe = v.reshape(1, sT, oldHW, oldHW, D).permute(0, 4, 1, 2, 3).float()
+            pe = v.reshape(1, oldT, oldHW, oldHW, D).permute(0, 4, 1, 2, 3).float()
             pe = F.interpolate(pe, size=(sT, sH, sW), mode='trilinear', align_corners=False)
             out[k] = pe.permute(0, 2, 3, 4, 1).reshape(1, sT * sH * sW, D).to(v.dtype)
+            print(f'  res-interp {k}: {tuple(v.shape)} -> {tuple(out[k].shape)}')
+        elif k.endswith('t_query_embed.weight') or k.endswith('t_target_embed.weight'):
+            # [n_frames, D] learned per-frame position table; linearly resample the
+            # frame dim (mirrors QueryEncoder._interp_time_embed's runtime resize).
+            newF = tgt.shape[0]
+            w = v.t().unsqueeze(0).float()                   # [1, D, oldF]
+            w = F.interpolate(w, size=newF, mode='linear', align_corners=False)
+            out[k] = w.squeeze(0).t().to(v.dtype)            # [newF, D]
             print(f'  res-interp {k}: {tuple(v.shape)} -> {tuple(out[k].shape)}')
         elif 'heads_2d' in k and k.endswith('.1.weight'):
             # Linear out = 2*image_size logits ([x|y] x P bins); resample the P-bin dim.
