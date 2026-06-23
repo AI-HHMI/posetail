@@ -380,6 +380,9 @@ class PosetailDataset(Dataset):
         # for balancing datasets
         self.balance_datasets = config.dataset[split].get('balance_datasets', True)
         self.n_samples_per_dataset = config.dataset[split].get('n_samples_per_dataset', -1) # default balances based on dataset with the most samples
+        # optional per-dataset upsampling multiplier applied on top of balancing, e.g.
+        # {"kubric-multiview": 2.0}. Absent / weight 1.0 -> exact uniform-balance behavior.
+        self.dataset_weights = dict(config.dataset[split].get('dataset_weights', {}) or {})
 
         
         # per-camera augmentations: same parameters applied to all frames of one camera
@@ -1028,24 +1031,34 @@ class PosetailDataset(Dataset):
         # sample if there are more keypoints than the number to sample
         if coords.shape[1] > num_kpts_to_sample:
             # sample a proportion of static vs dynamic points if a speed thresh is provided
-            if self.speed_thresh is not None: 
+            if self.speed_thresh is not None:
 
-                dynamic_mask = avg_speed >= self.speed_thresh
-                static_mask = ~dynamic_mask
+                n_dyn = int(num_kpts_to_sample * self.prop_dynamic_kpts_to_sample)
+                n_stat = num_kpts_to_sample - n_dyn
 
-                num_dynamic = int(num_kpts_to_sample * self.prop_dynamic_kpts_to_sample)
-                num_static = num_kpts_to_sample - num_dynamic
+                dynamic_idx = torch.where(avg_speed >= self.speed_thresh)[0].cpu().numpy()
+                static_idx = torch.where(avg_speed < self.speed_thresh)[0].cpu().numpy()
 
-                dynamic_idx = torch.where(dynamic_mask)[0].cpu().numpy()
-                static_idx = torch.where(static_mask)[0].cpu().numpy()
+                # Trap fix: if too few keypoints clear the threshold to fill the dynamic
+                # quota, PROMOTE the fastest sub-threshold keypoints into the dynamic pool.
+                # The old code instead left the clip short, which RAISED the static fraction
+                # (and dropped the total kpt count) exactly when speed_thresh was set high to
+                # emphasize fast motion -- the opposite of the intent. When there ARE enough
+                # dynamic keypoints this is identical to the original behavior.
+                if len(dynamic_idx) < n_dyn and len(static_idx) > 0:
+                    sp = avg_speed.cpu().numpy()
+                    order = static_idx[np.argsort(-sp[static_idx])]      # fastest first
+                    promote = order[: n_dyn - len(dynamic_idx)]
+                    dynamic_idx = np.concatenate([dynamic_idx, promote])
+                    static_idx = np.setdiff1d(static_idx, promote)
 
-                num_dynamic = min(num_dynamic, len(dynamic_idx))
-                num_static = min(num_static, len(static_idx))
+                num_dynamic = min(n_dyn, len(dynamic_idx))
+                num_static = min(n_stat, len(static_idx))
 
-                sampled_dynamic = np.random.choice(dynamic_idx, size = num_dynamic, replace = False) if len(dynamic_idx) > 0 else []
-                sampled_static = np.random.choice(static_idx, size = num_static, replace = False) if len(static_idx) > 0 else []
+                sampled_dynamic = np.random.choice(dynamic_idx, size = num_dynamic, replace = False) if len(dynamic_idx) > 0 else np.array([], dtype = int)
+                sampled_static = np.random.choice(static_idx, size = num_static, replace = False) if len(static_idx) > 0 else np.array([], dtype = int)
 
-                ix_p = np.concatenate([sampled_dynamic, sampled_static])
+                ix_p = np.concatenate([sampled_dynamic, sampled_static]).astype(int)
                 np.random.shuffle(ix_p)
                 coords = coords[:, ix_p]
 
@@ -1355,14 +1368,16 @@ class PosetailDataset(Dataset):
         if n_samples == -1: 
             n_samples = self.metadata.groupby('dataset2').size().max()
 
-        # balance and sample based on a predefined number of samples
+        # balance and sample based on a predefined number of samples; an optional
+        # per-dataset weight upsamples specific datasets relative to the balanced count.
+        weights = getattr(self, 'dataset_weights', {}) or {}
         df_balanced = (self.metadata.groupby('dataset2')
-                           .apply(lambda x: self._balance_group(x, 
-                                                                n_samples = n_samples, 
-                                                                random_state = random_state), 
+                           .apply(lambda x: self._balance_group(x,
+                                                                n_samples = max(1, int(round(n_samples * weights.get(x.name, 1.0)))),
+                                                                random_state = random_state),
                                                                 include_groups = False)
                            .reset_index(drop = True))
-        
+
         return df_balanced
 
     # def _get_scale(self, row): 

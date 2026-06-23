@@ -9,16 +9,25 @@ def _sigmoid(x):
     # matches the decision boundary the BCE-with-logits vis loss optimizes toward.
     return 1.0 / (1.0 + np.exp(-x))
 
-def get_eval_metrics(vis_pred, vis_true, coords_pred, 
-                     coords_true, thresholds = None, 
-                     survival_threshold = 50, prefix = 'eval/'):
+def get_eval_metrics(vis_pred, vis_true, coords_pred,
+                     coords_true, thresholds = None,
+                     survival_threshold = 50, prefix = 'eval/',
+                     cube_scale = None, delta_x_multiplier = 1.0):
 
+    # cube_scale: optional (B,) world-units-per-pixel (median over cameras). When given, the
+    # delta_x thresholds become k * cube_scale * delta_x_multiplier world units, i.e. delta_x_k
+    # = "fraction within (k * multiplier) pixels at the model's resolution" -- cross-dataset
+    # comparable (multiplier=1 -> the standard TAP-Vid pixel thresholds). None -> raw world-unit
+    # thresholds (backward compatible).
     if vis_true is None:
-        vis_true = get_vis_true(coords_true) 
+        vis_true = get_vis_true(coords_true)
 
     if thresholds is None:
         thresholds = [1, 2, 4, 8, 16]
-    
+
+    if cube_scale is not None and isinstance(cube_scale, torch.Tensor):
+        cube_scale = cube_scale.detach().cpu().to(torch.float32).numpy()
+
     vis_pred = vis_pred.detach().cpu().to(torch.float32).numpy()
     vis_true = vis_true.detach().cpu().numpy().astype(bool)
     coords_pred = coords_pred.detach().cpu().to(torch.float32).numpy()
@@ -30,14 +39,16 @@ def get_eval_metrics(vis_pred, vis_true, coords_pred,
 
     mpjpe = get_mpjpe(coords_pred, coords_true, vis_pred, vis_true)
 
-    delta_x_avg, delta_x_dict = get_delta_x_avg(coords_pred, 
-        coords_true, vis_true, thresholds = thresholds)
+    delta_x_avg, delta_x_dict = get_delta_x_avg(coords_pred,
+        coords_true, vis_true, thresholds = thresholds,
+        cube_scale = cube_scale, multiplier = delta_x_multiplier)
     
     survival_rate = get_survival_rate(coords_pred, 
         coords_true, vis_true, threshold = survival_threshold)
     
-    avg_jaccard, avg_jaccard_dict = get_average_jaccard(coords_pred, 
-        coords_true, vis_pred, vis_true, thresholds=thresholds)
+    avg_jaccard, avg_jaccard_dict = get_average_jaccard(coords_pred,
+        coords_true, vis_pred, vis_true, thresholds=thresholds,
+        cube_scale=cube_scale, multiplier=delta_x_multiplier)
 
     metrics = {f'{prefix}mte': mte, 
                f'{prefix}delta_x_avg': delta_x_avg, 
@@ -102,42 +113,55 @@ def get_occlusion_accuracy(vis_pred, vis_true):
     return occlusion_acc
 
 
-def get_delta_x(coords_pred, coords_true, vis_true, threshold):
-    ''' 
-    for points that are visible, measures the fraction of 
-    points that are within a distance delta pixels from 
+def get_delta_x(coords_pred, coords_true, vis_true, threshold,
+                cube_scale = None, multiplier = 1.0):
+    '''
+    for points that are visible, measures the fraction of
+    points that are within a distance delta pixels from
     their ground truth
 
-    parameters: 
+    parameters:
         coords_pred: B, T, N, 3
         coords_true: B, T, N, 3
         vis_true: B, T, N, 1
+        cube_scale: optional (B,) world-units-per-pixel; when given the threshold is
+            threshold * multiplier * cube_scale[b] (world units), i.e. a fixed PIXEL
+            threshold comparable across datasets. None -> raw world-unit threshold.
+    '''
 
-    ''' 
-
-    within_thresh = np.sum((coords_pred - coords_true) ** 2, axis=-1) < (threshold ** 2)
+    dist2 = np.sum((coords_pred - coords_true) ** 2, axis=-1)              # (B, T, N)
+    if cube_scale is not None:
+        B = coords_pred.shape[0]
+        thr = (threshold * multiplier
+               * np.asarray(cube_scale, dtype=np.float64).reshape(B, 1, 1))  # (B,1,1) world units
+        within_thresh = dist2 < (thr ** 2)
+    else:
+        within_thresh = dist2 < (threshold ** 2)
     good = within_thresh[..., None] & vis_true
     delta_x = np.sum(good, axis = (0, 1, 2)) / np.sum(vis_true)
 
-    return delta_x 
+    return delta_x
 
 
-def get_delta_x_avg(coords_pred, coords_true, 
-                    vis_true, thresholds = None): 
+def get_delta_x_avg(coords_pred, coords_true,
+                    vis_true, thresholds = None,
+                    cube_scale = None, multiplier = 1.0):
 
     delta_xs = []
-    
+
     # initialize to default values
-    if thresholds is None: 
+    if thresholds is None:
         thresholds = [1, 2, 4, 8, 16]
 
     for thresh in thresholds:
 
         delta_x = get_delta_x(
-            coords_pred = coords_pred, 
-            coords_true = coords_true, 
-            vis_true = vis_true, 
-            threshold = thresh)
+            coords_pred = coords_pred,
+            coords_true = coords_true,
+            vis_true = vis_true,
+            threshold = thresh,
+            cube_scale = cube_scale,
+            multiplier = multiplier)
 
         delta_xs.append(delta_x)
 
@@ -145,6 +169,114 @@ def get_delta_x_avg(coords_pred, coords_true,
     delta_x_dict = dict(zip(thresholds, delta_xs))
 
     return delta_x_avg, delta_x_dict 
+
+
+def _to_np(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().to(torch.float32).numpy()
+    return np.asarray(x)
+
+
+def get_metrics_by_horizon(coords_pred, coords_true, vis_true,
+                           query_times=None, horizons=None, thresholds=None,
+                           prefix='eval/', emit_all=False):
+    '''
+    Drift-vs-horizon: error and delta_x bucketed by temporal distance from the
+    source/query frame, h = |t - t_src|. The aggregate delta_x_avg averages over
+    all frames and HIDES drift; this exposes it.
+
+    parameters:
+        coords_pred: B, T, N, R
+        coords_true: B, T, N, R
+        vis_true:    B, T, N, 1  (bool; None -> finite(coords_true))
+        query_times: B, N  source-frame index per track (None -> all 0, i.e. h=t)
+        horizons:    list of integer horizons to report (default 1,2,4,8,16,24,32
+                     clipped to < T)
+        thresholds:  delta_x pixel/metric thresholds (default 1,2,4,8,16)
+        emit_all:    when True, always emit every requested horizon key (NaN for
+                     empty buckets) and mte_fwd/mte_bwd, so the key set is stable
+                     across batches (required by average_metrics, which assumes
+                     uniform keys). When False, empty buckets are skipped.
+
+    returns a flat dict for logging:
+        {prefix}mte_h{h}      = mean L2 over visible points at horizon h
+        {prefix}delta_x_{x}_h{h}
+        {prefix}n_h{h}        = #points in that bucket
+        {prefix}mte_fwd / mte_bwd = mean L2 for h>0 vs h<0 (forward/backward asym.)
+    '''
+    cp = _to_np(coords_pred)
+    ct = _to_np(coords_true)
+    vt = (_to_np(vis_true) if vis_true is not None
+          else np.isfinite(ct[..., :1])).astype(bool)
+    B, T, N, _ = cp.shape
+
+    if query_times is None:
+        q = np.zeros((B, N), dtype=np.int64)
+    else:
+        q = _to_np(query_times).astype(np.int64).reshape(B, N)
+    if thresholds is None:
+        thresholds = [1, 2, 4, 8, 16]
+    if horizons is None:
+        horizons = [h for h in (1, 2, 4, 8, 16, 24, 32) if h < T]
+
+    horizon = np.arange(T)[None, :, None] - q[:, None, :]   # B, T, N  (signed)
+    absh = np.abs(horizon)
+    vis = vt[..., 0]                                         # B, T, N
+    err = np.linalg.norm(cp - ct, axis=-1)                  # B, T, N
+    finite = np.isfinite(err)
+
+    metrics = {}
+    for h in horizons:
+        sel = (absh == h) & vis & finite
+        nsel = int(sel.sum())
+        if nsel == 0 and not emit_all:
+            continue
+        e = err[sel]
+        metrics[f'{prefix}mte_h{h}'] = float(np.mean(e)) if nsel else float('nan')
+        for thr in thresholds:
+            metrics[f'{prefix}delta_x_{thr:.3g}_h{h}'] = (
+                float(np.mean(e < thr)) if nsel else float('nan'))
+        metrics[f'{prefix}n_h{h}'] = nsel
+
+    fwd = (horizon > 0) & vis & finite
+    bwd = (horizon < 0) & vis & finite
+    if fwd.any() or emit_all:
+        metrics[f'{prefix}mte_fwd'] = float(np.mean(err[fwd])) if fwd.any() else float('nan')
+    if bwd.any() or emit_all:
+        metrics[f'{prefix}mte_bwd'] = float(np.mean(err[bwd])) if bwd.any() else float('nan')
+    return metrics
+
+
+def get_metrics_by_motion(coords_pred, coords_true, vis_true, query_times=None,
+                          cube_scale=None, prefix='eval/'):
+    '''Error binned by each point's DISPLACEMENT from its query frame, normalized by
+    cube_scale (world-units-per-pixel) so "fast motion" is in pixel-equivalent units and
+    comparable across datasets. This is the watchable "how good on fast motion" signal:
+    mte_mo_{slow,med,fast,vfast} (median px error). Bins (px displacement-from-query):
+    slow <4, med 4-16, fast 16-64, vfast >=64.
+
+    cube_scale: (B,) world units per pixel (median over cameras); None -> 1 (raw units).
+    Keys are STABLE (NaN for empty bins) so average_metrics can aggregate them.'''
+    cp = _to_np(coords_pred)
+    ct = _to_np(coords_true)
+    vt = (_to_np(vis_true) if vis_true is not None else np.isfinite(ct[..., :1])).astype(bool)
+    B, T, N, R = cp.shape
+    q = (np.zeros((B, N), np.int64) if query_times is None
+         else _to_np(query_times).astype(np.int64).reshape(B, N))
+    cs = (_to_np(cube_scale).reshape(B) if cube_scale is not None else np.ones(B))
+    cs = np.where(cs > 1e-9, cs, 1.0)[:, None, None]                       # (B,1,1)
+    qidx = np.broadcast_to(q[:, None, :, None], (B, 1, N, R))
+    qc = np.take_along_axis(ct, qidx, axis=1)                             # (B,1,N,R) GT at query
+    disp = np.linalg.norm(ct - qc, axis=-1) / cs                         # (B,T,N) px-equiv
+    err = np.linalg.norm(cp - ct, axis=-1) / cs
+    vis = vt[..., 0]
+    finite = np.isfinite(err) & np.isfinite(disp)
+    metrics = {}
+    for lo, hi, name in [(0, 4, 'slow'), (4, 16, 'med'), (16, 64, 'fast'), (64, 1e18, 'vfast')]:
+        sel = (disp >= lo) & (disp < hi) & vis & finite
+        n = int(sel.sum())
+        metrics[f'{prefix}mte_mo_{name}'] = float(np.median(err[sel])) if n else float('nan')
+    return metrics
 
 
 def get_mpjpe(coords_pred, coords_true, vis_pred, vis_true, eps = 1e-8):
@@ -214,7 +346,8 @@ def get_survival_rate(coords_pred, coords_true, vis_true, threshold = 50):
     return float(np.mean(survival_ratios))
 
 
-def get_average_jaccard(coords_pred, coords_true, vis_pred, vis_true, thresholds=None):
+def get_average_jaccard(coords_pred, coords_true, vis_pred, vis_true, thresholds=None,
+                        cube_scale=None, multiplier=1.0):
     '''
     Average Jaccard (MVTracker / TAP-Vid definition).
 
@@ -231,6 +364,9 @@ def get_average_jaccard(coords_pred, coords_true, vis_pred, vis_true, thresholds
         coords_true: B, T, N, 3
         vis_pred:    B, T, N, 1  float in [0, 1]
         vis_true:    B, T, N, 1  bool
+        cube_scale:  optional (B,) world-units-per-pixel; when given, the closeness
+            threshold per track b is thresh * multiplier * cube_scale[b] world units
+            (a fixed PIXEL threshold, comparable across datasets, matching delta_x).
     '''
     if thresholds is None:
         thresholds = [1, 2, 4, 8, 16]
@@ -239,6 +375,8 @@ def get_average_jaccard(coords_pred, coords_true, vis_pred, vis_true, thresholds
     pred_vis = np.squeeze(_sigmoid(vis_pred) > 0.5, axis=-1) # B, T, N
     dist    = np.linalg.norm(coords_pred - coords_true, axis=-1)  # B, T, N
     B, T, N = dist.shape
+    cs = (np.asarray(cube_scale, dtype=np.float64).reshape(B) if cube_scale is not None
+          else np.ones(B))
 
     per_thresh = {t: [] for t in thresholds}
 
@@ -249,7 +387,7 @@ def get_average_jaccard(coords_pred, coords_true, vis_pred, vis_true, thresholds
             d  = dist[b, :, n]      # (T,)
 
             for thresh in thresholds:
-                alpha = d < thresh  # (T,) bool
+                alpha = d < (thresh * multiplier * cs[b])  # (T,) bool; cs[b]=1 if no cube_scale
 
                 tp    = np.sum(vt & vh & alpha)
                 denom = np.sum(vt) + np.sum(~vt & vh) + np.sum(vt & vh & ~alpha)

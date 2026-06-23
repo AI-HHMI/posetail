@@ -18,10 +18,12 @@ from easydict import EasyDict
 # from posetail.datasets.datasets import Rat7mIterableDataset
 from posetail.datasets.utils import safe_make
 from posetail.posetail.cube import get_camera_scale
-from posetail.posetail.eval_metrics import get_eval_metrics
+from posetail.posetail.eval_metrics import get_eval_metrics, get_metrics_by_motion
+from posetail.posetail.cube import get_camera_scale
 from posetail.posetail.losses import get_vis_true, unroll_batch, normalize_by_mean_depth
 from posetail.posetail.tracker import Tracker
 from posetail.posetail.tracker_encoder import TrackerEncoder
+from posetail.posetail.tracker_tapnext import TrackerTapNext
 
 from schedulefree import AdamWScheduleFree
 
@@ -243,6 +245,20 @@ def _interp_res_params(param_dict, model):
     return out, changed
 
 
+def _filter_shape_mismatch(param_dict, model):
+    """Drop checkpoint tensors whose shape no longer matches the model (e.g. a latent_dim or
+    scene_proj_dim change). Those params keep the model's fresh init -> warm-start from only the
+    shape-compatible weights (typically the backbone). Returns (filtered_dict, dropped_keys)."""
+    msd = model.state_dict()
+    kept, dropped = {}, []
+    for k, v in param_dict.items():
+        if k in msd and tuple(msd[k].shape) != tuple(v.shape):
+            dropped.append(k)
+        else:
+            kept[k] = v
+    return kept, dropped
+
+
 def load_checkpoint(config_path, checkpoint_path, model = None,
                     optimizer = None, device = None, eval_weights = 'auto'):
     """Load a checkpoint into a model (and optionally an optimizer for resuming training).
@@ -271,6 +287,8 @@ def load_checkpoint(config_path, checkpoint_path, model = None,
 
         if config.model.mode_3d == 'encoder':
             model = TrackerEncoder(**config.model)
+        elif config.model.mode_3d == 'tapnext':
+            model = TrackerTapNext(**config.model)
         else:
             model = Tracker(**config.model)
 
@@ -284,6 +302,15 @@ def load_checkpoint(config_path, checkpoint_path, model = None,
     # image_size (no-op when shapes already match -> backward-compatible)
     param_dict, res_changed = _interp_res_params(param_dict, model)
 
+    # drop params whose shape no longer matches the model (e.g. a latent_dim / scene_proj_dim
+    # change) -> warm-start from only the shape-compatible weights; the dropped ones keep the
+    # model's fresh init. (strict=False ignores missing/unexpected keys but NOT size mismatches.)
+    param_dict, dropped_keys = _filter_shape_mismatch(param_dict, model)
+    arch_changed = len(dropped_keys) > 0
+    if arch_changed:
+        print(f'  [warn] {len(dropped_keys)} checkpoint params dropped (shape mismatch -> '
+              f'reinitialized): {dropped_keys}')
+
     missing_keys, unexpected_keys = model.load_state_dict(param_dict, strict = False)
     print(f'received missing keys: {missing_keys}')
     print(f'received unexpected keys: {unexpected_keys}')
@@ -294,9 +321,9 @@ def load_checkpoint(config_path, checkpoint_path, model = None,
     # resolution interpolation changed any tensor shape: the optimizer's averaged buffers / baked
     # snapshot are at the original resolution and would shape-mismatch the interpolated params.
     do_swap = (eval_weights is True) or (eval_weights == 'auto' and optimizer is None)
-    if do_swap and res_changed:
-        print('  [warn] resolution-interp changed param shapes; skipping eval-weight swap '
-              '(using interpolated raw model_state)')
+    if do_swap and (res_changed or arch_changed):
+        print('  [warn] param shapes changed (res-interp or arch mismatch); skipping eval-weight '
+              'swap (using raw model_state for the loaded params)')
     elif do_swap:
         eval_param_dict = checkpoint.get('model_state_eval', None)
         if eval_param_dict is not None:
@@ -337,6 +364,8 @@ def load_checkpoint_no_inductor(config_path, checkpoint_path):
 
     if config.model.mode_3d == 'encoder':
         model = TrackerEncoder(**config.model)
+    elif config.model.mode_3d == 'tapnext':
+        model = TrackerTapNext(**config.model)
     else:
         model = Tracker(**config.model) 
 
@@ -412,6 +441,15 @@ def dict_to_device(dd, device):
 
     return dout
 
+
+def _eval_cube_scale(cgroup, query_coords):
+    """median-over-cameras world-units-per-pixel (B,) for cross-dataset delta_x/jaccard
+    normalization. Returns None on failure (-> raw world-unit thresholds)."""
+    try:
+        return torch.median(get_camera_scale(cgroup, query_coords), dim=0).values
+    except Exception:
+        return None
+
 def total_to_per_gpu(i, world_size): 
     per_gpu = (i + world_size - 1) // world_size
     return per_gpu
@@ -484,9 +522,15 @@ def train_iteration(config, model, fabric, batch,
     #                                error_if_nonfinite = False)
 
     try:
-        fabric.clip_gradients(model, optimizer, 
-            max_norm = config.training.max_grad_norm, 
-            error_if_nonfinite = True)
+        if hasattr(optimizer, '_opts'):
+            # DualOptimizer (muon+adamw): fabric.clip_gradients takes a single optimizer, so clip
+            # the model's grads directly (no AMP unscale needed at 32/bf16 precision).
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm,
+                                           error_if_nonfinite=True)
+        else:
+            fabric.clip_gradients(model, optimizer,
+                max_norm = config.training.max_grad_norm,
+                error_if_nonfinite = True)
 
         optimizer.step()
     except:
@@ -508,7 +552,8 @@ def train_iteration(config, model, fabric, batch,
             vis_true = vis,
             coords_pred = coords_pred,
             coords_true = coords,
-            prefix = prefix
+            prefix = prefix,
+            cube_scale = _eval_cube_scale(cgroup, query_coords),
         )
         metric_dicts.append(metrics_dict)
 
@@ -647,7 +692,8 @@ def train_epoch(config, model, fabric, dataloader,
                 vis_true = vis,
                 coords_pred = coords_pred,
                 coords_true = coords,
-                prefix = prefix
+                prefix = prefix,
+                cube_scale = _eval_cube_scale(cgroup, query_coords),
             )
             metric_dicts.append(metrics_dict)
 
@@ -794,13 +840,25 @@ def test_epoch(config, model, dataloader, loss = None,
                 _, tgt_md  = normalize_by_mean_depth(coords, vis_for_norm, C)
                 coords_pred = C + (coords_pred - C) * (tgt_md / pred_md)
 
+            cube_scale = _eval_cube_scale(cgroup, query_coords)
             metrics_dict = get_eval_metrics(
                 vis_pred = vis_pred,
                 vis_true = vis,
                 coords_pred = coords_pred,
                 coords_true = coords,
-                prefix = prefix
+                prefix = prefix,
+                cube_scale = cube_scale,
             )
+            # Fast-motion breakdown: error by cube_scale-normalized displacement-from-query,
+            # so val/mte_mo_fast etc. are a watchable, cross-dataset-comparable "fast motion" signal.
+            metrics_dict.update(get_metrics_by_motion(
+                coords_pred = coords_pred,
+                coords_true = coords,
+                vis_true = vis,
+                query_times = query_times,
+                cube_scale = cube_scale,
+                prefix = prefix,
+            ))
             metric_dicts.append(metrics_dict)
             metric_datasets.append(batch.sample_info.get('dataset', 'unknown'))
 

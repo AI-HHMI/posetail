@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from einops import rearrange, einsum, reduce, repeat
 
 from posetail.posetail.cube import get_camera_scale, from_homogeneous, to_homogeneous
-from posetail.posetail.cube import undistort_points, triangulate_simple_batch, project_points_torch
+from posetail.posetail.cube import undistort_points, triangulate_simple_batch, triangulate_simple_batch_reg, project_points_torch
 from posetail.posetail.cube import points_to_rays, _invert_SE3
 from posetail.posetail.cube import noisy_or_logit
 from posetail.posetail.utils import PadToMultiple, PadToSize, count_parameters
@@ -50,7 +50,10 @@ class TrackerEncoder(nn.Module):
                  log_3d_eps = 0.1,
                  depth_log_min = -2.5,
                  depth_log_max = 2.0,
-                 f_eff_scale = False):
+                 f_eff_scale = False,
+                 soft_argmax_temperature = 0.5,
+                 soft_argmax_threshold = 20,
+                 soft_argmax_temperature_learnable = False):
         super().__init__()
 
         self.mode_3d = mode_3d
@@ -169,6 +172,9 @@ class TrackerEncoder(nn.Module):
             depth_log_max=depth_log_max,
             image_size=self.image_size,
             f_eff_scale=f_eff_scale,
+            soft_argmax_temperature=soft_argmax_temperature,
+            soft_argmax_threshold=soft_argmax_threshold,
+            soft_argmax_temperature_learnable=soft_argmax_temperature_learnable,
         )
 
     def unfreeze_video_encoder(self, iteration):
@@ -600,9 +606,12 @@ class TrackerEncoder(nn.Module):
             camera_mats = torch.stack([cam['ext'] for cam in camera_group])
             weights = rearrange(conf_pred_2d, 'cams b t n 1 -> cams (b t n)')
             points_und_flat = torch.clip(points_und_flat, -2, 2)
-            points_3d_flat = triangulate_simple_batch(points_und_flat.to(torch.float32),
-                                                      camera_mats.to(torch.float32),
-                                                      weights.to(torch.float32)).to(points_und_flat.dtype)
+            # Regularized eigendecomposition variant: numerically stable gradients (vs the SVD
+            # version, whose grads spike on near-degenerate geometry) -> lets the triangulation
+            # supervision be enabled.
+            points_3d_flat = triangulate_simple_batch_reg(points_und_flat.to(torch.float32),
+                                                          camera_mats.to(torch.float32),
+                                                          weights.to(torch.float32)).to(points_und_flat.dtype)
             points_3d_tri = rearrange(points_3d_flat, '(b t n) r -> b t n r', b=B, t=T, n=N)
         else:
             points_3d_tri = None

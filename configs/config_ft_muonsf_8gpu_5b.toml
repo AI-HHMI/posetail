@@ -1,0 +1,229 @@
+# Finetuning variant of config_encoder_gridresid.toml: same gridresid architecture + CE-loss
+# recipe, plus finetuning mechanics (checkpoint load, full-encoder grad, longer warmup).
+
+[wandb]
+project_name = 'posetail-finetuning-v3'
+path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3'
+mode = 'online' # 'online', 'offline', 'disabled'
+
+[dataset]
+# batch_size=1 REQUIRED for mixed 2D+3D (2D loss assumes B=cams=1). Multi-GPU: --strategy ddp.
+batch_size = 1
+num_workers = 12
+# Finetune on the finetuning-v3 set (vs the pretraining-v3 set used for pretraining).
+prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v3'
+datasets_to_exclude = ["johnson-fly", "cmupanoptic", "rat7m", "rat-city", "branson-fly"]
+
+[dataset.train]
+split_dir = 'train'
+n_frames = 16
+min_res = 256
+max_res = 256
+cams_to_sample = [1, 8]
+kpts_to_sample = [128, 128]
+aug_prob = 0.25
+per_image_aug_prob = 0.65
+enable_kpt_filtering = false
+cam_thresh_for_vis = 1
+balance_datasets = true
+n_samples_per_dataset = -1
+# Upsample kubric-multiview 5x relative to every other dataset (all others default to 1.0).
+# Multiplies the per-dataset balanced count (see _balance_metadata, posetail_dataset.py:1363);
+# requires balance_datasets = true. weight 1.0/absent = old uniform behavior.
+dataset_weights = { "kubric-multiview" = 5.0 }
+crop_to_points = true
+speed_thresh = 3.0
+query_anytime = true
+query_edge_bias = 100.0
+prop_dynamic_kpts_to_sample = 0.95
+prob_2d_only = 0.25
+no_nan_coords = false
+
+
+crop_3d_enabled = true
+crop_3d_fraction = [0.1, 0.75]
+crop_3d_prob = 0.3
+
+
+[dataset.train.curriculum]
+enabled = false
+ramp_start_frac = 0.0
+ramp_end_frac   = 0.05
+intensity_floor = 0.0
+
+[dataset.val]
+split_dir = 'val'
+n_frames = 16
+max_res = 256
+cams_to_sample = 5
+# More query points per val sample -> lower-variance val metrics.
+kpts_to_sample = 128
+aug_prob = 0.0
+crop_to_points = true
+speed_thresh = 1.0
+prop_dynamic_kpts_to_sample = 0.7
+query_anytime = false
+
+[dataset.test]
+split_dir = 'test'
+max_res = 256
+n_frames = 16
+project_2d = false
+aug_prob = 0.0
+
+[devices]
+device = 'cuda'
+
+
+[model]
+mode_3d = "encoder"
+
+video_encoder_version = 'large'
+# VJEPA backbone trainable from step 0 (vs delayed unfreeze when pretraining from scratch).
+video_encoder_requires_grad = 25000
+video_encoder_hierarchical = true
+# Finetune the WHOLE encoder (omit video_encoder_finetune_last_n_layers -> default None = all)
+# so the backbone can specialize for dense correspondence, not just semantics.
+
+soft_argmax_temperature_learnable = true
+
+
+# processing
+stride_length = 16
+image_size = 256
+query_patch_size = 9
+per_camera_cube_scale = true
+
+# query encoder
+max_freq = 10
+embedding_dim = 256
+use_volume_embedding = false
+corr_radius = 2
+principal_point_embedding = true
+intrinsic_embedding = true
+metric_ray_translation = true
+
+# decoder
+latent_dim = 512
+n_heads = 8
+n_time_space_blocks = 6
+embedding_factor = 4
+use_camera_self_attention = true
+use_temporal_self_attention = true
+f_eff_scale = true
+# Projecting encoder features to the decoder dim trains notably better than false.
+scene_encoder_proj = true
+
+scene_proj_dim = 1024
+
+# "gridresid" = per-axis soft-argmax bin grid (CE-supervised): 3D head emits a motion residual
+# from a query anchor, depth is a log grid, plus a 2D pixel-bin position head.
+output_mode = "gridresid"
+head_3d_grid_size = 512
+# Ray-local motion grid half-width (p99.9 ~0.93 across datasets); generous under log_3d_output.
+head_3d_grid_radius = 1.5
+# Signed-log warp: tight eps spreads the sharply-peaked motion residual (p50~0.02) across bins.
+log_3d_output = true
+log_3d_eps = 0.01
+# Depth log-grid range = log(depth/(cube*f_eff)); covers every dataset's reach with margin.
+depth_log_min = -2.5
+depth_log_max = 2.0
+
+[training]
+seed = 23
+finetune = true
+
+# previous finetuning v3
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260620_115228-modwthc1/files/checkpoints/checkpoint_00184320.pth'
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260621_010518-807co7fa/files/checkpoints/checkpoint_00296960.pth'
+
+# small finetune for head_3d_grid_size = 512
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260621_211130-268oz1ua/files/checkpoints/checkpoint_00010240.pth'
+
+# continue
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260621_220241-ufwyxvnv/files/checkpoints/checkpoint_00245760.pth'
+
+# from _4
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260622_164809-j5y2ff92/files/checkpoints/checkpoint_00286720.pth'
+
+n_iterations = 8000000
+scheduler_type = 'muon'  # SF-Muon: beats AdamW/schedulefree by ~0.05 kubric at every matched iter
+# Tightened 50->20: 3d_rays_reproj/depth spiked grad_norm to 500-1.3M on hard frames; normal
+# grads are 3-20, so 20 clamps the pathological tail without throttling real steps.
+max_grad_norm = 20.0
+checkpoint_freq = 10240 # in iterations
+eval_metric_freq = 24 # in iterations
+val_freq = 48 # in iterations
+print_freq = 96 # in iterations
+debug_ix = -1 # only works for val
+
+[training.optimizer]
+# BEST CONFIG (from the 1-GPU SF-Muon LR/WD sweep, 2026-06-16/17). MEANT FOR `--devices 8`:
+# train.py scales base_lr by sqrt(world_size), so base 1e-4 -> eff ~2.83e-4 at 8 GPU. That is the
+# sqrt-rule bump for the 8x batch (my 1-GPU optimum was 1e-4) and AVOIDS the 5.66e-4 region
+# (base 2e-4 x sqrt8) which the sweep showed is the WORST. enc Muon -> ~2.83e-5 (near proven-stable 2e-5).
+learning_rate = 9e-5
+muon_schedulefree = true
+weight_decay = 0.001          # marginally beat 0.01 on kubric in the sweep
+warmup_steps = 200
+muon_warmup_steps = 200      # cheap insurance for the encoder-Muon ramp at scale (likely unneeded at 2.83e-5)
+beta1 = 0.9
+beta2 = 0.95
+# Whole encoder trainable but at 0.1x base LR: 1.0 blew up grad_norm to ~3485 and collapsed the
+# V-JEPA features. 0.1 -> two-group split, encoder ~5.7e-5. Kill-switch: grad_norm>100 -> 0.05.
+encoder_lr_scale = 0.1
+
+[training.scheduler]
+
+[training.losses]
+gamma = 0.8
+pixel_thresh = 3
+delta = 6
+use_huber_loss = true
+
+# weights for calculating total loss (use 0 to not compute a specific loss)
+# Aligned with pretraining (was 10 / 10); visibility need not dominate the coordinate losses.
+vis_loss_weight = 5
+vis_loss_3d_weight = 1.0
+conf_loss_weight = 0.0
+conf_2d_loss_weight = 0.0
+
+occluded_coords_loss_weight = 0.2
+feature_loss_weight = 0.0
+
+# Reweight v3 (contribution-balanced, by MEAN over qf044rva @ ~14.6k iters): targets are
+# softmax-sum ~= 2x regular-sum, and 2D-coord-sum ~= 3D-coord-sum (reproj counted as 3D), with
+# depth_loss raised to participate (~0.2, level with the other 3D-regression terms). See plan
+# file for the projection script. NOTE: the 4 weights below the *metric* 3D branch divides by
+# coords_3d_loss_scale (coords_loss/direct/rays/depth) were cut ~3x to keep balance after the
+# scale was lowered 150->50 (the cut is cosmetic; net contribution unchanged).
+coords_loss_weight = 1.0
+coords_loss_direct_weight = 1.0
+coords_loss_rays_weight = 0.1
+coords_loss_triangulate_weight = 0.0
+coords_loss_2d_weight = 1.5
+
+coords_loss_depth_weight = 10.0
+
+# Reproject fused 3D preds into each camera (pixel space). direct_reproj is safe; rays_reproj
+# DISABLED (was 0.1): it divides by predicted depth -> grad spikes 2714x on hard frames, the
+# main source of the slow corruption. Re-enable only with a depth clamp/eps in the loss.
+coords_loss_direct_reproj_weight = 0.6
+coords_loss_rays_reproj_weight = 0.0
+coords_loss_triangulate_reproj_weight = 0.6
+
+# Position-bin CE cut ~3-4x so softmax ~= 2x regular (was swamping regression ~6.6x by mean).
+coords_softmax_2d_weight = 0.6
+coords_softmax_3d_weight = 0.4
+depth_softmax_weight = 0.25
+
+# Rescale of the multi-cam 3D loss branch; lowered 150->50 alongside the ~3x cut to the four
+# scale-divided weights above (net 3D-regression contribution unchanged). Minor side effects:
+# smoothness_3d (uses scale*coords_3d_loss_scale before a hinge) drops ~3x; occluded_coords_loss
+# (currently inactive) would be ~3x hotter if it fires.
+coords_3d_loss_scale = 50.0
+
+smoothness_loss_3d_weight = 0.5
+smoothness_loss_2d_weight = 0.5
+smoothness_loss_order = 4
+smoothness_loss_tolerance = 1.5
