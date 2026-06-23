@@ -114,7 +114,7 @@ f_eff_scale = true
 # Projecting encoder features to the decoder dim trains notably better than false.
 scene_encoder_proj = true
 
-scene_proj_dim = 2048
+scene_proj_dim = 1024
 
 # "gridresid" = per-axis soft-argmax bin grid (CE-supervised): 3D head emits a motion residual
 # from a query anchor, depth is a log grid, plus a 2D pixel-bin position head.
