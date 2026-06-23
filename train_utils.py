@@ -238,6 +238,20 @@ def _interp_res_params(param_dict, model):
     return out, changed
 
 
+def _filter_shape_mismatch(param_dict, model):
+    """Drop checkpoint tensors whose shape no longer matches the model (e.g. a latent_dim or
+    scene_proj_dim change). Those params keep the model's fresh init -> warm-start from only the
+    shape-compatible weights (typically the backbone). Returns (filtered_dict, dropped_keys)."""
+    msd = model.state_dict()
+    kept, dropped = {}, []
+    for k, v in param_dict.items():
+        if k in msd and tuple(msd[k].shape) != tuple(v.shape):
+            dropped.append(k)
+        else:
+            kept[k] = v
+    return kept, dropped
+
+
 def load_checkpoint(config_path, checkpoint_path, model = None,
                     optimizer = None, device = None, eval_weights = 'auto'):
     """Load a checkpoint into a model (and optionally an optimizer for resuming training).
@@ -281,6 +295,15 @@ def load_checkpoint(config_path, checkpoint_path, model = None,
     # image_size (no-op when shapes already match -> backward-compatible)
     param_dict, res_changed = _interp_res_params(param_dict, model)
 
+    # drop params whose shape no longer matches the model (e.g. a latent_dim / scene_proj_dim
+    # change) -> warm-start from only the shape-compatible weights; the dropped ones keep the
+    # model's fresh init. (strict=False ignores missing/unexpected keys but NOT size mismatches.)
+    param_dict, dropped_keys = _filter_shape_mismatch(param_dict, model)
+    arch_changed = len(dropped_keys) > 0
+    if arch_changed:
+        print(f'  [warn] {len(dropped_keys)} checkpoint params dropped (shape mismatch -> '
+              f'reinitialized): {dropped_keys}')
+
     missing_keys, unexpected_keys = model.load_state_dict(param_dict, strict = False)
     print(f'received missing keys: {missing_keys}')
     print(f'received unexpected keys: {unexpected_keys}')
@@ -291,9 +314,9 @@ def load_checkpoint(config_path, checkpoint_path, model = None,
     # resolution interpolation changed any tensor shape: the optimizer's averaged buffers / baked
     # snapshot are at the original resolution and would shape-mismatch the interpolated params.
     do_swap = (eval_weights is True) or (eval_weights == 'auto' and optimizer is None)
-    if do_swap and res_changed:
-        print('  [warn] resolution-interp changed param shapes; skipping eval-weight swap '
-              '(using interpolated raw model_state)')
+    if do_swap and (res_changed or arch_changed):
+        print('  [warn] param shapes changed (res-interp or arch mismatch); skipping eval-weight '
+              'swap (using raw model_state for the loaded params)')
     elif do_swap:
         eval_param_dict = checkpoint.get('model_state_eval', None)
         if eval_param_dict is not None:

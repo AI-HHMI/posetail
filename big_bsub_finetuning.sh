@@ -31,6 +31,6 @@ d=$(date +d%dh%H)
 #    -n 96 -q gpu_h100 -R "span[hosts=1]" -gpu "num=8" -W 96:00 \
 #    /bin/bash train_script.sh configs/config_encoder_gridresid_finetune.toml
 
-bsub -J enm1-$d -e ~/logs/posetail/enm1-$d.err -o ~/logs/posetail/enm1-$d.out \
+bsub -J enm2-$d -e ~/logs/posetail/enm2-$d.err -o ~/logs/posetail/enm2-$d.out \
     -n 96 -q gpu_h100 -R "span[hosts=1]" -gpu "num=8" -W 168:00 \
-    /bin/bash train_script.sh configs/config_ft_muonsf_8gpu_4.toml
+    /bin/bash train_script.sh configs/config_ft_muonsf_8gpu_5.toml
