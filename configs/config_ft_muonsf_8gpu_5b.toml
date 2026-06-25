@@ -130,7 +130,7 @@ depth_log_min = -2.5
 depth_log_max = 2.0
 
 [training]
-seed = 23
+seed = 27
 finetune = true
 
 # previous finetuning v3
