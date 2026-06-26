@@ -92,7 +92,7 @@ intrinsic_embedding = true
 metric_ray_translation = true
 
 # decoder
-latent_dim = 256
+latent_dim = 512
 n_heads = 8
 n_time_space_blocks = 6
 embedding_factor = 4
@@ -102,7 +102,9 @@ f_eff_scale = false
 # Projecting encoder features to the decoder dim trains notably better than false.
 scene_encoder_proj = true
 
-scene_proj_dim = 1024
+cross_attn_dim = 512
+
+scene_proj_dim = 512
 scene_proj_prenorm = false
 scene_proj_mlp = false
 
