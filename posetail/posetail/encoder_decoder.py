@@ -738,9 +738,61 @@ class AdaptiveLayerNorm(nn.Module):
         return self.norm(x) * (1 + self.gamma(mode_idx)) + self.beta(mode_idx)
 
 
+class DecoupledCrossAttention(nn.Module):
+    """Cross-attention whose internal (q/k/v/attention) width is decoupled from the
+    decoder residual-stream width.
+
+    Queries come from the decoder stream (``latent_dim``); keys/values come from the scene
+    representation (``kv_dim`` = scene_proj_dim). All three are projected to ``cross_attn_dim``
+    (the attention width), attention runs over ``num_heads`` heads of size
+    ``cross_attn_dim // num_heads``, and ``out_proj`` maps back to ``latent_dim`` for the
+    residual add. This lets the scene->decoder readout capacity rise (a larger
+    ``cross_attn_dim``) without widening the rest of the decoder stack.
+
+    With ``cross_attn_dim == latent_dim`` (and ``kv_dim`` unchanged) the block is numerically
+    equivalent to ``nn.MultiheadAttention(embed_dim=latent_dim, num_heads=num_heads,
+    kdim=vdim=kv_dim, batch_first=True)``: split q/k/v/out ``nn.Linear``s of the same shapes,
+    the same ``scaled_dot_product_attention`` kernel, and the same ``1/sqrt(head_dim)`` scale.
+    Existing nn.MultiheadAttention checkpoints therefore reproduce their predictions exactly
+    once their fused ``in_proj`` is split into q/k/v by ``train_utils._convert_cross_attn``.
+    """
+
+    def __init__(self, latent_dim, kv_dim, cross_attn_dim, num_heads, dropout=0.0):
+        super().__init__()
+        assert cross_attn_dim % num_heads == 0, (
+            f'cross_attn_dim ({cross_attn_dim}) must be divisible by num_heads ({num_heads})')
+        self.latent_dim = latent_dim
+        self.kv_dim = kv_dim
+        self.cross_attn_dim = cross_attn_dim
+        self.num_heads = num_heads
+        self.head_dim = cross_attn_dim // num_heads
+        self.dropout = dropout
+        self.q_proj = nn.Linear(latent_dim, cross_attn_dim)
+        self.k_proj = nn.Linear(kv_dim, cross_attn_dim)
+        self.v_proj = nn.Linear(kv_dim, cross_attn_dim)
+        self.out_proj = nn.Linear(cross_attn_dim, latent_dim)
+        # xavier on the projections (dimension-robust; matches nn.MultiheadAttention's
+        # in_proj init style and keeps the wider-cross_attn_dim case well-scaled). Loaded
+        # checkpoints overwrite these, so init never affects backward-compatible loads.
+        for proj in (self.q_proj, self.k_proj, self.v_proj, self.out_proj):
+            nn.init.xavier_uniform_(proj.weight)
+            nn.init.zeros_(proj.bias)
+
+    def forward(self, query, kv):
+        """query: (B, Lq, latent_dim); kv: (B, Lk, kv_dim) -> (B, Lq, latent_dim)."""
+        q = rearrange(self.q_proj(query), 'b l (h d) -> b h l d', h=self.num_heads)
+        k = rearrange(self.k_proj(kv),    'b l (h d) -> b h l d', h=self.num_heads)
+        v = rearrange(self.v_proj(kv),    'b l (h d) -> b h l d', h=self.num_heads)
+        dropout_p = self.dropout if self.training else 0.0
+        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        attn = rearrange(attn, 'b h l d -> b l (h d)')
+        return self.out_proj(attn)
+
+
 class Decoder(nn.Module):
     def __init__(self, embed_dim=256, encoder_dim=1024,
                  num_heads=8, num_layers=8,
+                 cross_attn_dim=None,
                  mlp_ratio=4.0, dropout=0.05,
                  use_camera_self_attention=True,
                  use_temporal_self_attention=False,
@@ -762,6 +814,10 @@ class Decoder(nn.Module):
 
         self.embed_dim = embed_dim
         self.encoder_dim = encoder_dim
+        # Cross-attention internal width. Defaults to embed_dim (= latent_dim), which makes the
+        # block numerically equivalent to the previous nn.MultiheadAttention; set larger to raise
+        # the scene->decoder readout capacity without widening the decoder residual stream.
+        self.cross_attn_dim = cross_attn_dim if cross_attn_dim is not None else embed_dim
         self.num_layers = num_layers
         self.use_camera_self_attention = use_camera_self_attention
         self.use_temporal_self_attention = use_temporal_self_attention

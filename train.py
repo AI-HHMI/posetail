@@ -233,7 +233,7 @@ def run(config_path, fabric):
         muon_scale = config.training.optimizer.get('muon_lr_scale', 1.0)
         wd = config.training.optimizer.weight_decay
         dec_substr = ('decoder.cross_attns', 'decoder.mlps', 'decoder.camera_attns',
-                      'decoder.temporal_attns')
+                      'decoder.temporal_attns', 'decoder.latent_carry')
         scene_ids = {id(p) for p in model.scene_encoder.parameters()} \
             if hasattr(model, 'scene_encoder') else set()
         muon_dec, muon_enc, adamw_slow, adamw_base = [], [], [], []
@@ -243,6 +243,11 @@ def run(config_path, fabric):
             is2d = (p.ndim == 2 and name.endswith('.weight'))
             if is2d and 'scene_encoder.encoder.blocks' in name:
                 muon_enc.append(p)
+            elif is2d and 'scene_encoder.kv_proj' in name:
+                # The scene K/V projection is a fresh 2D hidden adapter (4096->scene_proj_dim),
+                # not part of the pretrained backbone -> route to Muon at the decoder base LR
+                # (it was previously mis-routed to adamw_slow via the scene_ids catch-all).
+                muon_dec.append(p)
             elif is2d and any(s in name for s in dec_substr):
                 muon_dec.append(p)
             elif id(p) in scene_ids:

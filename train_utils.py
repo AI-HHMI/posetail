@@ -160,27 +160,133 @@ def save_checkpoint(model, optimizer, prefix, i, config = None):
     checkpoint_path = os.path.join(checkpoint_dir,
         f'checkpoint_{str(i).zfill(8)}.pth')
 
+    def _cpu_state():
+        return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
     state_dict = {
         'iteration': i,
         'model_state': model.state_dict(),
         'optimizer_state': optimizer.state_dict(),
     }
 
-    # For schedule-free runs, also bake the averaged (eval) weights into the checkpoint so
-    # downstream inference can use them without reconstructing the optimizer. model_state above is
-    # captured first (raw training weights); we then swap to eval weights, snapshot, and restore
-    # train mode unconditionally (this also fixes the pre-existing nondeterminism where the save
-    # could land on a val iteration with the optimizer already in eval mode).
-    if config is not None and config.training.get('scheduler_type', None) == 'schedulefree':
-        sf = optimizer.optimizer if hasattr(optimizer, 'optimizer') else optimizer
+    # Schedule-free runs -- both AdamW-schedulefree (scheduler_type == 'schedulefree') and
+    # muon_schedulefree (DualOptimizer with a ScheduleFreeWrapper'd Muon) -- maintain an averaged
+    # "eval" weight point inside the optimizer that downstream inference should use. Bake BOTH
+    # snapshots deterministically: force train mode and snapshot the raw (y) weights as model_state,
+    # then eval mode and snapshot the averaged (x) weights as model_state_eval, then restore train
+    # mode. This generalizes the previous schedulefree-only bake to muon (which was silently saving
+    # the raw weights, and only by luck the averaged ones on saves that happened to land on a val
+    # iteration), and removes the nondeterminism where the snapshot depended on whatever optimizer
+    # mode the training loop left behind.
+    sf_run = config is not None and (
+        config.training.get('scheduler_type', None) == 'schedulefree'
+        or config.training.optimizer.get('muon_schedulefree', False))
+    sf = optimizer.optimizer if hasattr(optimizer, 'optimizer') else optimizer
+    if sf_run and hasattr(sf, 'eval') and hasattr(sf, 'train'):
+        sf.train()
+        state_dict['model_state'] = _cpu_state()
         sf.eval()
-        state_dict['model_state_eval'] = {k: v.detach().cpu().clone()
-                                          for k, v in model.state_dict().items()}
+        state_dict['model_state_eval'] = _cpu_state()
         sf.train()
 
     torch.save(state_dict, checkpoint_path)
 
     return checkpoint_path
+
+
+def _widen_cross_attn_layer(Wq, bq, Wk, bk, Wv, bv, Wout, bout, num_heads, new_dim):
+    """Function-preserving (Net2Net-style) widening of one cross-attention layer from the old
+    attention width ``old_dim = Wq.shape[0]`` to ``new_dim`` (both = num_heads * head_dim).
+
+    Per head, the old head is embedded into the first ``old_head_dim`` slots of the new head;
+    the Q rows are scaled by ``sqrt(new_head_dim/old_head_dim)`` so the larger ``1/sqrt(head_dim)``
+    softmax scale cancels and the attention scores are unchanged. Extra Q rows are zeroed and the
+    extra ``out_proj`` columns are zeroed (so the new dims contribute nothing at load -> the output
+    equals the old output exactly), while the extra K/V rows are small-random so gradients flow and
+    the extra dims become trainable. Returns the 8 new tensors as a flat tuple in q,k,v,out order."""
+    import math
+    old_dim = Wq.shape[0]
+    H = num_heads
+    hd_old, hd_new = old_dim // H, new_dim // H
+    s = math.sqrt(hd_new / hd_old)
+    dev, dt = Wq.device, Wq.dtype
+
+    def _embed(W, b, scale, rand_extra):
+        in_dim = W.shape[1]
+        Wn = torch.zeros(new_dim, in_dim, device=dev, dtype=dt)
+        bn = torch.zeros(new_dim, device=dev, dtype=dt)
+        for h in range(H):
+            Wn[h * hd_new:h * hd_new + hd_old] = W[h * hd_old:(h + 1) * hd_old] * scale
+            bn[h * hd_new:h * hd_new + hd_old] = b[h * hd_old:(h + 1) * hd_old] * scale
+            if rand_extra:
+                Wn[h * hd_new + hd_old:(h + 1) * hd_new] = \
+                    torch.randn(hd_new - hd_old, in_dim, device=dev, dtype=dt) * 0.02
+        return Wn, bn
+
+    Wqn, bqn = _embed(Wq, bq, s, rand_extra=False)    # extra Q rows = 0
+    Wkn, bkn = _embed(Wk, bk, 1.0, rand_extra=True)   # extra K rows small-random (bootstraps Q)
+    Wvn, bvn = _embed(Wv, bv, 1.0, rand_extra=True)   # extra V rows small-random
+    latent = Wout.shape[0]
+    Woutn = torch.zeros(latent, new_dim, device=dev, dtype=dt)
+    boutn = bout.clone()
+    for h in range(H):
+        Woutn[:, h * hd_new:h * hd_new + hd_old] = Wout[:, h * hd_old:(h + 1) * hd_old]
+    return Wqn, bqn, Wkn, bkn, Wvn, bvn, Woutn, boutn
+
+
+def _convert_cross_attn(param_dict, model):
+    """Backward-compatible load-time conversion of decoder cross-attention params from the old
+    ``nn.MultiheadAttention`` layout to the new ``DecoupledCrossAttention`` (split q/k/v/out
+    ``nn.Linear``) layout. No-op when the checkpoint is already in the new layout, or the model
+    has no new-style cross_attns (so old checkpoints/other architectures are untouched).
+
+    nn.MultiheadAttention stored either a FUSED ``in_proj_weight`` [3E, E] (when kdim==embed_dim)
+    or SPLIT ``{q,k,v}_proj_weight`` (when kdim!=embed_dim), always with a single ``in_proj_bias``
+    [3E] and ``out_proj.{weight,bias}``. Decided per layer from the recovered vs target shapes:
+      * cross_attn_dim == embed_dim (e.g. the j5y2ff92 finetune): EXACT split -> bit-identical
+        predictions.
+      * cross_attn_dim  > embed_dim: function-preserving per-head warm-start (see
+        ``_widen_cross_attn_layer``) -> reproduces the old output at load, extra dims trainable.
+    Mutates and returns ``param_dict``."""
+    msd = model.state_dict()
+    layer_ids = sorted({
+        int(k.split('.')[2]) for k in msd
+        if k.startswith('decoder.cross_attns.') and k.endswith('.q_proj.weight')
+    })
+    for i in layer_ids:
+        p = f'decoder.cross_attns.{i}'
+        if f'{p}.q_proj.weight' in param_dict:
+            continue  # already in the new (split) layout
+        if f'{p}.in_proj_weight' in param_dict:
+            W = param_dict.pop(f'{p}.in_proj_weight')
+            E = W.shape[0] // 3
+            Wq, Wk, Wv = W[:E], W[E:2 * E], W[2 * E:]
+        elif f'{p}.q_proj_weight' in param_dict:
+            Wq = param_dict.pop(f'{p}.q_proj_weight')
+            Wk = param_dict.pop(f'{p}.k_proj_weight')
+            Wv = param_dict.pop(f'{p}.v_proj_weight')
+            E = Wq.shape[0]
+        else:
+            continue  # no recognizable old cross-attn params for this layer
+        b = param_dict.pop(f'{p}.in_proj_bias')
+        bq, bk, bv = b[:E], b[E:2 * E], b[2 * E:]
+        Wout = param_dict.pop(f'{p}.out_proj.weight')
+        bout = param_dict.pop(f'{p}.out_proj.bias')
+
+        new_dim = msd[f'{p}.q_proj.weight'].shape[0]   # target cross_attn_dim
+        if new_dim == E:
+            keys = (Wq, bq, Wk, bk, Wv, bv, Wout, bout)
+        else:
+            num_heads = model.decoder.cross_attns[i].num_heads
+            keys = _widen_cross_attn_layer(Wq, bq, Wk, bk, Wv, bv, Wout, bout,
+                                           num_heads=num_heads, new_dim=new_dim)
+        (param_dict[f'{p}.q_proj.weight'], param_dict[f'{p}.q_proj.bias'],
+         param_dict[f'{p}.k_proj.weight'], param_dict[f'{p}.k_proj.bias'],
+         param_dict[f'{p}.v_proj.weight'], param_dict[f'{p}.v_proj.bias'],
+         param_dict[f'{p}.out_proj.weight'], param_dict[f'{p}.out_proj.bias']) = keys
+        print(f'  cross-attn convert {p}: MHA -> decoupled '
+              f'({"exact" if new_dim == E else f"widen {E}->{new_dim}"})')
+    return param_dict
 
 
 def _interp_res_params(param_dict, model):
@@ -298,6 +404,11 @@ def load_checkpoint(config_path, checkpoint_path, model = None,
     checkpoint = torch.load(checkpoint_path, map_location = device)
     param_dict = checkpoint['model_state']
 
+    # convert old nn.MultiheadAttention cross-attn params to the DecoupledCrossAttention split
+    # layout (no-op when already converted / model has no new-style cross_attns) -> old checkpoints
+    # load and (at cross_attn_dim==latent_dim) predict identically
+    param_dict = _convert_cross_attn(param_dict, model)
+
     # interpolate resolution-dependent params if the checkpoint was trained at a different
     # image_size (no-op when shapes already match -> backward-compatible)
     param_dict, res_changed = _interp_res_params(param_dict, model)
@@ -328,6 +439,7 @@ def load_checkpoint(config_path, checkpoint_path, model = None,
         eval_param_dict = checkpoint.get('model_state_eval', None)
         if eval_param_dict is not None:
             # baked fast path: no optimizer reconstruction needed
+            eval_param_dict = _convert_cross_attn(dict(eval_param_dict), model)
             eval_param_dict, _ = _interp_res_params(eval_param_dict, model)
             model.load_state_dict(eval_param_dict, strict = False)
         else:
