@@ -155,22 +155,33 @@ def save_checkpoint(model, optimizer, prefix, i, config = None):
     checkpoint_path = os.path.join(checkpoint_dir,
         f'checkpoint_{str(i).zfill(8)}.pth')
 
+    def _cpu_state():
+        return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
     state_dict = {
         'iteration': i,
         'model_state': model.state_dict(),
         'optimizer_state': optimizer.state_dict(),
     }
 
-    # For schedule-free runs, also bake the averaged (eval) weights into the checkpoint so
-    # downstream inference can use them without reconstructing the optimizer. model_state above is
-    # captured first (raw training weights); we then swap to eval weights, snapshot, and restore
-    # train mode unconditionally (this also fixes the pre-existing nondeterminism where the save
-    # could land on a val iteration with the optimizer already in eval mode).
-    if config is not None and config.training.get('scheduler_type', None) == 'schedulefree':
-        sf = optimizer.optimizer if hasattr(optimizer, 'optimizer') else optimizer
+    # Schedule-free runs -- both AdamW-schedulefree (scheduler_type == 'schedulefree') and
+    # muon_schedulefree (DualOptimizer with a ScheduleFreeWrapper'd Muon) -- maintain an averaged
+    # "eval" weight point inside the optimizer that downstream inference should use. Bake BOTH
+    # snapshots deterministically: force train mode and snapshot the raw (y) weights as model_state,
+    # then eval mode and snapshot the averaged (x) weights as model_state_eval, then restore train
+    # mode. This generalizes the previous schedulefree-only bake to muon (which was silently saving
+    # the raw weights, and only by luck the averaged ones on saves that happened to land on a val
+    # iteration), and removes the nondeterminism where the snapshot depended on whatever optimizer
+    # mode the training loop left behind.
+    sf_run = config is not None and (
+        config.training.get('scheduler_type', None) == 'schedulefree'
+        or config.training.optimizer.get('muon_schedulefree', False))
+    sf = optimizer.optimizer if hasattr(optimizer, 'optimizer') else optimizer
+    if sf_run and hasattr(sf, 'eval') and hasattr(sf, 'train'):
+        sf.train()
+        state_dict['model_state'] = _cpu_state()
         sf.eval()
-        state_dict['model_state_eval'] = {k: v.detach().cpu().clone()
-                                          for k, v in model.state_dict().items()}
+        state_dict['model_state_eval'] = _cpu_state()
         sf.train()
 
     torch.save(state_dict, checkpoint_path)
