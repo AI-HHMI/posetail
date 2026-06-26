@@ -35,6 +35,7 @@ class TrackerEncoder(nn.Module):
                  intrinsic_embedding = False,
                  metric_ray_translation = False,
                  latent_dim = 1024, n_heads = 8,
+                 cross_attn_dim = None,
                  n_time_space_blocks = 6, embedding_factor = 4,
                  use_camera_self_attention = False,
                  use_temporal_self_attention = False,
@@ -106,9 +107,12 @@ class TrackerEncoder(nn.Module):
         self.metric_ray_translation = metric_ray_translation
 
         # decoder params
-        self.latent_dim = latent_dim 
+        self.latent_dim = latent_dim
         self.n_iters = n_iters
         self.n_heads = n_heads
+        # Cross-attention internal width; None -> defaults to latent_dim in the Decoder
+        # (exact nn.MultiheadAttention equivalence). Raise it to add scene-readout capacity.
+        self.cross_attn_dim = cross_attn_dim
         self.n_time_space_blocks = n_time_space_blocks
         self.embedding_factor = embedding_factor
         self.use_camera_self_attention = use_camera_self_attention
@@ -159,6 +163,7 @@ class TrackerEncoder(nn.Module):
             embed_dim=latent_dim,
             encoder_dim=self.scene_encoder.embed_dim,
             num_heads=n_heads,
+            cross_attn_dim=cross_attn_dim,
             num_layers=n_time_space_blocks,
             mlp_ratio=embedding_factor,
             use_camera_self_attention=self.use_camera_self_attention,
