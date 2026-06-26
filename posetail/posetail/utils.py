@@ -21,6 +21,39 @@ def apply_rope_1d(x, positions, base=10000):
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
+def _sincos_1d(dim, pos, base=10000.0):
+    """Standard 1-D sin/cos positional encoding. dim must be even.
+    pos: (M,) positions -> (M, dim) with [sin | cos] halves."""
+    assert dim % 2 == 0, f'sincos dim must be even, got {dim}'
+    half = dim // 2
+    omega = torch.arange(half, device=pos.device, dtype=torch.float32) / half
+    omega = 1.0 / (base ** omega)                       # (half,)
+    out = pos.float()[:, None] * omega[None, :]         # (M, half)
+    return torch.cat([torch.sin(out), torch.cos(out)], dim=1)  # (M, dim)
+
+
+def get_3d_sincos_pos_embed(embed_dim, gT, gH, gW, device, dtype, base=10000.0):
+    """Fixed (non-learned) factorized 3-D sin/cos positional embedding over a (T,H,W) token
+    grid. Time gets embed_dim/2, height and width embed_dim/4 each (mirrors VJEPA's
+    non-uniform split). Returns (1, gT*gH*gW, embed_dim) in t-major then h then w row-major
+    order -- matching the (1, T', H', W', D) reshape SceneRepresentation uses for its learned
+    table. Deterministic and length-agnostic: defined at any grid size with no interpolation,
+    so it is the drop-in 'sincos' alternative to the learned pos_embed."""
+    assert embed_dim % 4 == 0, f'sincos embed_dim must be divisible by 4, got {embed_dim}'
+    dt, dh = embed_dim // 2, embed_dim // 4
+    dw = embed_dim - dt - dh                            # == embed_dim // 4
+    t = torch.arange(gT, device=device)
+    h = torch.arange(gH, device=device)
+    w = torch.arange(gW, device=device)
+    grid_t = t.view(gT, 1, 1).expand(gT, gH, gW).reshape(-1)
+    grid_h = h.view(1, gH, 1).expand(gT, gH, gW).reshape(-1)
+    grid_w = w.view(1, 1, gW).expand(gT, gH, gW).reshape(-1)
+    emb = torch.cat([_sincos_1d(dt, grid_t, base),
+                     _sincos_1d(dh, grid_h, base),
+                     _sincos_1d(dw, grid_w, base)], dim=1)  # (N, embed_dim)
+    return emb[None].to(dtype)                          # (1, N, embed_dim)
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters())
 

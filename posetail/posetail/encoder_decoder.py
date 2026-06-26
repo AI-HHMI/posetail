@@ -10,7 +10,7 @@ from posetail.posetail.networks import EmbedV2V
 from posetail.posetail.cube import is_point_visible, project_points_torch
 from posetail.posetail.cube import CameraSelfAttention
 from posetail.posetail.cube import signed_log1p, signed_expm1
-from posetail.posetail.utils import get_fourier_encoding, apply_rope_1d
+from posetail.posetail.utils import get_fourier_encoding, apply_rope_1d, get_3d_sincos_pos_embed
 
 from einops import rearrange, repeat, einsum
 
@@ -452,7 +452,8 @@ class SceneRepresentation(nn.Module):
     def __init__(self, version='large', freeze_encoder=True, n_frames=16, image_size=256,
                  hierarchical_features=True, decoder_dim=None,
                  proj_prenorm=False, proj_mlp=False,
-                 video_encoder_finetune_last_n_layers=None):
+                 video_encoder_finetune_last_n_layers=None,
+                 pos_embed_mode='learned'):
         super().__init__()
 
         # Initialize encoder
@@ -495,19 +496,39 @@ class SceneRepresentation(nn.Module):
         self.n_frames = n_frames
         self.image_size = image_size
 
-        n_tokens = (n_frames // self.tubelet_size) * (image_size // self.patch_size) * (image_size // self.patch_size)
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, n_tokens, self.embed_dim)
-        )
-        nn.init.trunc_normal_(self.pos_embed, mean=0.0, std=0.02, a=-2 * 0.02, b=2 * 0.02)
+        # Positional signal added on TOP of the VJEPA encoder output (which already carries
+        # the backbone's own positional scheme). Modes:
+        #   'learned' : trainable absolute table, trilinearly interpolated to the input grid
+        #               (the original behavior; backward-compatible default).
+        #   'sincos'  : fixed factorized 3-D sin/cos, computed analytically at the input grid
+        #               -- length-agnostic, no parameter, no interpolation.
+        #   'none'    : ablation -- no added positional signal; rely solely on the backbone.
+        # Only 'learned' registers a parameter; the rest of the module is identical.
+        assert pos_embed_mode in ('learned', 'sincos', 'none'), \
+            f"pos_embed_mode must be 'learned' | 'sincos' | 'none', got {pos_embed_mode!r}"
+        self.pos_embed_mode = pos_embed_mode
+        # Encoder-dim positional width (self.embed_dim is reassigned to decoder_dim below).
+        self.pos_embed_dim = self.embed_dim
+        if self.pos_embed_mode == 'learned':
+            n_tokens = (n_frames // self.tubelet_size) * (image_size // self.patch_size) * (image_size // self.patch_size)
+            self.pos_embed = nn.Parameter(
+                torch.zeros(1, n_tokens, self.embed_dim)
+            )
+            nn.init.trunc_normal_(self.pos_embed, mean=0.0, std=0.02, a=-2 * 0.02, b=2 * 0.02)
 
-        # Canonical (T',H',W') grid the pos_embed param was allocated for. forward()
-        # trilinearly interpolates the pos_embed to the actual input grid when they differ, so
-        # n_frames / image_size can change at finetune/inference WITHOUT resizing the parameter
-        # (checkpoints still load; identity / no-op when the grids match -> backward-compatible).
-        self._pe_grid = (n_frames // self.tubelet_size,
-                         image_size // self.patch_size,
-                         image_size // self.patch_size)
+            # Canonical (T',H',W') grid the pos_embed param was allocated for. forward()
+            # trilinearly interpolates the pos_embed to the actual input grid when they differ, so
+            # n_frames / image_size can change at finetune/inference WITHOUT resizing the parameter
+            # (checkpoints still load; identity / no-op when the grids match -> backward-compatible).
+            self._pe_grid = (n_frames // self.tubelet_size,
+                             image_size // self.patch_size,
+                             image_size // self.patch_size)
+        else:
+            self.pos_embed = None
+            self._pe_grid = None
+        # Per-(grid,device,dtype) cache for the fixed sincos table (recomputing the
+        # ~N*D tensor every forward would be wasteful; the grid is constant in practice).
+        self._sincos_cache = {}
 
         if decoder_dim is not None:
             in_dim = self.embed_dim
@@ -586,6 +607,16 @@ class SceneRepresentation(nn.Module):
         pe = F.interpolate(pe, size=(gT, gH, gW), mode='trilinear', align_corners=False)
         return pe.permute(0, 2, 3, 4, 1).reshape(1, gT * gH * gW, D)
 
+    def _sincos_pos_embed_for(self, gT, gH, gW, device, dtype):
+        """Fixed factorized 3-D sin/cos table for grid (gT,gH,gW), cached per
+        (grid, device, dtype) since the grid is constant across a run."""
+        key = (gT, gH, gW, device, dtype)
+        pe = self._sincos_cache.get(key)
+        if pe is None:
+            pe = get_3d_sincos_pos_embed(self.pos_embed_dim, gT, gH, gW, device, dtype)
+            self._sincos_cache[key] = pe
+        return pe
+
     def forward(self, views):
         """
         Args:
@@ -599,10 +630,14 @@ class SceneRepresentation(nn.Module):
         for view in views:
             xr = rearrange(view, 'b t c h w -> b c t h w')
             feat = self.encoder(xr)  # [B, n_tokens, embed_dim]
-            gT = view.shape[1] // self.tubelet_size
-            gH = view.shape[3] // self.patch_size
-            gW = view.shape[4] // self.patch_size
-            feat = feat + self._pos_embed_for(gT, gH, gW)
+            if self.pos_embed_mode != 'none':
+                gT = view.shape[1] // self.tubelet_size
+                gH = view.shape[3] // self.patch_size
+                gW = view.shape[4] // self.patch_size
+                if self.pos_embed_mode == 'learned':
+                    feat = feat + self._pos_embed_for(gT, gH, gW)
+                else:  # 'sincos'
+                    feat = feat + self._sincos_pos_embed_for(gT, gH, gW, feat.device, feat.dtype)
             if self.kv_proj is not None:
                 if self.pre_norms is not None:
                     chunks = torch.chunk(feat, self.n_proj_levels, dim=-1)
@@ -650,6 +685,46 @@ class TemporalSelfAttention(nn.Module):
         return self.out_proj(out)
 
 
+class RoPECrossAttention(nn.Module):
+    """Cross-attention (pose-query tokens attend to scene tokens) with 1-D temporal RoPE on
+    Q and K. Queries are rotated by their frame index, keys by their scene-token frame, both
+    in the same frame units, so the attention score is biased by RELATIVE time -- and is
+    length-agnostic (no table, defined at any T). Drop-in replacement for the nn.MultiheadAttention
+    cross-attention used in the Decoder; keys/values come from the scene tokens (kv_dim).
+
+    Unlike TemporalSelfAttention, out_proj is NOT zero-initialised: cross-attention is the main
+    information pathway (not an added residual block), so it must contribute from step 0."""
+
+    def __init__(self, embed_dim, num_heads, kv_dim, dropout=0.0, rope_base=10000.0):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
+        self.dropout = dropout
+        # RoPE frequency base. The 10000 default is tuned for thousand-token contexts; over
+        # short clips (~16-24 frames) most dim-pairs barely rotate, so a smaller base (~100-1000)
+        # spreads angular resolution across the few positions actually present.
+        self.rope_base = rope_base
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(kv_dim, embed_dim)
+        self.v_proj = nn.Linear(kv_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, query, kv, q_pos, k_pos):
+        """query: (Bc, Lq, embed_dim); kv: (Bc, Lk, kv_dim);
+        q_pos: (Lq,) query frame per token; k_pos: (Lk,) scene-token frame. Same units."""
+        q = rearrange(self.q_proj(query), 'b l (h d) -> b h l d', h=self.num_heads)
+        k = rearrange(self.k_proj(kv),    'b l (h d) -> b h l d', h=self.num_heads)
+        v = rearrange(self.v_proj(kv),    'b l (h d) -> b h l d', h=self.num_heads)
+        q = apply_rope_1d(q, q_pos, base=self.rope_base)
+        k = apply_rope_1d(k, k_pos, base=self.rope_base)
+        out = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.dropout if self.training else 0.0)
+        out = rearrange(out, 'b h l d -> b l (h d)')
+        return self.out_proj(out)
+
+
 class AdaptiveLayerNorm(nn.Module):
     def __init__(self, dim, num_modes=2):
         super().__init__()
@@ -669,6 +744,8 @@ class Decoder(nn.Module):
                  mlp_ratio=4.0, dropout=0.05,
                  use_camera_self_attention=True,
                  use_temporal_self_attention=False,
+                 cross_attn_rope=False,
+                 cross_attn_rope_base=10000.0,
                  output_mode="direct",
                  head_3d_grid_size=8,
                  head_3d_grid_radius=1.0,
@@ -688,6 +765,7 @@ class Decoder(nn.Module):
         self.num_layers = num_layers
         self.use_camera_self_attention = use_camera_self_attention
         self.use_temporal_self_attention = use_temporal_self_attention
+        self.cross_attn_rope = cross_attn_rope
         self.output_mode = output_mode
         self.f_eff_scale = f_eff_scale
         self.head_3d_grid_size = head_3d_grid_size
@@ -746,16 +824,28 @@ class Decoder(nn.Module):
         else:
             self.camera_attns = None
 
-        self.cross_attns = nn.ModuleList([
-            nn.MultiheadAttention(
-                embed_dim=embed_dim,
-                num_heads=num_heads,
-                kdim=encoder_dim,
-                vdim=encoder_dim,
-                dropout=dropout,
-                batch_first=True
-            ) for _ in range(num_layers)
-        ])
+        # Cross-attention: pose queries attend to scene tokens. With cross_attn_rope the
+        # scene-token positions are injected as 1-D temporal RoPE inside the QK product
+        # (length-agnostic, relative time) instead of via an additive scene pos_embed; pair
+        # it with scene_pos_embed_mode='none'. Default = the original additive nn.MultiheadAttention.
+        if self.cross_attn_rope:
+            self.cross_attns = nn.ModuleList([
+                RoPECrossAttention(embed_dim=embed_dim, num_heads=num_heads,
+                                   kv_dim=encoder_dim, dropout=dropout,
+                                   rope_base=cross_attn_rope_base)
+                for _ in range(num_layers)
+            ])
+        else:
+            self.cross_attns = nn.ModuleList([
+                nn.MultiheadAttention(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    kdim=encoder_dim,
+                    vdim=encoder_dim,
+                    dropout=dropout,
+                    batch_first=True
+                ) for _ in range(num_layers)
+            ])
 
         mlp_hidden_dim = int(embed_dim * mlp_ratio)
         self.mlps = nn.ModuleList([
@@ -894,7 +984,8 @@ class Decoder(nn.Module):
         probs = probs / probs.sum(dim=-1, keepdim=True)
         return (probs * grid_values.to(probs.dtype)).sum(dim=-1)
 
-    def forward(self, scene_features, query_embeds, rays, mode_idx, prev_latent=None):
+    def forward(self, scene_features, query_embeds, rays, mode_idx, prev_latent=None,
+                scene_frame_pos=None):
         """
         Args:
             scene_features: [N_cams, B, N_tokens, encoder_dim] from SceneRepresentation
@@ -905,6 +996,9 @@ class Decoder(nn.Module):
                 window's final decoder latent, frame-aligned to this window, fused into
                 the query tokens before the stack (sliding-window hand-off). None for the
                 first window / non-windowed pass.
+            scene_frame_pos: [N_tokens] frame index (in query-frame units) of each scene
+                token, required when cross_attn_rope is on (the key positions for temporal
+                RoPE). Ignored otherwise.
         Returns:
             outputs: [B, T, K, N_cams, out_dim]
             grid_logits: dict or None
@@ -917,6 +1011,15 @@ class Decoder(nn.Module):
         kv = rearrange(scene_features, 'cams b tokens dim -> (cams b) tokens dim')
         x = rearrange(query_embeds, 'b t k cams dim -> (cams b) (t k) dim')
         rays_r = rearrange(rays, 'b t k cams d e -> (b t k) cams d e')
+
+        # Temporal-RoPE cross-attention positions (built once, reused every layer). Query
+        # tokens flatten t-major as (t k), so token (t,k) has frame t -> arange(T) each
+        # repeated K times. Keys use the per-scene-token frame passed in.
+        if self.cross_attn_rope:
+            assert scene_frame_pos is not None, \
+                "cross_attn_rope=True requires scene_frame_pos (scene-token frame indices)"
+            q_pos = torch.arange(T, device=x.device).repeat_interleave(K)  # (T*K,)
+            k_pos = scene_frame_pos.to(x.device)                           # (N_tokens,)
 
         # Sliding-window hand-off: add the carried latent into the query tokens.
         # Zero-init Linear -> no-op until trained (warm-start safe); see __init__.
@@ -942,9 +1045,12 @@ class Decoder(nn.Module):
                               cams=N_cams, b=B, t=T, k=K)
 
             x_normed = self.norm1s[layer_idx](x, mode_idx)
-            attn_out, _ = self.cross_attns[layer_idx](
-                query=x_normed, key=kv, value=kv, need_weights=False
-            )
+            if self.cross_attn_rope:
+                attn_out = self.cross_attns[layer_idx](x_normed, kv, q_pos, k_pos)
+            else:
+                attn_out, _ = self.cross_attns[layer_idx](
+                    query=x_normed, key=kv, value=kv, need_weights=False
+                )
             x = x + attn_out
 
             x = x + self.mlps[layer_idx](self.norm2s[layer_idx](x, mode_idx))

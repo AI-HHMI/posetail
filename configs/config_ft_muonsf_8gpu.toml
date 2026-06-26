@@ -104,6 +104,9 @@ use_temporal_self_attention = true
 f_eff_scale = true
 # Projecting encoder features to the decoder dim trains notably better than false.
 scene_encoder_proj = true
+# Learned absolute pos_embed added on top of the (already-positional) VJEPA encoder output.
+# 'learned' = trainable interpolated table, 'sincos' = fixed 3-D sin/cos (length-agnostic), 'none' = ablation.
+scene_pos_embed_mode = 'learned'
 
 # "gridresid" = per-axis soft-argmax bin grid (CE-supervised): 3D head emits a motion residual
 # from a query anchor, depth is a log grid, plus a 2D pixel-bin position head.
