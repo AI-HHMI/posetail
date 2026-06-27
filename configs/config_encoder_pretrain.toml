@@ -75,7 +75,7 @@ video_encoder_finetune_last_n_layers = 12
 soft_argmax_temperature_learnable = true
 
 # processing
-stride_length = 8
+stride_length = 16
 stride_overlap = 4
 unroll_windows = false
 image_size = 256
@@ -102,24 +102,27 @@ f_eff_scale = true
 # Projecting encoder features to the decoder dim trains notably better than false.
 scene_encoder_proj = true
 
-cross_attn_dim = 2048
+cross_attn_dim = 512
 
-scene_proj_dim = 2048
+scene_proj_dim = 512
 scene_proj_prenorm = false
 scene_proj_mlp = false
+
+enable_subpixel_refinement = true
+subpixel_scale = 0.08
 
 # "gridresid" = per-axis soft-argmax bin grid (CE-supervised): 3D head emits a motion residual
 # from a query anchor, depth is a log grid, plus a 2D pixel-bin position head.
 output_mode = "gridresid"
 head_3d_grid_size = 256
 # Ray-local motion grid half-width (p99.9 ~0.93 across datasets); generous under log_3d_output.
-head_3d_grid_radius = 1.5
+head_3d_grid_radius = 2.0
 # Signed-log warp: tight eps spreads the sharply-peaked motion residual (p50~0.02) across bins.
 log_3d_output = true
 log_3d_eps = 0.01
 # Depth log-grid range = log(depth/(cube*f_eff)); covers every dataset's reach with margin.
 depth_log_min = -2.5
-depth_log_max = 2.0
+depth_log_max = 2.5
 
 [training]
 seed = 3

@@ -880,8 +880,11 @@ class Decoder(nn.Module):
         self.heads_conf_3d = _make_heads(1)
 
         if self.enable_subpixel_refinement and self.is_grid:
-            self.heads_subpixel_3d = _make_heads(3)        # sub-bin 3D offset
-            for m in range(2):                             # zero-init -> exact no-op at start
+            # Per-bin (3*G) sub-bin offset map: one learned offset per grid value per axis,
+            # soft-argmax-weighted at decode so the correction is conditioned on the predicted
+            # bin (motion location), not just the features. See the decode in forward().
+            self.heads_subpixel_3d = _make_heads(3 * head_3d_grid_size)
+            for m in range(2):                             # zero-init -> whole offset map = 0 -> no-op at start
                 nn.init.zeros_(self.heads_subpixel_3d[m][1].weight)
                 nn.init.zeros_(self.heads_subpixel_3d[m][1].bias)
         else:
@@ -951,10 +954,10 @@ class Decoder(nn.Module):
 
         self.scale_depth = nn.Parameter(torch.tensor([abs_scale]))
 
-    def _grid_decode(self, logits, grid_values):
-        """Per-axis masked soft-argmax over a fixed grid of bin centres (threshold 20
-        bins, temperature 0.5), mirroring tracker_tapnext.py:379-392. ``logits``
-        (..., K), ``grid_values`` (K,) -> decoded value (...)."""
+    def _grid_softmax(self, logits):
+        """Per-axis masked soft-argmax WEIGHTS over the bin grid (threshold 20 bins,
+        temperature 0.5), mirroring tracker_tapnext.py:379-392. ``logits`` (..., K) ->
+        normalized probs (..., K). Shared by the decode and the per-bin offset head."""
         soft_argmax_threshold = self.soft_argmax_threshold
         softmax_temperature = (torch.exp(self.log_soft_argmax_temp)
                                if self.log_soft_argmax_temp is not None
@@ -964,7 +967,12 @@ class Decoder(nn.Module):
         index = torch.arange(K, device=logits.device)
         mask = (torch.abs(argmax - index) <= soft_argmax_threshold).float()
         probs = F.softmax(logits * softmax_temperature, dim=-1) * mask
-        probs = probs / probs.sum(dim=-1, keepdim=True)
+        return probs / probs.sum(dim=-1, keepdim=True)
+
+    def _grid_decode(self, logits, grid_values):
+        """Soft-argmax decode: weighted sum of bin centres. ``logits`` (..., K),
+        ``grid_values`` (K,) -> decoded value (...)."""
+        probs = self._grid_softmax(logits)
         return (probs * grid_values.to(probs.dtype)).sum(dim=-1)
 
     def forward(self, scene_features, query_embeds, rays, mode_idx, prev_latent=None):
@@ -1030,10 +1038,14 @@ class Decoder(nn.Module):
             G = self.head_3d_grid_size
             raw_3d = self.heads_3d[m](x)                                    # (..., 3G)
             logits_3d = rearrange(raw_3d, '... (d k) -> ... d k', d=3, k=G)  # (..., 3, G)
-            out_3d = self._grid_decode(logits_3d, self.grid_1d)            # (..., 3)
+            p3d = self._grid_softmax(logits_3d)                            # (..., 3, G) soft-argmax weights
+            out_3d = (p3d * self.grid_1d.to(p3d.dtype)).sum(-1)            # (..., 3) decode (== _grid_decode)
 
             if self.heads_subpixel_3d is not None:                          # optional sub-bin refinement
-                delta = self.heads_subpixel_3d[m](x) * self.subpixel_scale
+                # Per-bin offset map: blend the offset by the SAME soft-argmax weights, so the
+                # correction is conditioned on the predicted bin. delta = scale * Σ_k p_k * o_k.
+                offsets = rearrange(self.heads_subpixel_3d[m](x), '... (d k) -> ... d k', d=3, k=G)
+                delta = (p3d * offsets).sum(-1) * self.subpixel_scale       # (..., 3) warped units
                 if self.log_3d_output:
                     # Refine in WARPED (uniform-bin) space: the offset is a constant number of bins
                     # everywhere, so its head-unit reach auto-scales with the local bin width. A
