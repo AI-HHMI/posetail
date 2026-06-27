@@ -35,6 +35,6 @@ bsub -J enm2-$d -e ~/logs/posetail/enm2-$d.err -o ~/logs/posetail/enm2-$d.out \
     -n 96 -q gpu_h100 -R "span[hosts=1]" -gpu "num=8" -W 168:00 \
     /bin/bash train_script.sh configs/config_ft_muonsf_8gpu_5.toml
 
-bsub -J enm3-$d -e ~/logs/posetail/enm3-$d.err -o ~/logs/posetail/enm3-$d.out \
-    -n 96 -q gpu_h100 -R "span[hosts=1]" -gpu "num=8" -W 168:00 \
-    /bin/bash train_script.sh configs/config_ft_muonsf_8gpu_5b.toml
+# bsub -J enm3-$d -e ~/logs/posetail/enm3-$d.err -o ~/logs/posetail/enm3-$d.out \
+#     -n 96 -q gpu_h100 -R "span[hosts=1]" -gpu "num=8" -W 168:00 \
+#     /bin/bash train_script.sh configs/config_ft_muonsf_8gpu_5b.toml

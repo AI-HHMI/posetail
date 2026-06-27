@@ -12,7 +12,7 @@ batch_size = 1
 num_workers = 12
 # Finetune on the finetuning-v3 set (vs the pretraining-v3 set used for pretraining).
 prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v3'
-datasets_to_exclude = ["johnson-fly", "cmupanoptic", "rat7m", "rat-city", "branson-fly"]
+datasets_to_exclude = ["johnson-fly", "cmupanoptic", "rat-city", "branson-fly"]
 
 [dataset.train]
 split_dir = 'train'
@@ -30,7 +30,7 @@ n_samples_per_dataset = -1
 # Upsample kubric-multiview 5x relative to every other dataset (all others default to 1.0).
 # Multiplies the per-dataset balanced count (see _balance_metadata, posetail_dataset.py:1363);
 # requires balance_datasets = true. weight 1.0/absent = old uniform behavior.
-dataset_weights = { "kubric-multiview" = 5.0 }
+dataset_weights = { "kubric-multiview" = 6.0, "point-odyssey-animal-sub256" = 4.0, "3dzef" = 0.1, "rat7m" = 0.1 }
 crop_to_points = true
 speed_thresh = 3.0
 query_anytime = true
@@ -114,23 +114,25 @@ f_eff_scale = true
 # Projecting encoder features to the decoder dim trains notably better than false.
 scene_encoder_proj = true
 
-scene_proj_dim = 2048
-
 # "gridresid" = per-axis soft-argmax bin grid (CE-supervised): 3D head emits a motion residual
 # from a query anchor, depth is a log grid, plus a 2D pixel-bin position head.
 output_mode = "gridresid"
 head_3d_grid_size = 512
 # Ray-local motion grid half-width (p99.9 ~0.93 across datasets); generous under log_3d_output.
-head_3d_grid_radius = 1.5
+head_3d_grid_radius = 2.0
 # Signed-log warp: tight eps spreads the sharply-peaked motion residual (p50~0.02) across bins.
 log_3d_output = true
-log_3d_eps = 0.01
+log_3d_eps = 0.1
+
+enable_subpixel_refinement = true
+subpixel_scale = 0.025
+
 # Depth log-grid range = log(depth/(cube*f_eff)); covers every dataset's reach with margin.
 depth_log_min = -2.5
-depth_log_max = 2.0
+depth_log_max = 2.5
 
 [training]
-seed = 27
+seed = 25
 finetune = true
 
 # previous finetuning v3
@@ -141,10 +143,10 @@ finetune = true
 # checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260621_211130-268oz1ua/files/checkpoints/checkpoint_00010240.pth'
 
 # continue
-# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260621_220241-ufwyxvnv/files/checkpoints/checkpoint_00245760.pth'
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260622_164809-j5y2ff92/files/checkpoints/checkpoint_01730560.pth'
 
-# from _4
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260622_164809-j5y2ff92/files/checkpoints/checkpoint_00286720.pth'
+# finetuned with enable_subpixel_refinement
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260627_135613-iuttiiqz/files/checkpoints/checkpoint_00030720.pth'
 
 n_iterations = 8000000
 scheduler_type = 'muon'  # SF-Muon: beats AdamW/schedulefree by ~0.05 kubric at every matched iter
