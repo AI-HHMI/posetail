@@ -109,7 +109,7 @@ scene_proj_prenorm = false
 scene_proj_mlp = false
 
 enable_subpixel_refinement = true
-subpixel_scale = 0.08
+subpixel_scale = 0.09
 
 # "gridresid" = per-axis soft-argmax bin grid (CE-supervised): 3D head emits a motion residual
 # from a query anchor, depth is a log grid, plus a 2D pixel-bin position head.
