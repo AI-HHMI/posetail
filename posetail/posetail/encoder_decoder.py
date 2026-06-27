@@ -732,7 +732,9 @@ class Decoder(nn.Module):
                  f_eff_scale=False,
                  soft_argmax_temperature=0.5,
                  soft_argmax_threshold=20,
-                 soft_argmax_temperature_learnable=False):
+                 soft_argmax_temperature_learnable=False,
+                 enable_subpixel_refinement=False,
+                 subpixel_scale=0.05):
         super().__init__()
 
         self.embed_dim = embed_dim
@@ -762,6 +764,14 @@ class Decoder(nn.Module):
         self.log_3d_output = log_3d_output
         self.log_3d_eps = log_3d_eps
         self.log_3d_c_range = float(math.log1p(head_3d_grid_radius / log_3d_eps))
+        # Optional sub-pixel/sub-bin 3D offset head: refines the discretized soft-argmax out_3d with
+        # a small learned continuous correction (supervised by the EXISTING coords regression loss,
+        # no new term). Zero-init -> starts as an exact no-op; disabled by default (no head at all).
+        # Under log_3d_output the offset is applied in WARPED space, so subpixel_scale is measured in
+        # warped units (~bins of correction); its head-unit reach then auto-scales with the local bin
+        # width. Without the warp it is a flat offset of subpixel_scale everywhere. See forward().
+        self.enable_subpixel_refinement = enable_subpixel_refinement
+        self.subpixel_scale = float(subpixel_scale)
 
         # Grid (classification) output modes, mirroring TrackerTapNext:
         #   "grid"      = absolute ray-local position via per-axis marginal soft-argmax.
@@ -868,6 +878,14 @@ class Decoder(nn.Module):
         self.heads_conf    = _make_heads(1)
         self.heads_depth   = _make_heads(head_depth_out)
         self.heads_conf_3d = _make_heads(1)
+
+        if self.enable_subpixel_refinement and self.is_grid:
+            self.heads_subpixel_3d = _make_heads(3)        # sub-bin 3D offset
+            for m in range(2):                             # zero-init -> exact no-op at start
+                nn.init.zeros_(self.heads_subpixel_3d[m][1].weight)
+                nn.init.zeros_(self.heads_subpixel_3d[m][1].bias)
+        else:
+            self.heads_subpixel_3d = None
 
         # Variance-matched, dimension-invariant head init.
         # The LayerNorm gives each head a unit-variance input (Sum_i x_i^2 = embed_dim), so for
@@ -1013,6 +1031,18 @@ class Decoder(nn.Module):
             raw_3d = self.heads_3d[m](x)                                    # (..., 3G)
             logits_3d = rearrange(raw_3d, '... (d k) -> ... d k', d=3, k=G)  # (..., 3, G)
             out_3d = self._grid_decode(logits_3d, self.grid_1d)            # (..., 3)
+
+            if self.heads_subpixel_3d is not None:                          # optional sub-bin refinement
+                delta = self.heads_subpixel_3d[m](x) * self.subpixel_scale
+                if self.log_3d_output:
+                    # Refine in WARPED (uniform-bin) space: the offset is a constant number of bins
+                    # everywhere, so its head-unit reach auto-scales with the local bin width. A
+                    # zero-init delta stays an EXACT no-op; clamp keeps expm1/its gradient bounded.
+                    cr = self.log_3d_c_range
+                    warped = signed_log1p(out_3d, self.log_3d_eps) + delta
+                    out_3d = signed_expm1(warped.clamp(-cr, cr), self.log_3d_eps).to(out_3d.dtype)
+                else:
+                    out_3d = out_3d + delta
 
             logits_depth = self.heads_depth[m](x)                          # (..., G)
             # decode log-depth then exp -> normalized depth (>0); tracker_encoder

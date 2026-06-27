@@ -98,13 +98,13 @@ n_time_space_blocks = 6
 embedding_factor = 4
 use_camera_self_attention = true
 use_temporal_self_attention = true
-f_eff_scale = false
+f_eff_scale = true
 # Projecting encoder features to the decoder dim trains notably better than false.
 scene_encoder_proj = true
 
-cross_attn_dim = 512
+cross_attn_dim = 2048
 
-scene_proj_dim = 512
+scene_proj_dim = 2048
 scene_proj_prenorm = false
 scene_proj_mlp = false
 
