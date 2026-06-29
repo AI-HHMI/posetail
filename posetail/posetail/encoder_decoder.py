@@ -1097,3 +1097,69 @@ class Decoder(nn.Module):
         latent = rearrange(x, '(cams b) (t k) dim -> b t k cams dim',
                            cams=N_cams, b=B, t=T, k=K)
         return output, grid_logits, latent
+
+
+class AttentionPooling(nn.Module):
+    """Multihead attention-pooling (MAP) head over the (time, camera) set of a point.
+
+    Pools the per-(t, cam) decoder latents of each tracked point into ONE latent per
+    point: a learned seed query cross-attends over the flattened (t * cams) tokens
+    (Set-Transformer PMA, Lee et al. 2019). Permutation-invariant over cameras (a
+    variable 1..N_cams are present, no camera embedding) but order-aware over time via
+    an optional learned per-frame embedding, linearly resampled to the actual T (mirrors
+    QueryEncoder's t-embed resize / train_utils._interp_res_params).
+
+        x: [b, t, k, cams, dim]  ->  [b, k, dim]
+    """
+
+    def __init__(self, dim, num_heads=8, n_frames=16, use_time_embedding=True,
+                 mlp_ratio=4.0):
+        super().__init__()
+        self.dim = dim
+        self.n_frames = n_frames
+        self.use_time_embedding = use_time_embedding
+
+        # learned seed query (the single "pooled" token that reads out the set)
+        self.query = nn.Parameter(torch.zeros(1, 1, dim))
+        nn.init.trunc_normal_(self.query, std=0.02)
+
+        if use_time_embedding:
+            self.time_embed = nn.Parameter(torch.zeros(n_frames, dim))
+            nn.init.trunc_normal_(self.time_embed, std=0.02)
+
+        self.norm_kv = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        # post-attention feed-forward (rFF in PMA), residual on the pooled token
+        self.norm_out = nn.LayerNorm(dim)
+        hidden = int(dim * mlp_ratio)
+        self.ff = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim))
+
+    def _resize_time_embed(self, T, device, dtype):
+        """[n_frames, dim] -> [T, dim] by linear resampling of the frame axis."""
+        te = self.time_embed.to(dtype)
+        if T == self.n_frames:
+            return te
+        w = te.t().unsqueeze(0)                                   # [1, dim, n_frames]
+        w = F.interpolate(w, size=T, mode='linear', align_corners=False)
+        return w.squeeze(0).t()                                   # [T, dim]
+
+    def forward(self, x, key_padding_mask=None):
+        """x: [b, t, k, cams, dim]; key_padding_mask: [b, k, t, cams] bool (True = drop).
+        Returns [b, k, dim]."""
+        b, T, k, cams, dim = x.shape
+
+        if self.use_time_embedding:
+            te = self._resize_time_embed(T, x.device, x.dtype)   # [T, dim]
+            x = x + te[None, :, None, None, :]
+
+        kv = rearrange(x, 'b t k cams d -> (b k) (t cams) d')
+        kv = self.norm_kv(kv)
+
+        kpm = None
+        if key_padding_mask is not None:
+            kpm = rearrange(key_padding_mask, 'b k t cams -> (b k) (t cams)')
+
+        q = self.query.expand(kv.shape[0], -1, -1)               # [(b k), 1, dim]
+        pooled, _ = self.attn(q, kv, kv, key_padding_mask=kpm, need_weights=False)
+        pooled = pooled + self.ff(self.norm_out(pooled))         # [(b k), 1, dim]
+        return rearrange(pooled[:, 0], '(b k) d -> b k d', b=b, k=k)

@@ -1,0 +1,146 @@
+# Track-quality scorer (triplet loss). Backbone frozen; query-encoder + decoder +
+# pooling/score heads warm-started from posetail-finetuning-v3 run 39yczenk.
+
+[wandb]
+project_name = "posetail-scorer"
+path = "/groups/karashchuk/home/karashchukl/results/posetail-scorer"
+mode = "online"
+
+[dataset]
+batch_size = 1
+num_workers = 12
+prefix = "/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v3"
+datasets_to_exclude = [ "johnson-fly", "cmupanoptic", "rat7m", "rat-city", "branson-fly",]
+
+[devices]
+device = "cuda"
+
+# [model] copied verbatim from run 39yczenk so every submodule shape matches the
+# checkpoint, EXCEPT video_encoder_requires_grad which is forced false (freeze backbone).
+[model]
+mode_3d = "encoder"
+video_encoder_version = "large"
+video_encoder_requires_grad = false
+video_encoder_hierarchical = true
+soft_argmax_temperature_learnable = true
+stride_length = 16
+image_size = 256
+query_patch_size = 9
+per_camera_cube_scale = true
+max_freq = 10
+embedding_dim = 256
+use_volume_embedding = false
+corr_radius = 2
+principal_point_embedding = true
+intrinsic_embedding = true
+metric_ray_translation = true
+latent_dim = 512
+n_heads = 8
+n_time_space_blocks = 6
+embedding_factor = 4
+use_camera_self_attention = true
+use_temporal_self_attention = true
+f_eff_scale = true
+scene_encoder_proj = true
+output_mode = "gridresid"
+head_3d_grid_size = 512
+head_3d_grid_radius = 1.5
+log_3d_output = true
+log_3d_eps = 0.01
+enable_subpixel_refinement = false
+depth_log_min = -2.5
+depth_log_max = 2.0
+
+[training]
+seed = 97
+finetune = true
+checkpoint_path = "/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260628_134003-39yczenk/files/checkpoints/checkpoint_00399360.pth"
+n_iterations = 8000000
+scheduler_type = "muon"
+max_grad_norm = 20.0
+checkpoint_freq = 10240
+val_freq = 200
+val_batches = 20
+print_freq = 20
+debug_ix = -1
+
+# Scorer head + corruption settings.
+[scorer]
+pool_num_heads = 8
+score_hidden = 64
+use_precision = true
+triplet_margin = 0.5
+precision_reg_weight = 0.01
+
+[scorer.corruption]
+# per-type probability that a given point gets this corruption (every point gets >=1)
+const_offset_prob = 0.5
+frame_noise_prob = 0.5
+gradual_drift_prob = 0.5
+sinusoid_prob = 0.5
+# anchor augmentation
+anchor_appearance_aug = false
+anchor_rotate_2d_deg = 45.0
+
+# 3D magnitudes in cube_scale (world) units
+[scorer.corruption.mag_3d]
+const_offset = 0.10
+frame_noise = 0.10
+gradual_drift = 0.15
+sinusoid = 0.10
+
+# 2D magnitudes in pixels (image_size = 256)
+[scorer.corruption.mag_2d]
+const_offset = 8.0
+frame_noise = 6.0
+gradual_drift = 12.0
+sinusoid = 8.0
+
+[dataset.train]
+split_dir = "train"
+n_frames = 16
+min_res = 256
+max_res = 256
+cams_to_sample = [ 1, 8,]
+kpts_to_sample = [ 128, 128,]
+aug_prob = 0.0
+per_image_aug_prob = 0.0
+enable_kpt_filtering = false
+cam_thresh_for_vis = 1
+balance_datasets = true
+n_samples_per_dataset = -1
+crop_to_points = true
+speed_thresh = 3.0
+query_anytime = false
+prop_dynamic_kpts_to_sample = 0.95
+prob_2d_only = 0.25
+no_nan_coords = true
+crop_3d_enabled = false
+
+[dataset.val]
+split_dir = "val"
+n_frames = 16
+max_res = 256
+cams_to_sample = 5
+kpts_to_sample = 128
+aug_prob = 0.0
+crop_to_points = true
+speed_thresh = 1.0
+prop_dynamic_kpts_to_sample = 0.7
+query_anytime = false
+no_nan_coords = true
+
+[training.optimizer]
+learning_rate = 9e-5
+muon_schedulefree = true
+weight_decay = 0.001
+warmup_steps = 200
+muon_warmup_steps = 200
+beta1 = 0.9
+beta2 = 0.95
+encoder_lr_scale = 0.07
+
+[training.scheduler]
+
+[dataset.train.dataset_weights]
+kubric-multiview = 5.0
