@@ -22,6 +22,13 @@ import os
 import time
 import signal
 
+# Import wandb BEFORE torch/lightning: its extension pulls in the pixi env's newer
+# libstdc++ (CXXABI_1.3.15) first, which matplotlib/torchmetrics (via lightning) then
+# reuse. Importing torch first instead loads the node's older system libstdc++, which on
+# some queues (e.g. gpu_l4) lacks CXXABI_1.3.15 and crashes the matplotlib import. This
+# mirrors train.py's import order.
+import wandb
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
@@ -35,7 +42,6 @@ from posetail.posetail.losses_scorer import TripletScorerLoss
 from train_utils import (load_config, save_config, set_seeds, write_json,
                          build_optimizer_param_groups, load_checkpoint, save_checkpoint,
                          total_to_per_gpu, dict_to_device, get_timestamp)
-import wandb
 
 
 def parse_args():
