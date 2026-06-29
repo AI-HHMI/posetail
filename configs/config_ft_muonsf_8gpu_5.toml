@@ -12,7 +12,7 @@ batch_size = 1
 num_workers = 12
 # Finetune on the finetuning-v3 set (vs the pretraining-v3 set used for pretraining).
 prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v3'
-datasets_to_exclude = ["johnson-fly", "cmupanoptic", "rat-city", "branson-fly"]
+datasets_to_exclude = ["johnson-fly", "cmupanoptic", "rat7m", "rat-city", "branson-fly"]
 
 [dataset.train]
 split_dir = 'train'
@@ -30,7 +30,7 @@ n_samples_per_dataset = -1
 # Upsample kubric-multiview 5x relative to every other dataset (all others default to 1.0).
 # Multiplies the per-dataset balanced count (see _balance_metadata, posetail_dataset.py:1363);
 # requires balance_datasets = true. weight 1.0/absent = old uniform behavior.
-dataset_weights = { "kubric-multiview" = 6.0, "point-odyssey-animal-sub256" = 4.0, "3dzef" = 0.1, "rat7m" = 0.1 }
+dataset_weights = { "kubric-multiview" = 5.0 }
 crop_to_points = true
 speed_thresh = 3.0
 query_anytime = true
@@ -80,7 +80,7 @@ mode_3d = "encoder"
 
 video_encoder_version = 'large'
 # VJEPA backbone trainable from step 0 (vs delayed unfreeze when pretraining from scratch).
-video_encoder_requires_grad = 25000
+video_encoder_requires_grad = true
 video_encoder_hierarchical = true
 # Finetune the WHOLE encoder (omit video_encoder_finetune_last_n_layers -> default None = all)
 # so the backbone can specialize for dense correspondence, not just semantics.
@@ -119,20 +119,20 @@ scene_encoder_proj = true
 output_mode = "gridresid"
 head_3d_grid_size = 512
 # Ray-local motion grid half-width (p99.9 ~0.93 across datasets); generous under log_3d_output.
-head_3d_grid_radius = 2.0
+head_3d_grid_radius = 1.5
 # Signed-log warp: tight eps spreads the sharply-peaked motion residual (p50~0.02) across bins.
 log_3d_output = true
-log_3d_eps = 0.1
+log_3d_eps = 0.01
 
-enable_subpixel_refinement = true
-subpixel_scale = 0.025
+enable_subpixel_refinement = false
+# subpixel_scale = 0.08
 
 # Depth log-grid range = log(depth/(cube*f_eff)); covers every dataset's reach with margin.
 depth_log_min = -2.5
-depth_log_max = 2.5
+depth_log_max = 2.0
 
 [training]
-seed = 25
+seed = 97
 finetune = true
 
 # previous finetuning v3
@@ -143,10 +143,11 @@ finetune = true
 # checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260621_211130-268oz1ua/files/checkpoints/checkpoint_00010240.pth'
 
 # continue
-# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260622_164809-j5y2ff92/files/checkpoints/checkpoint_01730560.pth'
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260622_164809-j5y2ff92/files/checkpoints/checkpoint_01761280.pth'
 
 # finetuned with enable_subpixel_refinement
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260627_135613-iuttiiqz/files/checkpoints/checkpoint_00030720.pth'
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260627_135613-iuttiiqz/files/checkpoints/checkpoint_00030720.pth'
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260627_194655-nuqutgsb/files/checkpoints/checkpoint_00040960.pth'
 
 n_iterations = 8000000
 scheduler_type = 'muon'  # SF-Muon: beats AdamW/schedulefree by ~0.05 kubric at every matched iter
@@ -173,7 +174,7 @@ beta1 = 0.9
 beta2 = 0.95
 # Whole encoder trainable but at 0.1x base LR: 1.0 blew up grad_norm to ~3485 and collapsed the
 # V-JEPA features. 0.1 -> two-group split, encoder ~5.7e-5. Kill-switch: grad_norm>100 -> 0.05.
-encoder_lr_scale = 0.1
+encoder_lr_scale = 0.07
 
 [training.scheduler]
 
