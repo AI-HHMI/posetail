@@ -56,7 +56,8 @@ class TrackerEncoder(nn.Module):
                  soft_argmax_threshold = 20,
                  soft_argmax_temperature_learnable = False,
                  enable_subpixel_refinement = False,
-                 subpixel_scale = 0.05):
+                 subpixel_scale = 0.05,
+                 grid_decode_space = 'head'):
         super().__init__()
 
         self.mode_3d = mode_3d
@@ -184,6 +185,7 @@ class TrackerEncoder(nn.Module):
             soft_argmax_temperature_learnable=soft_argmax_temperature_learnable,
             enable_subpixel_refinement=enable_subpixel_refinement,
             subpixel_scale=subpixel_scale,
+            grid_decode_space=grid_decode_space,
         )
 
     def unfreeze_video_encoder(self, iteration):

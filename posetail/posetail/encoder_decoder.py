@@ -734,7 +734,8 @@ class Decoder(nn.Module):
                  soft_argmax_threshold=20,
                  soft_argmax_temperature_learnable=False,
                  enable_subpixel_refinement=False,
-                 subpixel_scale=0.05):
+                 subpixel_scale=0.05,
+                 grid_decode_space="head"):
         super().__init__()
 
         self.embed_dim = embed_dim
@@ -764,6 +765,17 @@ class Decoder(nn.Module):
         self.log_3d_output = log_3d_output
         self.log_3d_eps = log_3d_eps
         self.log_3d_c_range = float(math.log1p(head_3d_grid_radius / log_3d_eps))
+        # Soft-argmax averaging space for the 3D decode (only meaningful with log_3d_output):
+        #   "head"   = average the head-unit bin centres directly (out_3d = Σ p_k * grid_1d_k).
+        #              The centres are convex-spaced (signed_expm1), so a broad distribution
+        #              OVERSHOOTS through the warp (Jensen bias at large motion). DEFAULT — the
+        #              original behaviour, bit-for-bit when "head".
+        #   "warped" = average in the uniform WARPED space first, then expm1
+        #              (out_3d = signed_expm1(Σ p_k * w_k)); overshoot-free. Adds no params/buffers
+        #              (the warped centres are signed_log1p(grid_1d), recovered exactly), so it is
+        #              load-compatible with any checkpoint. Enable for a future retrain.
+        assert grid_decode_space in ("head", "warped"), grid_decode_space
+        self.grid_decode_space = grid_decode_space
         # Optional sub-pixel/sub-bin 3D offset head: refines the discretized soft-argmax out_3d with
         # a small learned continuous correction (supervised by the EXISTING coords regression loss,
         # no new term). Zero-init -> starts as an exact no-op; disabled by default (no head at all).
@@ -1039,7 +1051,16 @@ class Decoder(nn.Module):
             raw_3d = self.heads_3d[m](x)                                    # (..., 3G)
             logits_3d = rearrange(raw_3d, '... (d k) -> ... d k', d=3, k=G)  # (..., 3, G)
             p3d = self._grid_softmax(logits_3d)                            # (..., 3, G) soft-argmax weights
-            out_3d = (p3d * self.grid_1d.to(p3d.dtype)).sum(-1)            # (..., 3) decode (== _grid_decode)
+            if self.log_3d_output and self.grid_decode_space == "warped":
+                # Average in the uniform WARPED space, then expm1 — overshoot-free (see __init__).
+                # grid_1d == signed_expm1(linspace(-cr,cr,G)), so signed_log1p recovers the warped
+                # centres exactly; no extra buffer, load-compatible with "head" checkpoints.
+                cr = self.log_3d_c_range
+                warped_centres = signed_log1p(self.grid_1d.to(p3d.dtype), self.log_3d_eps)
+                warped_mean = (p3d * warped_centres).sum(-1).clamp(-cr, cr)  # (..., 3) warped units
+                out_3d = signed_expm1(warped_mean, self.log_3d_eps).to(p3d.dtype)
+            else:
+                out_3d = (p3d * self.grid_1d.to(p3d.dtype)).sum(-1)        # (..., 3) head-space decode (default)
 
             if self.heads_subpixel_3d is not None:                          # optional sub-bin refinement
                 # Per-bin offset map: blend the offset by the SAME soft-argmax weights, so the
