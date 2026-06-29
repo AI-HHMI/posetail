@@ -162,9 +162,36 @@ class ScorerEncoder(TrackerEncoder):
         return scores, log_prec
 
     def forward(self, views, coords, camera_group, query_times=None):
-        """views: list of [b,t,h,w,c]; coords: full trajectory [b,t,k,R]."""
+        """Single-sample inference path. views: list of [b,t,h,w,c];
+        coords: full trajectory [b,t,k,R]. Returns scores, log_prec: [b, k]."""
         views_norm, scene_features = self.encode_scene(views)
         return self.score(views_norm, scene_features, coords, camera_group)
+
+    def score_triplet(self, trip):
+        """Score a (good, bad, anchor) triplet in ONE forward pass (DDP-safe: a single
+        entry/exit of the module's forward, one backward).
+
+        trip is the dict from datasets.scorer_corruption.make_triplet. Returns
+        scores, log_prec, labels each [N, 3] (N = b*k; columns good, bad, anchor).
+        """
+        gv, gc, gcg = trip['good']
+        _, bc, bcg = trip['bad']                       # bad shares good's pixels
+        av, ac, acg = trip['anchor']
+
+        vn, sf = self.encode_scene(gv)
+        good_s, good_lp = self.score(vn, sf, gc, gcg)
+        bad_s, bad_lp = self.score(vn, sf, bc, bcg)
+        if trip['reuse_scene_for_anchor']:
+            avn, asf = vn, sf
+        else:
+            avn, asf = self.encode_scene(av)
+        anc_s, anc_lp = self.score(avn, asf, ac, acg)
+
+        scores = torch.stack([good_s, bad_s, anc_s], dim=-1).reshape(-1, 3)
+        log_prec = torch.stack([good_lp, bad_lp, anc_lp], dim=-1).reshape(-1, 3)
+        al = float(trip['anchor_label'])
+        labels = torch.tensor([1.0, -1.0, al], device=scores.device).expand_as(scores)
+        return scores, log_prec, labels
 
     def print_summary(self):
         from posetail.posetail.utils import count_parameters

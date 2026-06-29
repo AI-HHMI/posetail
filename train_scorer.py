@@ -134,32 +134,6 @@ def _to_device(batch, device):
     return batch
 
 
-def _score_triplet(model, trip):
-    """Run the three triplet samples through the scorer. Returns scores, log_prec [N, 3]
-    (columns good, bad, anchor) and labels [N, 3]."""
-    gv, gc, gcg = trip['good']
-    _, bc, bcg = trip['bad']                          # bad shares good's pixels
-    av, ac, acg = trip['anchor']
-
-    vn, sf = model.encode_scene(gv)
-    good_s, good_lp = model.score(vn, sf, gc, gcg)    # [b, k]
-    bad_s, bad_lp = model.score(vn, sf, bc, bcg)
-    if trip['reuse_scene_for_anchor']:
-        avn, asf = vn, sf
-    else:
-        avn, asf = model.encode_scene(av)
-    anc_s, anc_lp = model.score(avn, asf, ac, acg)
-
-    scores = torch.stack([good_s, bad_s, anc_s], dim=-1)          # [b, k, 3]
-    log_prec = torch.stack([good_lp, bad_lp, anc_lp], dim=-1)
-    scores = scores.reshape(-1, 3)                               # [N, 3]
-    log_prec = log_prec.reshape(-1, 3)
-
-    al = trip['anchor_label']
-    labels = torch.tensor([1.0, -1.0, al], device=scores.device).expand_as(scores)
-    return scores, log_prec, labels
-
-
 def run(config_path, fabric):
     torch.set_float32_matmul_precision('medium')
     config = load_config(config_path)
@@ -211,8 +185,9 @@ def run(config_path, fabric):
                           use_precision=scorer_kwargs.get('use_precision', True),
                           **config.model)
     model = fabric.setup(model)
-    model.mark_forward_method('encode_scene')
-    model.mark_forward_method('score')
+    # one marked forward method that scores the whole triplet -> DDP sees a single
+    # forward per iteration (avoids the multi-forward reducer pitfall).
+    model.mark_forward_method('score_triplet')
     model.print_summary()
 
     base_lr = config.training.optimizer.learning_rate
@@ -261,7 +236,7 @@ def run(config_path, fabric):
         trip = make_triplet(batch, train_dataset, corruptor_3d, corruptor_2d, corruption_cfg)
 
         optimizer.zero_grad()
-        scores, log_prec, labels = _score_triplet(model, trip)
+        scores, log_prec, labels = model.score_triplet(trip)
         total_loss = train_loss(scores, log_prec, labels)
         fabric.backward(total_loss)
 
@@ -299,7 +274,7 @@ def run(config_path, fabric):
                         break
                     vbatch = _to_device(vbatch, device)
                     vtrip = make_triplet(vbatch, val_dataset, corruptor_3d, corruptor_2d, corruption_cfg)
-                    vs, vlp, vl = _score_triplet(model, vtrip)
+                    vs, vlp, vl = model.score_triplet(vtrip)
                     val_loss(vs, vlp, vl)
             result_dict.update(val_loss.collapse_history(prefix='val/'))
             val_loss.reset_history()
