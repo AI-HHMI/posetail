@@ -112,22 +112,24 @@ scene_proj_mlp = false
 # "gridresid" = per-axis soft-argmax bin grid (CE-supervised): 3D head emits a motion residual
 # from a query anchor, depth is a log grid, plus a 2D pixel-bin position head.
 #
-# good gridresid with subpixel refinement, seems better
-output_mode = "gridresid"
-head_3d_grid_size = 512
-head_3d_grid_radius = 1.15
-log_3d_output = true
-log_3d_eps = 0.1
-enable_subpixel_refinement = true
-subpixel_scale = 0.018
 
 # without subpixel
+output_mode = "gridresid"
+head_3d_grid_size = 512
+head_3d_grid_radius = 1.8
+log_3d_output = true
+log_3d_eps = 0.02
+soft_argmax_threshold = 30
+enable_subpixel_refinement = false
+
+# good gridresid with subpixel refinement
 # output_mode = "gridresid"
-# head_3d_grid_size = 1024
-# head_3d_grid_radius = 2.0
+# head_3d_grid_size = 512
+# head_3d_grid_radius = 1.15
 # log_3d_output = true
-# log_3d_eps = 0.3
-# enable_subpixel_refinement = false
+# log_3d_eps = 0.1
+# enable_subpixel_refinement = true
+# subpixel_scale = 0.018
 
 
 # Depth log-grid range = log(depth/(cube*f_eff)); covers every dataset's reach with margin.
