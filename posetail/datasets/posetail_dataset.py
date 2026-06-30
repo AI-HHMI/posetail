@@ -362,6 +362,10 @@ class PosetailDataset(Dataset):
         # keeps TrackerEncoder behavior identical.
         self.causal_masking = config.dataset[split].get('causal_masking', False)
         self.no_nan_coords = config.dataset[split].get('no_nan_coords', True)
+        # When no_nan_coords is off, keep partially-missing tracks but drop points
+        # observed in fewer than min_valid_frames frames (avoids all-/mostly-missing
+        # points the scorer can't meaningfully evaluate).
+        self.min_valid_frames = config.dataset[split].get('min_valid_frames', 1)
 
         # 3D sphere subvolume crop augmentation
         self.crop_3d_enabled = config.dataset[split].get('crop_3d_enabled', False)
@@ -545,6 +549,9 @@ class PosetailDataset(Dataset):
             if self.no_nan_coords:
                 mask = torch.all(torch.isfinite(coords), dim=(0, 2))
                 coords = coords[:, mask]
+            elif self.min_valid_frames > 1:
+                finite_frames = torch.isfinite(coords).all(dim=2).sum(dim=0)
+                coords = coords[:, finite_frames >= self.min_valid_frames]
 
             if coords.shape[1] < 2:
                 return None
@@ -685,6 +692,12 @@ class PosetailDataset(Dataset):
 
             if self.no_nan_coords:
                 mask = torch.all(torch.isfinite(coords), dim=(0, 2))
+                coords = coords[:, mask]
+                if vis is not None:
+                    vis = vis[:, mask]
+                    vis_2d = vis_2d[:, mask]
+            elif self.min_valid_frames > 1:
+                mask = torch.isfinite(coords).all(dim=2).sum(dim=0) >= self.min_valid_frames
                 coords = coords[:, mask]
                 if vis is not None:
                     vis = vis[:, mask]

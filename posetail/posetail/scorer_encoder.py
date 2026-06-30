@@ -31,6 +31,15 @@ class ScorerEncoder(TrackerEncoder):
         d = self.decoder.embed_dim                                # = latent_dim
 
         self.attn_pool = AttentionPooling(d, num_heads=pool_num_heads, n_frames=self.S)
+
+        # Learnable token substituted for (frame, point) slots whose track coord is NaN
+        # (missing/occluded). Sized to the query-encoder output dim, since it replaces the
+        # fused query embedding before the decoder. Keeps those slots finite so the decoder's
+        # temporal/camera self-attention can't be poisoned by NaN; the slot still flows through
+        # pooling (with its time embedding), so missingness informs the score.
+        self.missing_point = nn.Parameter(torch.zeros(self.query_encoder.decoder_dim))
+        nn.init.normal_(self.missing_point, std=0.02)
+
         self.score_feature = nn.Sequential(
             nn.LayerNorm(d), nn.Linear(d, score_hidden), nn.SiLU())
         self.score_head = nn.Linear(score_hidden, 1, bias=False)  # no bias (miss-alignment)
@@ -111,6 +120,16 @@ class ScorerEncoder(TrackerEncoder):
         B, T, K, R = coords_full.shape
         n_cams = len(camera_group)
 
+        # Support missing (NaN) track points. Sanitize NaN coords to a finite placeholder
+        # (each point's mean over its observed frames) BEFORE projection/rays/patches, so no
+        # NaN reaches the decoder's temporal/camera self-attention (which would poison every
+        # other frame/cam of the point). The valid mask drives the missing-point token below.
+        valid = torch.isfinite(coords_full).all(dim=-1)                 # [b, t, k]
+        mean_pos = torch.nanmean(coords_full.to(torch.float32), dim=1, keepdim=True)  # [b,1,k,R]
+        coords_full = torch.where(valid.unsqueeze(-1), coords_full.to(torch.float32),
+                                  mean_pos.expand_as(coords_full))
+        coords_full = torch.nan_to_num(coords_full, nan=0.0)            # guard all-NaN points
+
         coords_flat = rearrange(coords_full, 'b t k r -> b (t k) r').to(torch.float32)
         cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius = \
             self._scene_scalars(coords_flat, camera_group, device)
@@ -125,6 +144,12 @@ class ScorerEncoder(TrackerEncoder):
             query_coords=query_coords, query_time=query_time,
             target_time=target_time, cube_scale=cube_scale)
         query_embeds = rearrange(query_embeds, 'b (t k) cams d -> b t k cams d', t=T, k=K)
+
+        # Replace embeddings of missing (NaN) slots with the learnable missing-point token
+        # (broadcast over cameras). Their sanitized coords only served to keep projection/rays
+        # finite; the token is what the decoder + pooling actually see for those slots.
+        query_embeds = torch.where(
+            (~valid)[..., None, None], self.missing_point.to(query_embeds.dtype), query_embeds)
 
         if R == 3:
             p2d_query = project_points_torch(camera_group, query_coords)       # [cams,b,(t k),2]
