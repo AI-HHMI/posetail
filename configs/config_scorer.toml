@@ -17,7 +17,8 @@ mode = "online"
 batch_size = 1
 num_workers = 12
 prefix = "/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v3"
-datasets_to_exclude = [ "johnson-fly", "cmupanoptic", "rat7m", "rat-city", "branson-fly",]
+# datasets_to_exclude = [ "johnson-fly", "cmupanoptic", "rat7m", "rat-city", "branson-fly",]
+datasets_to_exclude = []
 
 [devices]                     # infra
 device = "cuda"
@@ -68,8 +69,8 @@ depth_log_max = 2.0
 pool_num_heads = 8            # attention-pooling heads (pools over time & cameras)
 score_hidden = 64            # width of the score-feature MLP
 use_precision = true         # precision (uncertainty) head + precision-weighted loss
-triplet_margin = 0.5         # ranking margin between clean and corrupt
-precision_reg_weight = 0.01  # anti-collapse reg on log-precision
+triplet_margin = 0.25         # ranking margin between clean and corrupt
+precision_reg_weight = 0.5  # anti-collapse reg on log-precision
 
 # SCORER: synthetic corruption that builds the "bad" sample (every point corrupted).
 [scorer.corruption]
@@ -82,12 +83,15 @@ sinusoid_prob = 0.5
 anchor_appearance_aug = false
 anchor_rotate_2d_deg = 45.0
 
-# SCORER: 3D corruption magnitudes, in cube_scale (world) units
+# SCORER: 3D corruption magnitudes, in cube_scale units (~ pixel-equivalent: a world
+# shift = mag * cube_scale, where cube_scale = world-units/pixel, so it projects to
+# ~0.5*mag px of 2D motion). Kept on the same pixel scale as mag_2d so 3D "bad" tracks
+# are visibly corrupted (sub-pixel values like 0.1 were effectively no corruption).
 [scorer.corruption.mag_3d]
-const_offset = 0.10
-frame_noise = 0.10
-gradual_drift = 0.15
-sinusoid = 0.10
+const_offset = 16.0
+frame_noise = 12.0
+gradual_drift = 24.0
+sinusoid = 16.0
 
 # SCORER: 2D corruption magnitudes, in pixels (image_size = 256)
 [scorer.corruption.mag_2d]
