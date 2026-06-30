@@ -71,6 +71,7 @@ score_hidden = 64            # width of the score-feature MLP
 use_precision = true         # precision (uncertainty) head + precision-weighted loss
 triplet_margin = 0.25         # ranking margin between clean and corrupt
 precision_reg_weight = 0.1  # anti-collapse reg on log-precision
+score_reg_weight = 0.001     # L2 on raw scores: anchors level, stops magnitude drift
 
 # SCORER: synthetic corruption that builds the "bad" sample (every point corrupted).
 [scorer.corruption]

@@ -28,10 +28,12 @@ class TripletScorerLoss(nn.Module):
     is pushed to the correct side by the margin. Identical algebra to the reference port.
     """
 
-    def __init__(self, margin=0.5, precision_reg_weight=0.01, reduction='mean'):
+    def __init__(self, margin=0.5, precision_reg_weight=0.01, score_reg_weight=0.0,
+                 reduction='mean'):
         super().__init__()
         self.margin = margin
         self.precision_reg_weight = precision_reg_weight
+        self.score_reg_weight = score_reg_weight
         self.reduction = reduction
         self.loss_history = defaultdict(list)
 
@@ -71,7 +73,13 @@ class TripletScorerLoss(nn.Module):
 
         # keep confidence from collapsing toward zero: 0 at precision=1, ->inf as precision->0
         precision_reg = -torch.log(precisions.clamp_min(1e-6)).mean() * self.precision_reg_weight
-        total = triplet_loss + precision_reg
+
+        # The triplet loss only constrains score *differences*, so the absolute level/magnitude
+        # is unconstrained and drifts (good & bad both grow). A small L2 on the raw scores acts
+        # only on the output: it anchors the level near 0 and caps runaway magnitude, while the
+        # margin-relu keeps the useful gap (~margin) intact. Centers good~-margin/2, bad~+margin/2.
+        score_reg = self.score_reg_weight * scores.pow(2).mean()
+        total = triplet_loss + precision_reg + score_reg
 
         # ---- logging metrics (good=col 0, bad=col 1 by construction) ----
         good_s, bad_s = scores[:, 0], scores[:, 1]
@@ -81,6 +89,7 @@ class TripletScorerLoss(nn.Module):
             self.loss_history['scorer_loss'].append(float(total))
             self.loss_history['triplet_loss'].append(float(triplet_loss))
             self.loss_history['precision_reg'].append(float(precision_reg))
+            self.loss_history['score_reg'].append(float(score_reg))
             self.loss_history['triplet_acc'].append(float(triplet_acc))
             self.loss_history['score_gap'].append(float(score_gap))
             self.loss_history['score_good'].append(float(good_s.mean()))

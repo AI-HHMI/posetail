@@ -208,9 +208,11 @@ def run(config_path, fabric):
 
     corruptor_3d, corruptor_2d = build_corruptors(corruption_cfg)
     train_loss = TripletScorerLoss(margin=scorer_kwargs.get('triplet_margin', 0.5),
-                                   precision_reg_weight=scorer_kwargs.get('precision_reg_weight', 0.01))
+                                   precision_reg_weight=scorer_kwargs.get('precision_reg_weight', 0.01),
+                                   score_reg_weight=scorer_kwargs.get('score_reg_weight', 0.0))
     val_loss = TripletScorerLoss(margin=scorer_kwargs.get('triplet_margin', 0.5),
-                                 precision_reg_weight=scorer_kwargs.get('precision_reg_weight', 0.01))
+                                 precision_reg_weight=scorer_kwargs.get('precision_reg_weight', 0.01),
+                                 score_reg_weight=scorer_kwargs.get('score_reg_weight', 0.0))
 
     iters_per_gpu = total_to_per_gpu(config.training.n_iterations, fabric.world_size)
     checkpoint_freq = total_to_per_gpu(config.training.checkpoint_freq, fabric.world_size)
