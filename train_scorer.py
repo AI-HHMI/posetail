@@ -242,8 +242,8 @@ def run(config_path, fabric):
         trip = make_triplet(batch, train_dataset, corruptor_3d, corruptor_2d, corruption_cfg)
 
         optimizer.zero_grad()
-        scores, log_prec, labels = model.score_triplet(trip)
-        total_loss = train_loss(scores, log_prec, labels)
+        scores, precision, labels = model.score_triplet(trip)
+        total_loss = train_loss(scores, precision, labels)
         fabric.backward(total_loss)
 
         grad_norm = 0.0

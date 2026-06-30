@@ -18,10 +18,10 @@ def test_loss_sign_convention():
     bad = torch.full((N,), 3.0)
     anchor = good.clone()                       # augmented good ~ good
     scores = torch.stack([good, bad, anchor], dim=-1)
-    log_prec = torch.zeros(N, 3)
+    precision = torch.ones(N, 3)                 # full confidence -> weighting is a no-op
     labels = torch.tensor([1.0, -1.0, 1.0]).expand(N, 3)
 
-    l_good = loss(scores, log_prec, labels)
+    l_good = loss(scores, precision, labels)
     acc = loss.loss_history['triplet_acc'][-1]
     print(f"  good<<bad: loss={float(l_good):.4f} triplet_acc={acc:.3f}")
     assert acc == 1.0, acc
@@ -30,7 +30,7 @@ def test_loss_sign_convention():
     # swapped: good scores HIGHER than bad -> wrong -> big loss, acc 0
     loss.reset_history()
     scores_sw = torch.stack([bad, good, bad.clone()], dim=-1)   # good col now high
-    l_bad = loss(scores_sw, log_prec, labels)
+    l_bad = loss(scores_sw, precision, labels)
     acc_bad = loss.loss_history['triplet_acc'][-1]
     print(f"  swapped:   loss={float(l_bad):.4f} triplet_acc={acc_bad:.3f}")
     assert acc_bad == 0.0, acc_bad
@@ -47,7 +47,7 @@ def test_loss_anchor_from_bad():
     anchor = bad.clone()
     scores = torch.stack([good, bad, anchor], dim=-1)
     labels = torch.tensor([1.0, -1.0, -1.0]).expand(N, 3)       # anchor = bad-derived
-    l = loss(scores, torch.zeros(N, 3), labels)
+    l = loss(scores, torch.ones(N, 3), labels)
     acc = loss.loss_history['triplet_acc'][-1]
     print(f"  anchor-from-bad: loss={float(l):.4f} acc={acc:.3f}")
     assert acc == 1.0

@@ -35,14 +35,13 @@ class TripletScorerLoss(nn.Module):
         self.reduction = reduction
         self.loss_history = defaultdict(list)
 
-    def forward(self, scores, log_precisions, labels):
-        """scores/log_precisions/labels: each `[N, 3]` (columns = good, bad, anchor).
+    def forward(self, scores, precisions, labels):
+        """scores/precisions/labels: each `[N, 3]` (columns = good, bad, anchor).
+        `precisions` are per-point confidences in (0,1) (sigmoid output of the scorer).
 
         Returns the scalar total loss (triplet + precision_reg) and appends per-call
         scalars to `loss_history` for logging.
         """
-        precisions = log_precisions.exp()
-
         # The majority sign per row identifies the same-label ("close") pair; the odd one
         # out is "distant". With good=+1, bad=-1, anchor=±1 each row sums to ±1.
         example_type = rearrange(labels.sum(dim=-1), 'n -> n 1')
@@ -70,8 +69,8 @@ class TripletScorerLoss(nn.Module):
         else:
             triplet_loss = weighted.mean()
 
-        # keep precision from collapsing toward zero
-        precision_reg = -log_precisions.mean() * self.precision_reg_weight
+        # keep confidence from collapsing toward zero: 0 at precision=1, ->inf as precision->0
+        precision_reg = -torch.log(precisions.clamp_min(1e-6)).mean() * self.precision_reg_weight
         total = triplet_loss + precision_reg
 
         # ---- logging metrics (good=col 0, bad=col 1 by construction) ----

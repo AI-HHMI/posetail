@@ -2,7 +2,7 @@
 
 Builds the scorer from config_scorer.toml, warm-starts from the tracker checkpoint
 (strict=False), pulls real PosetailDataset samples (3D and 2D), runs a full triplet, and
-checks: scores/log_prec are [b,k] finite; backbone frozen while query-encoder/decoder/
+checks: scores/precision are [b,k] finite; backbone frozen while query-encoder/decoder/
 pool/heads are trainable; good & bad share scene features (pixels unchanged); one backward
 produces grads only on trainable params.
 
@@ -55,17 +55,17 @@ def run_sample(model, batch, dataset, c3, c2, ccfg, loss):
     av, ac, acg = trip['anchor']
 
     vn, sf = model.encode_scene(gv)
-    good_s, good_lp = model.score(vn, sf, gc, gcg)
-    bad_s, bad_lp = model.score(vn, sf, bc, bcg)
+    good_s, good_p = model.score(vn, sf, gc, gcg)
+    bad_s, bad_p = model.score(vn, sf, bc, bcg)
     # scene features identical for good vs bad (corruption never touches pixels)
     vn2, sf2 = model.encode_scene(gv)
     same = all(torch.allclose(a, b) for a, b in zip(sf, sf2)) if isinstance(sf, (list, tuple)) \
         else torch.allclose(sf, sf2)
     avn, asf = (vn, sf) if trip['reuse_scene_for_anchor'] else model.encode_scene(av)
-    anc_s, anc_lp = model.score(avn, asf, ac, acg)
+    anc_s, anc_p = model.score(avn, asf, ac, acg)
 
     assert good_s.shape == (b, n), good_s.shape
-    assert good_lp.shape == (b, n)
+    assert good_p.shape == (b, n)
     for nm, s in [('good', good_s), ('bad', bad_s), ('anchor', anc_s)]:
         assert torch.isfinite(s).all(), f"{nm} has non-finite scores"
     print(f"  scores ok: good[{good_s.shape}] finite; "
@@ -73,9 +73,9 @@ def run_sample(model, batch, dataset, c3, c2, ccfg, loss):
 
     # loss + backward
     scores = torch.stack([good_s, bad_s, anc_s], -1).reshape(-1, 3)
-    log_prec = torch.stack([good_lp, bad_lp, anc_lp], -1).reshape(-1, 3)
+    precision = torch.stack([good_p, bad_p, anc_p], -1).reshape(-1, 3)
     labels = torch.tensor([1.0, -1.0, trip['anchor_label']], device=DEVICE).expand_as(scores)
-    l = loss(scores, log_prec, labels)
+    l = loss(scores, precision, labels)
     l.backward()
     enc_grad = any(p.grad is not None and p.grad.abs().sum() > 0
                    for p in model.scene_encoder.encoder.parameters())

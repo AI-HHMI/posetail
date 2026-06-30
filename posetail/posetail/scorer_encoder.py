@@ -3,7 +3,7 @@
 `ScorerEncoder` subclasses `TrackerEncoder` so every reused submodule (scene_encoder,
 query_encoder, decoder, norms, transform_norm) keeps its name and shape -> the trained
 tracker checkpoint loads by name (strict=False). It adds an attention-pooling head + a
-score / log-precision head on top of the decoder's per-point latents.
+score / precision head on top of the decoder's per-point latents.
 
 The only structural change vs the tracker is **query = target**: the tracker repeats one
 query position across all frames ("where is point n at every frame?"); the scorer feeds
@@ -43,7 +43,8 @@ class ScorerEncoder(TrackerEncoder):
         self.score_feature = nn.Sequential(
             nn.LayerNorm(d), nn.Linear(d, score_hidden), nn.SiLU())
         self.score_head = nn.Linear(score_hidden, 1, bias=False)  # no bias (miss-alignment)
-        self.log_precision_head = nn.Linear(score_hidden, 1) if use_precision else None
+        # emits a logit -> sigmoid -> per-point confidence in (0,1) used to weight triplets
+        self.precision_head = nn.Linear(score_hidden, 1) if use_precision else None
 
     # ----------------------------------------------------------------------------------
     # Scene encoding (frozen backbone) -- split out so good+bad reuse the same features.
@@ -115,7 +116,7 @@ class ScorerEncoder(TrackerEncoder):
     # Score one sample from precomputed scene features. query = target.
     # ----------------------------------------------------------------------------------
     def score(self, views_norm, scene_features, coords_full, camera_group):
-        """coords_full: [B, T, K, R] full trajectory. Returns scores, log_prec: [B, K]."""
+        """coords_full: [B, T, K, R] full trajectory. Returns scores, precision: [B, K]."""
         device = coords_full.device
         B, T, K, R = coords_full.shape
         n_cams = len(camera_group)
@@ -180,15 +181,15 @@ class ScorerEncoder(TrackerEncoder):
         pooled = self.attn_pool(latents)                            # [b, k, d]
         feats = self.score_feature(pooled)
         scores = self.score_head(feats)[..., 0]                     # [b, k]
-        if self.log_precision_head is not None:
-            log_prec = self.log_precision_head(feats)[..., 0]       # [b, k]
+        if self.precision_head is not None:
+            precision = torch.sigmoid(self.precision_head(feats)[..., 0])  # [b, k], (0,1)
         else:
-            log_prec = torch.zeros_like(scores)
-        return scores, log_prec
+            precision = torch.ones_like(scores)  # full confidence -> weighting is a no-op
+        return scores, precision
 
     def forward(self, views, coords, camera_group, query_times=None):
         """Single-sample inference path. views: list of [b,t,h,w,c];
-        coords: full trajectory [b,t,k,R]. Returns scores, log_prec: [b, k]."""
+        coords: full trajectory [b,t,k,R]. Returns scores, precision: [b, k]."""
         views_norm, scene_features = self.encode_scene(views)
         return self.score(views_norm, scene_features, coords, camera_group)
 
@@ -197,26 +198,26 @@ class ScorerEncoder(TrackerEncoder):
         entry/exit of the module's forward, one backward).
 
         trip is the dict from datasets.scorer_corruption.make_triplet. Returns
-        scores, log_prec, labels each [N, 3] (N = b*k; columns good, bad, anchor).
+        scores, precision, labels each [N, 3] (N = b*k; columns good, bad, anchor).
         """
         gv, gc, gcg = trip['good']
         _, bc, bcg = trip['bad']                       # bad shares good's pixels
         av, ac, acg = trip['anchor']
 
         vn, sf = self.encode_scene(gv)
-        good_s, good_lp = self.score(vn, sf, gc, gcg)
-        bad_s, bad_lp = self.score(vn, sf, bc, bcg)
+        good_s, good_p = self.score(vn, sf, gc, gcg)
+        bad_s, bad_p = self.score(vn, sf, bc, bcg)
         if trip['reuse_scene_for_anchor']:
             avn, asf = vn, sf
         else:
             avn, asf = self.encode_scene(av)
-        anc_s, anc_lp = self.score(avn, asf, ac, acg)
+        anc_s, anc_p = self.score(avn, asf, ac, acg)
 
         scores = torch.stack([good_s, bad_s, anc_s], dim=-1).reshape(-1, 3)
-        log_prec = torch.stack([good_lp, bad_lp, anc_lp], dim=-1).reshape(-1, 3)
+        precision = torch.stack([good_p, bad_p, anc_p], dim=-1).reshape(-1, 3)
         al = float(trip['anchor_label'])
         labels = torch.tensor([1.0, -1.0, al], device=scores.device).expand_as(scores)
-        return scores, log_prec, labels
+        return scores, precision, labels
 
     def print_summary(self):
         from posetail.posetail.utils import count_parameters
