@@ -70,7 +70,7 @@ pool_num_heads = 8            # attention-pooling heads (pools over time & camer
 score_hidden = 64            # width of the score-feature MLP
 use_precision = true         # precision (uncertainty) head + precision-weighted loss
 triplet_margin = 0.25         # ranking margin between clean and corrupt
-precision_reg_weight = 0.5  # anti-collapse reg on log-precision
+precision_reg_weight = 0.1  # anti-collapse reg on log-precision
 
 # SCORER: synthetic corruption that builds the "bad" sample (every point corrupted).
 [scorer.corruption]

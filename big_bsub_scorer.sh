@@ -13,5 +13,5 @@ d=$(date +d%dh%H%M)
 
 
 bsub -J scorer-$d -e ~/logs/posetail/scorer-$d.err -o ~/logs/posetail/scorer-$d.out \
-    -n 48 -q gpu_h100 -R "span[hosts=1]" -gpu "num=4:aff=yes" -W 72:00 \
+    -n 48 -q gpu_h200 -R "span[hosts=1]" -gpu "num=4:aff=yes" -W 72:00 \
     /bin/bash train_scorer_script.sh configs/config_scorer.toml

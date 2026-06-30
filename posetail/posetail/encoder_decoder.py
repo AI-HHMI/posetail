@@ -735,6 +735,7 @@ class Decoder(nn.Module):
                  soft_argmax_temperature_learnable=False,
                  enable_subpixel_refinement=False,
                  subpixel_scale=0.05,
+                 subpixel_temperature=10.0,
                  grid_decode_space="head"):
         super().__init__()
 
@@ -776,14 +777,25 @@ class Decoder(nn.Module):
         #              load-compatible with any checkpoint. Enable for a future retrain.
         assert grid_decode_space in ("head", "warped"), grid_decode_space
         self.grid_decode_space = grid_decode_space
-        # Optional sub-pixel/sub-bin 3D offset head: refines the discretized soft-argmax out_3d with
-        # a small learned continuous correction (supervised by the EXISTING coords regression loss,
-        # no new term). Zero-init -> starts as an exact no-op; disabled by default (no head at all).
-        # Under log_3d_output the offset is applied in WARPED space, so subpixel_scale is measured in
-        # warped units (~bins of correction); its head-unit reach then auto-scales with the local bin
-        # width. Without the warp it is a flat offset of subpixel_scale everywhere. See forward().
+        # Optional sub-pixel/sub-bin 3D refinement (supervised by the EXISTING coords regression
+        # loss, no new term). Zero-init offset head -> starts as an exact no-op; disabled by default
+        # (no head at all). When enabled, the decode is a SHARPENED ARGMAX: a learnable high
+        # temperature (subpixel_temperature) peaks the per-bin weights toward one-hot at the argmax
+        # bin, so the decode approaches centre[argmax] + scale * bin_width * o_{argmax} (~one position
+        # + one offset) while staying fully differentiable. See forward().
+        #
+        # subpixel_scale is measured in BINS: the offset is multiplied by subpixel_bin_width (the
+        # adjacent-centre spacing in the space the offset is applied in), so subpixel_scale=0.5 means
+        # up to half a bin of correction. Under log_3d_output the offset is applied in WARPED space
+        # (uniform bins), else in head space; subpixel_bin_width below matches that space.
         self.enable_subpixel_refinement = enable_subpixel_refinement
         self.subpixel_scale = float(subpixel_scale)
+        # Warped (log_3d) or head bin spacing between adjacent centres, so subpixel_scale -> bins.
+        if log_3d_output:
+            _bin_width = 2.0 * self.log_3d_c_range / max(head_3d_grid_size - 1, 1)   # warped units/bin
+        else:
+            _bin_width = 2.0 * head_3d_grid_radius / max(head_3d_grid_size - 1, 1)   # head units/bin
+        self.subpixel_bin_width = float(_bin_width)
 
         # Grid (classification) output modes, mirroring TrackerTapNext:
         #   "grid"      = absolute ray-local position via per-axis marginal soft-argmax.
@@ -902,6 +914,14 @@ class Decoder(nn.Module):
         else:
             self.heads_subpixel_3d = None
 
+        if self.enable_subpixel_refinement and self.is_grid:
+            # Learnable sharpening temperature (beta) for the subpixel selection. High init ->
+            # weights peak at the argmax bin (~one position + one offset). Loaded fresh under
+            # strict=False; absent unless refinement is on, so it never perturbs old checkpoints.
+            self.log_subpixel_temp = nn.Parameter(torch.tensor(math.log(float(subpixel_temperature))))
+        else:
+            self.log_subpixel_temp = None
+
         # Variance-matched, dimension-invariant head init.
         # The LayerNorm gives each head a unit-variance input (Sum_i x_i^2 = embed_dim), so for
         # W ~ N(0, std^2) with zero bias the head-output std is std * sqrt(embed_dim). We fix that
@@ -966,12 +986,14 @@ class Decoder(nn.Module):
 
         self.scale_depth = nn.Parameter(torch.tensor([abs_scale]))
 
-    def _grid_softmax(self, logits):
+    def _grid_softmax(self, logits, temp=None):
         """Per-axis masked soft-argmax WEIGHTS over the bin grid (threshold 20 bins,
         temperature 0.5), mirroring tracker_tapnext.py:379-392. ``logits`` (..., K) ->
-        normalized probs (..., K). Shared by the decode and the per-bin offset head."""
+        normalized probs (..., K). Shared by the decode and the per-bin offset head.
+        ``temp`` overrides the softmax temperature (used by the sharpened subpixel path)."""
         soft_argmax_threshold = self.soft_argmax_threshold
-        softmax_temperature = (torch.exp(self.log_soft_argmax_temp)
+        softmax_temperature = temp if temp is not None else (
+                               torch.exp(self.log_soft_argmax_temp)
                                if self.log_soft_argmax_temp is not None
                                else self._soft_argmax_temp_fixed)
         K = logits.shape[-1]
@@ -1050,32 +1072,35 @@ class Decoder(nn.Module):
             G = self.head_3d_grid_size
             raw_3d = self.heads_3d[m](x)                                    # (..., 3G)
             logits_3d = rearrange(raw_3d, '... (d k) -> ... d k', d=3, k=G)  # (..., 3, G)
-            p3d = self._grid_softmax(logits_3d)                            # (..., 3, G) soft-argmax weights
-            if self.log_3d_output and self.grid_decode_space == "warped":
-                # Average in the uniform WARPED space, then expm1 — overshoot-free (see __init__).
-                # grid_1d == signed_expm1(linspace(-cr,cr,G)), so signed_log1p recovers the warped
-                # centres exactly; no extra buffer, load-compatible with "head" checkpoints.
-                cr = self.log_3d_c_range
-                warped_centres = signed_log1p(self.grid_1d.to(p3d.dtype), self.log_3d_eps)
-                warped_mean = (p3d * warped_centres).sum(-1).clamp(-cr, cr)  # (..., 3) warped units
-                out_3d = signed_expm1(warped_mean, self.log_3d_eps).to(p3d.dtype)
-            else:
-                out_3d = (p3d * self.grid_1d.to(p3d.dtype)).sum(-1)        # (..., 3) head-space decode (default)
 
-            if self.heads_subpixel_3d is not None:                          # optional sub-bin refinement
-                # Per-bin offset map: blend the offset by the SAME soft-argmax weights, so the
-                # correction is conditioned on the predicted bin. delta = scale * Σ_k p_k * o_k.
+            if self.heads_subpixel_3d is not None:
+                # SHARPENED ARGMAX refinement: a learnable high temperature peaks the per-bin weights
+                # toward one-hot at the argmax bin, so the decode approaches centre[argmax] +
+                # offset[argmax] (~one position + one offset) while staying fully differentiable. Both
+                # the base position and the offset use these sharp weights.
+                w = self._grid_softmax(logits_3d, temp=torch.exp(self.log_subpixel_temp))  # (..., 3, G) sharp
                 offsets = rearrange(self.heads_subpixel_3d[m](x), '... (d k) -> ... d k', d=3, k=G)
-                delta = (p3d * offsets).sum(-1) * self.subpixel_scale       # (..., 3) warped units
+                offset_sel = (w * offsets).sum(-1) * self.subpixel_scale * self.subpixel_bin_width  # bins
                 if self.log_3d_output:
-                    # Refine in WARPED (uniform-bin) space: the offset is a constant number of bins
-                    # everywhere, so its head-unit reach auto-scales with the local bin width. A
-                    # zero-init delta stays an EXACT no-op; clamp keeps expm1/its gradient bounded.
+                    # Select centre + add offset in WARPED (uniform-bin) space; clamp bounds expm1.
                     cr = self.log_3d_c_range
-                    warped = signed_log1p(out_3d, self.log_3d_eps) + delta
-                    out_3d = signed_expm1(warped.clamp(-cr, cr), self.log_3d_eps).to(out_3d.dtype)
+                    warped_centre = signed_log1p(self.grid_1d.to(w.dtype), self.log_3d_eps)
+                    warped_sel = (w * warped_centre).sum(-1)                # (..., 3) ~ warped centre[argmax]
+                    out_3d = signed_expm1((warped_sel + offset_sel).clamp(-cr, cr), self.log_3d_eps).to(w.dtype)
                 else:
-                    out_3d = out_3d + delta
+                    out_3d = (w * self.grid_1d.to(w.dtype)).sum(-1) + offset_sel  # (..., 3) head-space
+            else:
+                p3d = self._grid_softmax(logits_3d)                        # (..., 3, G) soft-argmax weights
+                if self.log_3d_output and self.grid_decode_space == "warped":
+                    # Average in the uniform WARPED space, then expm1 — overshoot-free (see __init__).
+                    # grid_1d == signed_expm1(linspace(-cr,cr,G)), so signed_log1p recovers the warped
+                    # centres exactly; no extra buffer, load-compatible with "head" checkpoints.
+                    cr = self.log_3d_c_range
+                    warped_centres = signed_log1p(self.grid_1d.to(p3d.dtype), self.log_3d_eps)
+                    warped_mean = (p3d * warped_centres).sum(-1).clamp(-cr, cr)  # (..., 3) warped units
+                    out_3d = signed_expm1(warped_mean, self.log_3d_eps).to(p3d.dtype)
+                else:
+                    out_3d = (p3d * self.grid_1d.to(p3d.dtype)).sum(-1)    # (..., 3) head-space decode (default)
 
             logits_depth = self.heads_depth[m](x)                          # (..., G)
             # decode log-depth then exp -> normalized depth (>0); tracker_encoder

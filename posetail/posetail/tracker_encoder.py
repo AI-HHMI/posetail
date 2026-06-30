@@ -57,6 +57,7 @@ class TrackerEncoder(nn.Module):
                  soft_argmax_temperature_learnable = False,
                  enable_subpixel_refinement = False,
                  subpixel_scale = 0.05,
+                 subpixel_temperature = 10.0,
                  grid_decode_space = 'head'):
         super().__init__()
 
@@ -185,6 +186,7 @@ class TrackerEncoder(nn.Module):
             soft_argmax_temperature_learnable=soft_argmax_temperature_learnable,
             enable_subpixel_refinement=enable_subpixel_refinement,
             subpixel_scale=subpixel_scale,
+            subpixel_temperature=subpixel_temperature,
             grid_decode_space=grid_decode_space,
         )
 
