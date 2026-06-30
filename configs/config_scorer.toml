@@ -70,7 +70,7 @@ pool_num_heads = 8            # attention-pooling heads (pools over time & camer
 score_hidden = 64            # width of the score-feature MLP
 use_precision = true         # precision (uncertainty) head + precision-weighted loss
 triplet_margin = 0.25         # ranking margin between clean and corrupt
-precision_reg_weight = 0.1  # anti-collapse reg on log-precision
+precision_reg_weight = 0.15  # anti-collapse reg on log-precision
 score_reg_weight = 0.001     # L2 on raw scores: anchors level, stops magnitude drift
 
 # SCORER: synthetic corruption that builds the "bad" sample (every point corrupted).
@@ -82,7 +82,7 @@ gradual_drift_prob = 0.5
 sinusoid_prob = 0.5
 # anchor augmentation (the triplet's invariance target)
 anchor_appearance_aug = true
-anchor_rotate_2d_deg = 45.0
+anchor_rotate_2d_deg = 90.0
 
 # SCORER: 3D corruption magnitudes, in cube_scale units (~ pixel-equivalent: a world
 # shift = mag * cube_scale, where cube_scale = world-units/pixel, so it projects to
@@ -117,7 +117,7 @@ print_freq = 20
 
 # TRACKER ENC: SF-Muon optimizer settings reused from the run (no scorer-specific tuning).
 [training.optimizer]
-learning_rate = 9e-5
+learning_rate = 5e-4
 muon_schedulefree = true
 weight_decay = 0.001
 warmup_steps = 200
@@ -143,13 +143,15 @@ cam_thresh_for_vis = 1
 balance_datasets = true
 n_samples_per_dataset = -1
 crop_to_points = true
-speed_thresh = 3.0
+speed_thresh = 1.0
 query_anytime = false            # SCORER: full trajectory (query=target every frame)
 prop_dynamic_kpts_to_sample = 0.95
 prob_2d_only = 0.25
 no_nan_coords = false            # SCORER: allow partially-occluded tracks (missing-point token)
 min_valid_frames = 6             # SCORER: drop points seen in <6 frames (no_nan_coords off)
-crop_3d_enabled = false          # SCORER: keep full tracks (no sub-volume crop)
+crop_3d_enabled = true
+crop_3d_fraction = [0.2, 0.75]
+crop_3d_prob = 0.2
 
 [dataset.val]
 split_dir = "val"
