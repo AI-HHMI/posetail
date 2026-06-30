@@ -115,11 +115,12 @@ scene_proj_mlp = false
 
 # without subpixel
 output_mode = "gridresid"
-head_3d_grid_size = 512
+head_3d_grid_size = 1024
 head_3d_grid_radius = 1.8
 log_3d_output = true
-log_3d_eps = 0.02
-soft_argmax_threshold = 30
+log_3d_eps = 0.05
+soft_argmax_threshold = 70
+grid_decode_space = "warped"
 enable_subpixel_refinement = false
 
 # good gridresid with subpixel refinement
