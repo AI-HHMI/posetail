@@ -24,6 +24,7 @@ import random
 
 import numpy as np
 import torch
+from easydict import EasyDict as edict
 
 from posetail.posetail.cube import get_camera_scale
 from posetail.datasets.posetail_dataset import (rotate_points_image_plane,
@@ -310,3 +311,61 @@ def build_corruptors(corruption_cfg):
     corruptor_3d = PointCorruptor(probs, mag_3d)
     corruptor_2d = PointCorruptor(probs, mag_2d)
     return corruptor_3d, corruptor_2d
+
+
+# --------------------------------------------------------------------------------------
+# Dataset wrapper -- run the whole triplet build (rotation + appearance aug + corruption)
+# in the DataLoader worker processes instead of the training loop's main process.
+# --------------------------------------------------------------------------------------
+
+class ScorerTripletDataset(torch.utils.data.Dataset):
+    """Wraps a `PosetailDataset` so each item is a ready `(good, bad, anchor)` triplet.
+
+    Building the triplet is CPU-bound (`cv2.warpAffine`, imgaug appearance aug, torch CPU
+    ops), so doing it here means it runs inside the DataLoader workers -- pipelined with the
+    GPU step -- rather than synchronously in the training loop. Base items come off disk as
+    CPU tensors, so `make_triplet`'s internal `.to(device)` calls are no-ops here; the triplet
+    stays on CPU until the main loop moves it to the GPU. On Linux fork each worker already
+    holds the base dataset's imgaug pipelines, so `apply_appearance_aug` works unchanged.
+    """
+
+    def __init__(self, base, corruption_cfg):
+        self.base = base
+        self.cfg = dict(corruption_cfg)
+        # plain-dict PointCorruptors -> fork-safe, no CUDA state
+        self.corruptor_3d, self.corruptor_2d = build_corruptors(self.cfg)
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        item = self.base[idx]
+        if item is None:
+            return None                        # mirror PosetailDataset (None is rare, retry-guarded)
+        views, coords, vis, fnums, cgroup, row, query_times, vis_2d, p2d = item
+        mini = edict({'views': [v[None] for v in views],   # add b=1 -> [1,t,h,w,3]
+                      'coords': coords[None],               # [1,t,n,R]
+                      'cgroup': cgroup})
+        trip = make_triplet(mini, self.base, self.corruptor_3d, self.corruptor_2d, self.cfg)
+        trip['sample_info'] = row              # carry for the bad-gradient error print
+        return trip
+
+
+def triplet_collate(batch):
+    """Trivial collate for the scorer: one full b=1 triplet dict per step.
+
+    The scorer runs `batch_size=1` because each camera's rotated crop has a variable size, so
+    there is nothing to stack -- just unwrap the single item.
+    """
+    assert len(batch) == 1, 'scorer runs batch_size=1 (variable per-camera rotated sizes)'
+    return batch[0]
+
+
+def seed_worker(worker_id):
+    """DataLoader `worker_init_fn`: decorrelate numpy RNG across workers.
+
+    PyTorch auto-seeds torch and Python's `random` per worker (so corruption and the anchor
+    coin-flip are already independent), but NOT numpy -- and the rotation angles use
+    `np.random.uniform`. Seed numpy per worker so the workers don't emit correlated angles.
+    """
+    np.random.seed((torch.initial_seed() + worker_id) % 2**32)

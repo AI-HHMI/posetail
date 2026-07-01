@@ -35,8 +35,9 @@ from torch.utils.data import DataLoader, DistributedSampler
 from lightning.fabric import Fabric
 from schedulefree import AdamWScheduleFree
 
-from posetail.datasets.posetail_dataset import PosetailDataset, custom_collate
-from posetail.datasets.scorer_corruption import make_triplet, build_corruptors
+from posetail.datasets.posetail_dataset import PosetailDataset
+from posetail.datasets.scorer_corruption import (ScorerTripletDataset, triplet_collate,
+                                                 seed_worker)
 from posetail.posetail.scorer_encoder import ScorerEncoder
 from posetail.posetail.losses_scorer import TripletScorerLoss
 from train_utils import (load_config, save_config, set_seeds, write_json,
@@ -132,12 +133,15 @@ def build_optimizer(model, config, fabric, lr):
     return fabric.setup_optimizers(optimizer)
 
 
-def _to_device(batch, device):
-    batch.views = [v.to(device) for v in batch.views]
-    batch.coords = batch.coords.to(device)
-    if batch.cgroup:
-        batch.cgroup = [dict_to_device(c, device) for c in batch.cgroup]
-    return batch
+def _triplet_to_device(trip, device):
+    """Move a worker-built (good, bad, anchor) triplet to the GPU. Each sample is a
+    (views_list, coords, cgroup_list) tuple; the rest of the dict (mode, anchor_label,
+    reuse_scene_for_anchor, sample_info) stays as-is."""
+    for k in ('good', 'bad', 'anchor'):
+        v, c, cg = trip[k]
+        trip[k] = ([x.to(device) for x in v], c.to(device),
+                   [dict_to_device(d, device) for d in cg])
+    return trip
 
 
 def run(config_path, fabric):
@@ -153,23 +157,27 @@ def run(config_path, fabric):
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    train_dataset = PosetailDataset(config, split='train')
+    # triplet build (rotation + appearance aug + corruption) runs in the DataLoader workers
+    corruption_cfg = dict(config.scorer.get('corruption', {}))
+    train_dataset = ScorerTripletDataset(PosetailDataset(config, split='train'), corruption_cfg)
     sampler = DistributedSampler(train_dataset, num_replicas=fabric.world_size,
                                  rank=fabric.global_rank, shuffle=True,
                                  seed=config.training.get('seed', None))
     train_loader = DataLoader(train_dataset, batch_size=config.dataset.batch_size,
-                              collate_fn=custom_collate, sampler=sampler, shuffle=False,
+                              collate_fn=triplet_collate, sampler=sampler, shuffle=False,
                               num_workers=config.dataset.num_workers, prefetch_factor=2,
-                              persistent_workers=True, pin_memory=True)
+                              persistent_workers=True, pin_memory=True,
+                              worker_init_fn=seed_worker)
     train_loader = fabric.setup_dataloaders(train_loader)
 
     val = config.dataset.val.get('split_dir', None)
     if val:
-        val_dataset = PosetailDataset(config, split='val')
+        val_dataset = ScorerTripletDataset(PosetailDataset(config, split='val'), corruption_cfg)
         val_loader = DataLoader(val_dataset, batch_size=config.dataset.batch_size,
-                                collate_fn=custom_collate, shuffle=True,
+                                collate_fn=triplet_collate, shuffle=True,
                                 num_workers=config.dataset.num_workers, prefetch_factor=2,
-                                persistent_workers=True, pin_memory=True)
+                                persistent_workers=True, pin_memory=True,
+                                worker_init_fn=seed_worker)
         val_loader = fabric.setup_dataloaders(val_loader)
 
     if fabric.is_global_zero:
@@ -185,7 +193,7 @@ def run(config_path, fabric):
 
     # --- model (frozen backbone via config) ---
     scorer_kwargs = dict(config.scorer)
-    corruption_cfg = scorer_kwargs.pop('corruption', {})
+    scorer_kwargs.pop('corruption', None)      # corruption_cfg already built above for the datasets
     model = ScorerEncoder(pool_num_heads=scorer_kwargs.get('pool_num_heads', 8),
                           score_hidden=scorer_kwargs.get('score_hidden', 64),
                           use_precision=scorer_kwargs.get('use_precision', True),
@@ -206,7 +214,6 @@ def run(config_path, fabric):
         ckpt = load_checkpoint(config_path, checkpoint_path, model=model, device='cpu')
         model = ckpt['model']
 
-    corruptor_3d, corruptor_2d = build_corruptors(corruption_cfg)
     train_loss = TripletScorerLoss(margin=scorer_kwargs.get('triplet_margin', 0.5),
                                    precision_reg_weight=scorer_kwargs.get('precision_reg_weight', 0.01),
                                    score_reg_weight=scorer_kwargs.get('score_reg_weight', 0.0))
@@ -240,8 +247,7 @@ def run(config_path, fabric):
         model.train()
 
         start_time = time.time()
-        batch = _to_device(batch, device)
-        trip = make_triplet(batch, train_dataset, corruptor_3d, corruptor_2d, corruption_cfg)
+        trip = _triplet_to_device(batch, device)
 
         optimizer.zero_grad()
         scores, precision, labels = model.score_triplet(trip)
@@ -264,7 +270,7 @@ def run(config_path, fabric):
             optimizer.step()
         except Exception as e:
             print(f"ERROR BAD GRADIENTS!! {e}")
-            print(batch.sample_info)
+            print(trip['sample_info'])
         optimizer.zero_grad()
 
         result_dict.update(train_loss.collapse_history(prefix='train/'))
@@ -280,8 +286,7 @@ def run(config_path, fabric):
                 for j, vbatch in enumerate(val_loader):
                     if j >= config.training.get('val_batches', 20):
                         break
-                    vbatch = _to_device(vbatch, device)
-                    vtrip = make_triplet(vbatch, val_dataset, corruptor_3d, corruptor_2d, corruption_cfg)
+                    vtrip = _triplet_to_device(vbatch, device)
                     vs, vlp, vl = model.score_triplet(vtrip)
                     val_loss(vs, vlp, vl)
             result_dict.update(val_loss.collapse_history(prefix='val/'))
