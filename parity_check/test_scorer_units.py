@@ -10,12 +10,12 @@ from posetail.datasets.scorer_corruption import (PointCorruptor, corrupt_coords,
 
 
 def test_loss_sign_convention():
-    """good << bad  ->  loss small + triplet_acc==1; swapped -> large loss, acc==0."""
+    """good >> bad  ->  loss small + triplet_acc==1; swapped -> large loss, acc==0."""
     loss = TripletScorerLoss(margin=0.5, precision_reg_weight=0.0)
     N = 64
     # anchor derived from good (label +1): columns = [good, bad, anchor]
-    good = torch.full((N,), -3.0)
-    bad = torch.full((N,), 3.0)
+    good = torch.full((N,), 3.0)
+    bad = torch.full((N,), -3.0)
     anchor = good.clone()                       # augmented good ~ good
     scores = torch.stack([good, bad, anchor], dim=-1)
     precision = torch.ones(N, 3)                 # full confidence -> weighting is a no-op
@@ -23,13 +23,13 @@ def test_loss_sign_convention():
 
     l_good = loss(scores, precision, labels)
     acc = loss.loss_history['triplet_acc'][-1]
-    print(f"  good<<bad: loss={float(l_good):.4f} triplet_acc={acc:.3f}")
+    print(f"  good>>bad: loss={float(l_good):.4f} triplet_acc={acc:.3f}")
     assert acc == 1.0, acc
     assert float(l_good) < 0.6, float(l_good)        # ~ margin only (relu floored)
 
-    # swapped: good scores HIGHER than bad -> wrong -> big loss, acc 0
+    # swapped: good scores LOWER than bad -> wrong -> big loss, acc 0
     loss.reset_history()
-    scores_sw = torch.stack([bad, good, bad.clone()], dim=-1)   # good col now high
+    scores_sw = torch.stack([bad, good, bad.clone()], dim=-1)   # good col now low
     l_bad = loss(scores_sw, precision, labels)
     acc_bad = loss.loss_history['triplet_acc'][-1]
     print(f"  swapped:   loss={float(l_bad):.4f} triplet_acc={acc_bad:.3f}")
@@ -42,8 +42,8 @@ def test_loss_anchor_from_bad():
     """Anchor derived from bad (label -1): close pair = bad & anchor; good is distant."""
     loss = TripletScorerLoss(margin=0.5, precision_reg_weight=0.0)
     N = 32
-    good = torch.full((N,), -2.0)
-    bad = torch.full((N,), 2.0)
+    good = torch.full((N,), 2.0)
+    bad = torch.full((N,), -2.0)
     anchor = bad.clone()
     scores = torch.stack([good, bad, anchor], dim=-1)
     labels = torch.tensor([1.0, -1.0, -1.0]).expand(N, 3)       # anchor = bad-derived

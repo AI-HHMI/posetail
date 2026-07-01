@@ -3,7 +3,7 @@
 Ported from miss-alignment (bioRxiv 2026.04.29.721716,
 `miss_alignment/models/models.py::TripletMarginRankingLoss`). Adapted to operate on
 per-point scores: each tracked point contributes one (good, bad, anchor) triplet, so the
-loss batch is N = b * k triplets. Convention: **lower score = cleaner** track.
+loss batch is N = b * k triplets. Convention: **higher score = cleaner** track.
 
 The class mirrors `losses.TotalLoss`'s logging interface (a defaultdict(list) history with
 `collapse_history`/`reset_history`) so train_scorer can log to wandb the same way.
@@ -56,9 +56,9 @@ class TripletScorerLoss(nn.Module):
         distant_prec = rearrange(precisions[distant_mask], 'n -> n 1')
 
         # close pair should agree; distant should sit `margin` past it on the correct side
-        # (example_type sign selects the direction: cleaner = lower score).
+        # (example_type sign selects the direction: cleaner = higher score).
         dist_pos = torch.abs(close_scores[..., 0] - close_scores[..., 1])
-        dist_neg = torch.min((close_scores - distant_scores) * example_type, dim=-1).values
+        dist_neg = torch.min((distant_scores - close_scores) * example_type, dim=-1).values
         triplet_losses = F.relu(dist_pos + dist_neg + self.margin)
 
         # downweight triplets where any member is uncertain (geometric mean of precisions)
@@ -77,15 +77,15 @@ class TripletScorerLoss(nn.Module):
         # The triplet loss only constrains score *differences*, so the absolute level/magnitude
         # is unconstrained and drifts (good & bad both grow). A small L2 on the raw scores acts
         # only on the output: it anchors the level near 0 and caps runaway magnitude, while the
-        # margin-relu keeps the useful gap (~margin) intact. Centers good~-margin/2, bad~+margin/2.
+        # margin-relu keeps the useful gap (~margin) intact. Centers good~+margin/2, bad~-margin/2.
         score_reg = self.score_reg_weight * scores.pow(2).mean()
         total = triplet_loss + precision_reg + score_reg
 
         # ---- logging metrics (good=col 0, bad=col 1 by construction) ----
         good_s, bad_s = scores[:, 0], scores[:, 1]
         with torch.no_grad():
-            triplet_acc = (good_s < bad_s).float().mean()
-            score_gap = (bad_s - good_s).mean()                  # >0 means good is cleaner
+            triplet_acc = (good_s > bad_s).float().mean()
+            score_gap = (good_s - bad_s).mean()                  # >0 means good is cleaner
             self.loss_history['scorer_loss'].append(float(total))
             self.loss_history['triplet_loss'].append(float(triplet_loss))
             self.loss_history['precision_reg'].append(float(precision_reg))
