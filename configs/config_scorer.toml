@@ -98,7 +98,7 @@ sinusoid = 9.0
 [scorer.corruption.mag_2d]
 const_offset = 8.0
 frame_noise = 6.0
-gradual_drift = 12.0
+gradual_drift = 10.0
 sinusoid = 8.0
 
 # ======================================================================================
