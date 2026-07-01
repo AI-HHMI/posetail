@@ -76,10 +76,10 @@ score_reg_weight = 0.001     # L2 on raw scores: anchors level, stops magnitude 
 # SCORER: synthetic corruption that builds the "bad" sample (every point corrupted).
 [scorer.corruption]
 # per-type probability that a given point gets this corruption (every point gets >=1)
-const_offset_prob = 0.33
-frame_noise_prob = 0.33
-gradual_drift_prob = 0.33
-sinusoid_prob = 0.33
+const_offset_prob = 0.5
+frame_noise_prob = 0.5
+gradual_drift_prob = 0.5
+sinusoid_prob = 0.5
 # anchor augmentation (the triplet's invariance target); rotate range shared by 2D & 3D anchors
 anchor_appearance_aug = true
 anchor_rotate_2d_deg = 45.0
@@ -89,16 +89,16 @@ anchor_rotate_2d_deg = 45.0
 # ~0.5*mag px of 2D motion). Kept on the same pixel scale as mag_2d so 3D "bad" tracks
 # are visibly corrupted (sub-pixel values like 0.1 were effectively no corruption).
 [scorer.corruption.mag_3d]
-const_offset = 9.0
+const_offset = 15.0
 frame_noise = 5.0
-gradual_drift = 9.0
-sinusoid = 9.0
+gradual_drift = 24.0
+sinusoid = 16.0
 
 # SCORER: 2D corruption magnitudes, in pixels (image_size = 256)
 [scorer.corruption.mag_2d]
 const_offset = 8.0
 frame_noise = 6.0
-gradual_drift = 10.0
+gradual_drift = 12.0
 sinusoid = 8.0
 
 # ======================================================================================
@@ -136,8 +136,8 @@ min_res = 256
 max_res = 256
 cams_to_sample = [ 1, 8,]
 kpts_to_sample = [ 128, 128,]    # SCORER: triplets per step = batch_size * kpts
-aug_prob = 0.5                   # SCORER: strength of the in-loop appearance aug (per-camera Sometimes)
-per_image_aug_prob = 0.5         # SCORER: strength of the in-loop per-image appearance aug
+aug_prob = 0.4                   # SCORER: strength of the in-loop appearance aug (per-camera Sometimes)
+per_image_aug_prob = 0.3         # SCORER: strength of the in-loop per-image appearance aug
 should_augment_prob = 0.0        # SCORER: base sample stays clean; rotation+appearance done in the loop
 enable_kpt_filtering = false
 cam_thresh_for_vis = 1

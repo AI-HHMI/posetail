@@ -459,22 +459,22 @@ class PosetailDataset(Dataset):
         
         # per-camera augmentations: same parameters applied to all frames of one camera
         self.aug_per_camera = iaa.Sequential([
-            iaa.Sometimes(self.aug_prob, iaa.imgcorruptlike.DefocusBlur(severity=(1,2))),
+            iaa.Sometimes(self.aug_prob, iaa.imgcorruptlike.DefocusBlur(severity=(1,))),
             # iaa.Sometimes(self.aug_prob, iaa.imgcorruptlike.Contrast(severity=(1,2))),
-            iaa.Sometimes(self.aug_prob, iaa.GammaContrast((0.5, 1.8))),
+            iaa.Sometimes(self.aug_prob, iaa.GammaContrast((0.6, 1.8))),
             iaa.Sometimes(self.aug_prob, iaa.AddToSaturation((-50, 30))),
             iaa.Sometimes(self.aug_prob, iaa.AddToHue((-10, 10))),
             # iaa.Sometimes(self.aug_prob, iaa.UniformColorQuantizationToNBits(nb_bits=(3,7))),
-            iaa.Sometimes(self.aug_prob, iaa.JpegCompression(compression=(30, 70))),
+            # iaa.Sometimes(self.aug_prob, iaa.JpegCompression(compression=(30, 70))),
             # iaa.Sometimes(self.aug_prob, iaa.imgcorruptlike.Pixelate(severity=(1,2))),
         ])
 
         # per-image augmentations: independently resampled for each frame
         self.aug_per_image = iaa.Sequential([
-            iaa.Sometimes(self.per_image_aug_prob, iaa.MotionBlur(k=(3,5))),
+            iaa.Sometimes(self.per_image_aug_prob, iaa.MotionBlur(k=(1,3))),
             iaa.Sometimes(self.per_image_aug_prob, iaa.AdditiveGaussianNoise(scale=(0, 0.07*255))),
             iaa.Sometimes(self.per_image_aug_prob, iaa.Multiply((0.9, 1.1))),
-            iaa.Sometimes(self.per_image_aug_prob, iaa.SaltAndPepper(0.01)),
+            iaa.Sometimes(self.per_image_aug_prob, iaa.SaltAndPepper(0.004)),
         ])
         
         # generate metadata for the provided data path (requires a specific format)
