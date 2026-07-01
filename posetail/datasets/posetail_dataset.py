@@ -459,7 +459,7 @@ class PosetailDataset(Dataset):
         
         # per-camera augmentations: same parameters applied to all frames of one camera
         self.aug_per_camera = iaa.Sequential([
-            iaa.Sometimes(self.aug_prob, iaa.imgcorruptlike.DefocusBlur(severity=(1,))),
+            iaa.Sometimes(self.aug_prob, iaa.imgcorruptlike.DefocusBlur(severity=(1,1))),
             # iaa.Sometimes(self.aug_prob, iaa.imgcorruptlike.Contrast(severity=(1,2))),
             iaa.Sometimes(self.aug_prob, iaa.GammaContrast((0.6, 1.8))),
             iaa.Sometimes(self.aug_prob, iaa.AddToSaturation((-50, 30))),
@@ -471,8 +471,8 @@ class PosetailDataset(Dataset):
 
         # per-image augmentations: independently resampled for each frame
         self.aug_per_image = iaa.Sequential([
-            iaa.Sometimes(self.per_image_aug_prob, iaa.MotionBlur(k=(1,3))),
-            iaa.Sometimes(self.per_image_aug_prob, iaa.AdditiveGaussianNoise(scale=(0, 0.07*255))),
+            iaa.Sometimes(self.per_image_aug_prob, iaa.MotionBlur(k=(3,4))),
+            iaa.Sometimes(self.per_image_aug_prob, iaa.AdditiveGaussianNoise(scale=(0, 0.04*255))),
             iaa.Sometimes(self.per_image_aug_prob, iaa.Multiply((0.9, 1.1))),
             iaa.Sometimes(self.per_image_aug_prob, iaa.SaltAndPepper(0.004)),
         ])
