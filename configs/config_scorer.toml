@@ -70,7 +70,7 @@ pool_num_heads = 8            # attention-pooling heads (pools over time & camer
 score_hidden = 64            # width of the score-feature MLP
 use_precision = true         # precision (uncertainty) head + precision-weighted loss
 triplet_margin = 0.25         # ranking margin between clean and corrupt
-precision_reg_weight = 0.15  # anti-collapse reg on log-precision
+precision_reg_weight = 0.10  # anti-collapse reg on log-precision
 score_reg_weight = 0.001     # L2 on raw scores: anchors level, stops magnitude drift
 
 # SCORER: synthetic corruption that builds the "bad" sample (every point corrupted).
@@ -99,16 +99,16 @@ point_drop_bernoulli_rate = 0.2   # per-frame drop prob for the per-frame-random
 # are visibly corrupted (sub-pixel values like 0.1 were effectively no corruption).
 [scorer.corruption.mag_3d]
 const_offset = 15.0
-frame_noise = 5.0
+frame_noise = 10.0
 gradual_drift = 24.0
 sinusoid = 16.0
 
 # SCORER: 2D corruption magnitudes, in pixels (image_size = 256)
 [scorer.corruption.mag_2d]
-const_offset = 8.0
-frame_noise = 6.0
+const_offset = 10.0
+frame_noise = 8.0
 gradual_drift = 12.0
-sinusoid = 8.0
+sinusoid = 10.0
 
 # ======================================================================================
 # [training] -- mostly inherited training infra; checkpoint_path is the scorer's warm-start.
@@ -126,7 +126,7 @@ print_freq = 20
 
 # TRACKER ENC: SF-Muon optimizer settings reused from the run (no scorer-specific tuning).
 [training.optimizer]
-learning_rate = 5e-4
+learning_rate = 2e-4
 muon_schedulefree = true
 weight_decay = 0.001
 warmup_steps = 200
