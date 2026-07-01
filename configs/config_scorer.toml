@@ -84,6 +84,15 @@ sinusoid_prob = 0.5
 anchor_appearance_aug = true
 anchor_rotate_2d_deg = 45.0
 
+# SCORER: point-drop augmentation. Randomly NaN out (point, frame) slots on BOTH good and
+# bad (SHARED mask, so corruption stays the only quality signal) so the scorer learns that
+# missing points are orthogonal to quality and must not lower the score. Per point, drops
+# use a contiguous window OR per-frame random (50/50). Only currently-valid frames are
+# dropped, and every point keeps >= the dataset's min_valid_frames valid frames.
+point_drop_prob = 0.5             # per-point chance of getting any drop
+point_drop_max_frac = 0.4         # contiguous-window length up to this fraction of T frames
+point_drop_bernoulli_rate = 0.2   # per-frame drop prob for the per-frame-random pattern
+
 # SCORER: 3D corruption magnitudes, in cube_scale units (~ pixel-equivalent: a world
 # shift = mag * cube_scale, where cube_scale = world-units/pixel, so it projects to
 # ~0.5*mag px of 2D motion). Kept on the same pixel scale as mag_2d so 3D "bad" tracks

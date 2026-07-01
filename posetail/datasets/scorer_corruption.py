@@ -20,6 +20,7 @@ Adapted from miss-alignment's composable `ShiftConfig`/`ShiftGenerator`
 (`data/shift_generation.py`), extended to per-point, per-time shifts `[K, T, D]`.
 """
 
+import math
 import random
 
 import numpy as np
@@ -156,6 +157,52 @@ def corrupt_coords(coords_full, corruptor, mode, cube_scale_b=None):
     return coords_full + shifts
 
 
+def compute_drop_mask(coords, cfg, k_min):
+    """Boolean [b,t,n] mask of coord slots to NaN out. Per point, randomly use a contiguous
+    window OR per-frame random drops (50/50). Only currently-valid frames are dropped, and
+    every point keeps >= k_min valid frames (the dataset's min_valid_frames, so drops never
+    push a point below what the base loader would keep). torch-only RNG (worker-safe: torch
+    is auto-seeded per DataLoader worker, unlike numpy)."""
+    p = cfg.get('point_drop_prob', 0.0)
+    if p <= 0.0:
+        return None
+    max_frac = cfg.get('point_drop_max_frac', 0.4)
+    rate     = cfg.get('point_drop_bernoulli_rate', 0.2)
+    b, t, n, _ = coords.shape
+    device = coords.device
+
+    valid    = torch.isfinite(coords).all(dim=-1)              # [b,t,n]
+    n_valid  = valid.sum(dim=1)                                # [b,n]
+    max_drop = (n_valid - k_min).clamp(min=0)                  # [b,n]
+
+    # contiguous window per point
+    L_max  = max(1, int(math.ceil(max_frac * t)))
+    length = torch.randint(1, L_max + 1, (b, n), device=device)
+    start  = (torch.rand(b, n, device=device) * (t - length + 1).clamp(min=1).float()).long()
+    ar     = torch.arange(t, device=device)[None, :, None]     # [1,t,1]
+    window = (ar >= start[:, None, :]) & (ar < (start + length)[:, None, :])   # [b,t,n]
+
+    # per-frame random per point
+    bern = torch.rand(b, t, n, device=device) < rate           # [b,t,n]
+
+    # 50/50 pattern choice per point, gated by point_drop_prob, restricted to valid frames
+    use_window = (torch.rand(b, n, device=device) < 0.5)[:, None, :]
+    gate       = (torch.rand(b, n, device=device) < p)[:, None, :]
+    cand = torch.where(use_window, window, bern) & gate & valid
+
+    # cap per point so >= k_min valid frames remain (cumulative count over time)
+    order = cand.cumsum(dim=1)
+    return cand & (order <= max_drop[:, None, :])              # [b,t,n]
+
+
+def apply_drop_mask(coords, mask):
+    """Return a copy of coords [b,t,n,R] with `mask` [b,t,n] slots set to NaN."""
+    if mask is None:
+        return coords
+    nan = torch.full_like(coords, float('nan'))
+    return torch.where(mask.unsqueeze(-1), nan, coords)
+
+
 def apply_appearance_aug(views, dataset):
     """Run the dataset's imgaug appearance pipeline on each view -> new view list.
 
@@ -262,11 +309,17 @@ def make_triplet(batch, dataset, corruptor_3d, corruptor_2d, cfg):
             s_views = apply_appearance_aug(s_views, dataset)
         cube_scale_b = compute_cube_scale_b(s_cgroup, s_coords)
         bad_coords = corrupt_coords(s_coords, corruptor_3d, '3d', cube_scale_b)
+        drop_mask = compute_drop_mask(s_coords, cfg, dataset.min_valid_frames)  # shared: good & bad drop identically
+        s_coords = apply_drop_mask(s_coords, drop_mask)
+        bad_coords = apply_drop_mask(bad_coords, drop_mask)
     else:
         s_views, s_coords, s_cgroup = rotate_anchor_2d(views, cgroup, coords, angle_range=ang)
         if app:
             s_views = apply_appearance_aug(s_views, dataset)
         bad_coords = corrupt_coords(s_coords, corruptor_2d, '2d')
+        drop_mask = compute_drop_mask(s_coords, cfg, dataset.min_valid_frames)  # shared: good & bad drop identically
+        s_coords = apply_drop_mask(s_coords, drop_mask)
+        bad_coords = apply_drop_mask(bad_coords, drop_mask)
 
     good = (s_views, s_coords, s_cgroup)
     bad = (s_views, bad_coords, s_cgroup)                              # shares good's augmented pixels
