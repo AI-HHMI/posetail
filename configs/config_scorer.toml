@@ -80,8 +80,8 @@ const_offset_prob = 0.5
 frame_noise_prob = 0.5
 gradual_drift_prob = 0.5
 sinusoid_prob = 0.5
-# anchor augmentation (the triplet's invariance target); rotate range shared by 2D & 3D anchors
-anchor_appearance_aug = true
+# anchor augmentation (the triplet's invariance target); rotate range shared by 2D & 3D anchors.
+# appearance aug is gated by should_augment_prob (in [dataset.*]); rotation is always applied.
 anchor_rotate_2d_deg = 45.0
 
 # SCORER: point-drop augmentation. Randomly NaN out (point, frame) slots on BOTH good and
@@ -147,7 +147,7 @@ cams_to_sample = [ 1, 8,]
 kpts_to_sample = [ 128, 128,]    # SCORER: triplets per step = batch_size * kpts
 aug_prob = 0.4                   # SCORER: strength of the in-loop appearance aug (per-camera Sometimes)
 per_image_aug_prob = 0.3         # SCORER: strength of the in-loop per-image appearance aug
-should_augment_prob = 0.0        # SCORER: base sample stays clean; rotation+appearance done in the loop
+should_augment_prob = 0.75       # SCORER: per-view appearance-aug prob in the loop (base forced to 0)
 enable_kpt_filtering = false
 cam_thresh_for_vis = 1
 balance_datasets = true
@@ -171,7 +171,7 @@ cams_to_sample = 5
 kpts_to_sample = 128
 aug_prob = 0.4                   # SCORER: same in-loop appearance aug as train
 per_image_aug_prob = 0.4
-should_augment_prob = 0.0        # SCORER: base sample clean; rotation+appearance done in the loop
+should_augment_prob = 0.75       # SCORER: per-view appearance-aug prob in the loop (base forced to 0)
 crop_to_points = true
 speed_thresh = 1.0
 prop_dynamic_kpts_to_sample = 0.7
