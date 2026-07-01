@@ -114,23 +114,23 @@ scene_proj_mlp = false
 #
 
 # without subpixel
-# output_mode = "gridresid"
-# head_3d_grid_size = 1024
-# head_3d_grid_radius = 1.8
-# log_3d_output = true
-# log_3d_eps = 0.05
-# soft_argmax_threshold = 70
-# grid_decode_space = "warped"
-# enable_subpixel_refinement = false
-
-# gridresid with subpixel refinement
 output_mode = "gridresid"
-head_3d_grid_size = 512
+head_3d_grid_size = 1024
 head_3d_grid_radius = 1.8
 log_3d_output = true
 log_3d_eps = 0.1
-enable_subpixel_refinement = true
-subpixel_scale = 0.6
+soft_argmax_threshold = 60
+grid_decode_space = "warped"
+enable_subpixel_refinement = false
+
+# gridresid with subpixel refinement
+# output_mode = "gridresid"
+# head_3d_grid_size = 512
+# head_3d_grid_radius = 1.8
+# log_3d_output = true
+# log_3d_eps = 0.1
+# enable_subpixel_refinement = true
+# subpixel_scale = 0.6
 
 
 # Depth log-grid range = log(depth/(cube*f_eff)); covers every dataset's reach with margin.
