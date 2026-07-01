@@ -1,17 +1,20 @@
 """Synthetic track corruption + triplet assembly for the track-quality scorer.
 
-Given a clean loaded sample (a "good" track), we build a triplet of three samples:
+Given a clean loaded sample, we build a triplet of three samples. ALL three get both rotation
+and appearance augmentation (the scorer never sees a raw un-augmented view):
 
-    good   = the clean track                              (label +1, every point)
-    bad    = corrupt(good): every point independently     (label -1, every point)
-             gets >=1 corruption applied over time
-    anchor = augment(good or bad, 50/50): a posetail       (label = source's label)
-             geometric augmentation that preserves track validity
+    good   = clean track,   augmentation A                (label +1, every point)
+    bad    = corrupt(good),  augmentation A (SAME as good) (label -1, every point)
+             every point independently gets >=1 corruption applied over time
+    anchor = same track as good|bad (50/50), augmentation B (label = source's label)
+             an INDEPENDENT augmentation the scorer must be invariant to
 
-The scorer must rank `bad` as worse than `good` while being invariant to the augmentation
-that produced `anchor`. Corruptions move COORDINATES ONLY (never pixels), so `good` and
-`bad` share scene features; the 3D anchor augmentation (world-frame rotation) also leaves
-pixels unchanged, while the 2D anchor augmentation (in-plane image rotation) warps them.
+`good` and `bad` share ONE augmentation (A) so they stay pixel-matched -- corruptions move
+COORDINATES ONLY, so they share scene features and the good-vs-bad gap isolates track quality.
+The `anchor` gets an independent augmentation (B) of the same underlying track, so its pixels
+always differ (reuse_scene_for_anchor is always False). Rotation uses the dataset's real
+image-plane rotation: `rotate_anchor_2d` (single camera) / `rotate_anchor_3d` (per camera,
+extrinsic Z-roll, projection-consistent); appearance uses the dataset's imgaug pipeline.
 
 Adapted from miss-alignment's composable `ShiftConfig`/`ShiftGenerator`
 (`data/shift_generation.py`), extended to per-point, per-time shifts `[K, T, D]`.
@@ -23,7 +26,8 @@ import numpy as np
 import torch
 
 from posetail.posetail.cube import get_camera_scale
-from posetail.datasets.posetail_dataset import rotate_points_image_plane
+from posetail.datasets.posetail_dataset import (rotate_points_image_plane,
+                                                rotate_camera_image_plane_3d)
 
 
 # --------------------------------------------------------------------------------------
@@ -195,6 +199,36 @@ def rotate_anchor_2d(views, cgroup, coords, angle_range=45.0):
     return warped_views, coords_rot, [cam_rot]
 
 
+def rotate_anchor_3d(views, cgroup, angle_range=45.0):
+    """Per-view in-plane image rotation for the multi-camera 3D path.
+
+    Each camera gets an INDEPENDENT random angle (mirrors dataset.augment_image_rotation, but
+    forced -- no aug_prob gate). Warps that camera's images (cv2) and applies the matching
+    extrinsic Z-roll so the 3D->2D projection stays consistent; the 3D world coords are left
+    unchanged (rotation is camera-only), so the caller keeps using the same coords.
+
+    views: list (per camera) of [b,t,h,w,3] float tensors. Returns (warped_views, rotated_cgroup).
+    """
+    import cv2
+    new_views = []
+    new_cgroup = []
+    for cam, v in zip(cgroup, views):
+        angle = float(np.random.uniform(-angle_range, angle_range))
+        cam_rot, (M_2x3, (cw, ch)) = rotate_camera_image_plane_3d(_clone_cam(cam), angle)
+
+        device = v.device
+        imgs = v.detach().cpu().numpy()                                # [b,t,h,w,3]
+        b, t = imgs.shape[:2]
+        warped = np.zeros((b, t, ch, cw, 3), dtype=np.float32)
+        for bi in range(b):
+            for ti in range(t):
+                warped[bi, ti] = cv2.warpAffine(imgs[bi, ti], M_2x3, (cw, ch),
+                                                flags=cv2.INTER_LINEAR)
+        new_views.append(torch.from_numpy(warped).to(device))
+        new_cgroup.append(cam_rot)
+    return new_views, new_cgroup
+
+
 # --------------------------------------------------------------------------------------
 # Triplet assembly
 # --------------------------------------------------------------------------------------
@@ -202,42 +236,57 @@ def rotate_anchor_2d(views, cgroup, coords, angle_range=45.0):
 def make_triplet(batch, dataset, corruptor_3d, corruptor_2d, cfg):
     """Build a (good, bad, anchor) triplet from one collated batch.
 
-    Returns a dict with three samples, each a tuple (views, coords_full, cgroup), plus the
-    anchor's source label and a flag for whether the anchor's pixels changed (so the
-    trainer can reuse `good`'s scene features for the anchor when they did not).
+    All three samples get both rotation and appearance augmentation (the network never sees a
+    raw un-augmented view). `good` and `bad` share ONE augmentation so they stay pixel-matched
+    (only the coord corruption distinguishes them, and `score_triplet` can reuse good's scene
+    features for bad); the `anchor` gets an INDEPENDENT augmentation of the SAME track as its
+    source, which is the invariance target the scorer must match.
+
+    Returns a dict with three samples, each a tuple (views, coords_full, cgroup), the anchor's
+    source label, the mode, and reuse_scene_for_anchor (always False: the anchor's pixels differ).
     """
     coords = batch.coords                                              # [b,t,n,R]
     R = coords.shape[-1]
     mode = '3d' if R == 3 else '2d'
     views = batch.views
     cgroup = batch.cgroup
+    ang = cfg.get('anchor_rotate_2d_deg', 45.0)                        # shared 2D & 3D angle range
+    app = cfg.get('anchor_appearance_aug', False)
 
+    # (A) one shared transform for the good/bad scene -> they stay pixel-matched
     if mode == '3d':
-        cube_scale_b = compute_cube_scale_b(cgroup, coords)
-        bad_coords = corrupt_coords(coords, corruptor_3d, '3d', cube_scale_b)
+        s_views, s_cgroup = rotate_anchor_3d(views, cgroup, angle_range=ang)
+        s_coords = coords                                             # world coords unchanged by image rotation
+        if app:
+            s_views = apply_appearance_aug(s_views, dataset)
+        cube_scale_b = compute_cube_scale_b(s_cgroup, s_coords)
+        bad_coords = corrupt_coords(s_coords, corruptor_3d, '3d', cube_scale_b)
     else:
-        bad_coords = corrupt_coords(coords, corruptor_2d, '2d')
+        s_views, s_coords, s_cgroup = rotate_anchor_2d(views, cgroup, coords, angle_range=ang)
+        if app:
+            s_views = apply_appearance_aug(s_views, dataset)
+        bad_coords = corrupt_coords(s_coords, corruptor_2d, '2d')
 
-    good = (views, coords, cgroup)
-    bad = (views, bad_coords, cgroup)                                  # same pixels
+    good = (s_views, s_coords, s_cgroup)
+    bad = (s_views, bad_coords, s_cgroup)                              # shares good's augmented pixels
 
+    # (B) independent transform for the anchor, on the SAME track as its source
     from_good = random.random() < 0.5
-    src_views, src_coords, src_cgroup = good if from_good else bad
+    a_src_coords = s_coords if from_good else bad_coords
 
     if mode == '3d':
-        a_cgroup, a_coords = dataset.rotate_camera_group(
-            [_clone_cam(c) for c in src_cgroup], src_coords)
-        a_views = src_views
-        pixels_changed = False
-        if cfg.get('anchor_appearance_aug', False):
-            a_views = apply_appearance_aug(src_views, dataset)
-            pixels_changed = True
+        # 3D image rotation is camera-only, so build from the ORIGINAL views (single warp) and
+        # keep the identical world coords -> same track, independent view.
+        a_views, a_cgroup = rotate_anchor_3d(views, cgroup, angle_range=ang)
+        a_coords = a_src_coords
+        if app:
+            a_views = apply_appearance_aug(a_views, dataset)
     else:
-        a_views, a_coords, a_cgroup = rotate_anchor_2d(
-            src_views, src_cgroup, src_coords,
-            angle_range=cfg.get('anchor_rotate_2d_deg', 45.0))
-        pixels_changed = True
-        if cfg.get('anchor_appearance_aug', False):
+        # 2D coords ARE pixels, so rotate the shared-augmented source again -> the anchor's
+        # (rotated) track stays identical to its source.
+        a_views, a_coords, a_cgroup = rotate_anchor_2d(s_views, s_cgroup, a_src_coords,
+                                                       angle_range=ang)
+        if app:
             a_views = apply_appearance_aug(a_views, dataset)
 
     anchor = (a_views, a_coords, a_cgroup)
@@ -245,7 +294,7 @@ def make_triplet(batch, dataset, corruptor_3d, corruptor_2d, cfg):
     return {
         'good': good, 'bad': bad, 'anchor': anchor,
         'anchor_label': anchor_label, 'mode': mode,
-        'reuse_scene_for_anchor': not pixels_changed,
+        'reuse_scene_for_anchor': False,
     }
 
 
