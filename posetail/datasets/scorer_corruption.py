@@ -212,12 +212,22 @@ def apply_appearance_aug(views, dataset):
     out = []
     for v in views:
         arr = (v.detach().cpu().numpy() * 255.0).astype(np.uint8)      # [b,t,h,w,3]
-        b, t = arr.shape[:2]
+        b, t, h, w = arr.shape[:4]
+        # imgcorruptlike augmenters (DefocusBlur) assert h,w >= 32. Tiny views (e.g. a rotated
+        # crop of a small source frame) would crash; symmetric-pad up to 32 for the aug, then
+        # crop back so the view shape and its coords stay unchanged.
+        pad_h, pad_w = max(0, 32 - h), max(0, 32 - w)
+        top, left = pad_h // 2, pad_w // 2
+        if pad_h or pad_w:
+            arr = np.pad(arr, ((0, 0), (0, 0), (top, pad_h - top), (left, pad_w - left), (0, 0)),
+                         mode='symmetric')
         aug_cam = dataset.aug_per_camera.to_deterministic()
         for bi in range(b):
             imgs = [aug_cam(image=arr[bi, ti]) for ti in range(t)]
             imgs = [dataset.aug_per_image(image=im) for im in imgs]
             arr[bi] = np.stack(imgs, axis=0)
+        if pad_h or pad_w:
+            arr = arr[:, :, top:top + h, left:left + w, :]
         out.append(torch.from_numpy(arr.astype(np.float32) / 255.0).to(v.device))
     return out
 
@@ -277,6 +287,52 @@ def rotate_anchor_3d(views, cgroup, angle_range=45.0):
     return new_views, new_cgroup
 
 
+def crop_views(views, crops):
+    """Slice each view [b,t,h,w,3] to its per-camera [x1,y1,x2,y2] crop rect."""
+    out = []
+    for v, crop in zip(views, crops):
+        x1, y1, x2, y2 = (int(c) for c in crop)
+        out.append(v[:, :, y1:y2, x1:x2, :])
+    return out
+
+
+def resize_views(views, cgroup, target_res, coords=None):
+    """Resize each view so its longest side == target_res, scaling the camera (and 2D coords).
+
+    Mirrors `PosetailDataset.resize_camera_group` (fixed target, no randint jitter) but also
+    resizes the actual image frames. `views`: list (per camera) of [b,t,h,w,3] float tensors.
+    Returns (views, cgroup) for 3D, or (views, cgroup, coords) when 2D pixel `coords` are given.
+    """
+    import cv2
+    if target_res is None or target_res == -1:
+        return (views, cgroup) if coords is None else (views, cgroup, coords)
+    out_views, out_cgroup, scale0 = [], [], None
+    for ci, (v, cam) in enumerate(zip(views, cgroup)):
+        cam = dict(cam)
+        size = cam['size']
+        scale = float(target_res) / float(size.max())
+        new_size = torch.round(size.float() * scale).to(torch.int32)
+        nw, nh = int(new_size[0]), int(new_size[1])
+        arr = v.detach().cpu().numpy()                                 # [b,t,h,w,3]
+        b, t = arr.shape[:2]
+        resized = np.zeros((b, t, nh, nw, 3), dtype=arr.dtype)
+        for bi in range(b):
+            for ti in range(t):
+                resized[bi, ti] = cv2.resize(arr[bi, ti], (nw, nh), interpolation=cv2.INTER_LINEAR)
+        out_views.append(torch.from_numpy(resized).to(v.device))
+        cam['size'] = new_size
+        cam['mat'] = cam['mat'] * scale
+        cam['mat'][2, 2] = 1
+        if 'offset' in cam:
+            cam['offset'] = cam['offset'] * scale
+        out_cgroup.append(cam)
+        if ci == 0:
+            scale0 = scale
+    if coords is None:
+        return out_views, out_cgroup
+    return out_views, out_cgroup, coords * scale0                      # 2D: single camera
+
+
 # --------------------------------------------------------------------------------------
 # Triplet assembly
 # --------------------------------------------------------------------------------------
@@ -299,13 +355,23 @@ def make_triplet(batch, dataset, corruptor_3d, corruptor_2d, cfg):
     views = batch.views
     cgroup = batch.cgroup
     ang = cfg.get('anchor_rotate_2d_deg', 45.0)                        # shared 2D & 3D angle range
-    app = cfg.get('anchor_appearance_aug', False)
+    do_crop = cfg.get('crop_to_points', True)                          # scorer owns crop-to-points
+    target_res = cfg.get('target_res', 256)                            # scorer owns the resize
+    aug_prob = cfg.get('should_augment_prob', 0.0)                     # gates the appearance aug
+
+    # Each view runs rotate -> crop-to-points -> resize -> appearance aug (mirrors the base
+    # pipeline order, so the crop's min_crop_dim guarantee and the resize both hold BEFORE the
+    # imgaug appearance pipeline sees the image).
 
     # (A) one shared transform for the good/bad scene -> they stay pixel-matched
     if mode == '3d':
         s_views, s_cgroup = rotate_anchor_3d(views, cgroup, angle_range=ang)
         s_coords = coords                                             # world coords unchanged by image rotation
-        if app:
+        if do_crop:
+            s_cgroup, crops = dataset.crop_cgroup_to_points(s_cgroup, s_coords[0])
+            s_views = crop_views(s_views, crops)
+        s_views, s_cgroup = resize_views(s_views, s_cgroup, target_res)
+        if random.random() < aug_prob:
             s_views = apply_appearance_aug(s_views, dataset)
         cube_scale_b = compute_cube_scale_b(s_cgroup, s_coords)
         bad_coords = corrupt_coords(s_coords, corruptor_3d, '3d', cube_scale_b)
@@ -314,7 +380,13 @@ def make_triplet(batch, dataset, corruptor_3d, corruptor_2d, cfg):
         bad_coords = apply_drop_mask(bad_coords, drop_mask)
     else:
         s_views, s_coords, s_cgroup = rotate_anchor_2d(views, cgroup, coords, angle_range=ang)
-        if app:
+        if do_crop:
+            s_cgroup, crops, s_coords_u = dataset.crop_cgroup_to_points_2d(s_cgroup, s_coords[0])
+            s_views = crop_views(s_views, crops)
+            s_coords = s_coords_u[None]
+        s_views, s_cgroup, s_coords_u = resize_views(s_views, s_cgroup, target_res, coords=s_coords[0])
+        s_coords = s_coords_u[None]
+        if random.random() < aug_prob:
             s_views = apply_appearance_aug(s_views, dataset)
         bad_coords = corrupt_coords(s_coords, corruptor_2d, '2d')
         drop_mask = compute_drop_mask(s_coords, cfg, dataset.min_valid_frames)  # shared: good & bad drop identically
@@ -333,14 +405,25 @@ def make_triplet(batch, dataset, corruptor_3d, corruptor_2d, cfg):
         # keep the identical world coords -> same track, independent view.
         a_views, a_cgroup = rotate_anchor_3d(views, cgroup, angle_range=ang)
         a_coords = a_src_coords
-        if app:
+        if do_crop:
+            # crop from PRE-drop coords so heavy point-drops can never empty the crop bbox
+            a_cgroup, a_crops = dataset.crop_cgroup_to_points(a_cgroup, coords[0])
+            a_views = crop_views(a_views, a_crops)
+        a_views, a_cgroup = resize_views(a_views, a_cgroup, target_res)
+        if random.random() < aug_prob:
             a_views = apply_appearance_aug(a_views, dataset)
     else:
-        # 2D coords ARE pixels, so rotate the shared-augmented source again -> the anchor's
-        # (rotated) track stays identical to its source.
-        a_views, a_coords, a_cgroup = rotate_anchor_2d(s_views, s_cgroup, a_src_coords,
-                                                       angle_range=ang)
-        if app:
+        # 2D coords ARE pixels, so rotate the shared source again -> the anchor's rotated track
+        # stays identical to its source. Crop-to-points + resize exactly like the 3D anchor (gated
+        # by the same crop_to_points flag) so both modes apply cropping consistently.
+        a_views, a_coords_u, a_cgroup = rotate_anchor_2d(s_views, s_cgroup, a_src_coords[0],
+                                                         angle_range=ang)
+        if do_crop:
+            a_cgroup, a_crops, a_coords_u = dataset.crop_cgroup_to_points_2d(a_cgroup, a_coords_u)
+            a_views = crop_views(a_views, a_crops)
+        a_views, a_cgroup, a_coords_u = resize_views(a_views, a_cgroup, target_res, coords=a_coords_u)
+        a_coords = a_coords_u[None]
+        if random.random() < aug_prob:
             a_views = apply_appearance_aug(a_views, dataset)
 
     anchor = (a_views, a_coords, a_cgroup)
@@ -382,6 +465,8 @@ class ScorerTripletDataset(torch.utils.data.Dataset):
     holds the base dataset's imgaug pipelines, so `apply_appearance_aug` works unchanged.
     """
 
+    GETITEM_MAX_RETRIES = 10
+
     def __init__(self, base, corruption_cfg):
         self.base = base
         self.cfg = dict(corruption_cfg)
@@ -392,16 +477,25 @@ class ScorerTripletDataset(torch.utils.data.Dataset):
         return len(self.base)
 
     def __getitem__(self, idx):
-        item = self.base[idx]
-        if item is None:
-            return None                        # mirror PosetailDataset (None is rare, retry-guarded)
-        views, coords, vis, fnums, cgroup, row, query_times, vis_2d, p2d = item
-        mini = edict({'views': [v[None] for v in views],   # add b=1 -> [1,t,h,w,3]
-                      'coords': coords[None],               # [1,t,n,R]
-                      'cgroup': cgroup})
-        trip = make_triplet(mini, self.base, self.corruptor_3d, self.corruptor_2d, self.cfg)
-        trip['sample_info'] = row              # carry for the bad-gradient error print
-        return trip
+        # A single worker exception here (e.g. a degenerate crop) would crash the rank and hang
+        # the whole DDP job on the next NCCL collective, so any triplet-build failure retries a
+        # different sample instead of propagating.
+        for _ in range(self.GETITEM_MAX_RETRIES):
+            item = self.base[idx]
+            if item is not None:
+                try:
+                    views, coords, vis, fnums, cgroup, row, query_times, vis_2d, p2d = item
+                    mini = edict({'views': [v[None] for v in views],   # add b=1 -> [1,t,h,w,3]
+                                  'coords': coords[None],               # [1,t,n,R]
+                                  'cgroup': cgroup})
+                    trip = make_triplet(mini, self.base, self.corruptor_3d, self.corruptor_2d, self.cfg)
+                    trip['sample_info'] = row      # carry for the bad-gradient error print
+                    return trip
+                except Exception as e:
+                    print(f"[ScorerTripletDataset] triplet build failed for idx {idx}: "
+                          f"{type(e).__name__}: {e}; retrying another sample")
+            idx = int(np.random.randint(len(self.base)))
+        return None                            # exhausted retries (the loop's None-skip handles it)
 
 
 def triplet_collate(batch):

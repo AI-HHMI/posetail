@@ -144,6 +144,32 @@ def _triplet_to_device(trip, device):
     return trip
 
 
+def _build_scorer_dataset(config, split, corruption_cfg):
+    """Build a ScorerTripletDataset whose base `PosetailDataset` returns full, un-augmented frames.
+
+    The scorer owns rotation + crop-to-points + resize + appearance aug (done per triplet view in
+    make_triplet), so the base must NOT crop/resize/augment -- otherwise it would crop+resize to
+    256 first and the scorer's rotation would shrink a thin crop below imgaug's 32px floor. The
+    config file stays the source of truth for the FINAL views: we read those settings, hand them to
+    the scorer, temporarily force the base to skip them, then restore the config (PosetailDataset
+    reads config into attributes at __init__, so the restore is safe and keeps save_config faithful).
+    """
+    ds_cfg = config.dataset[split]
+    view_cfg = dict(corruption_cfg)
+    view_cfg['crop_to_points'] = ds_cfg.get('crop_to_points', True)
+    view_cfg['target_res'] = ds_cfg.get('max_res', -1)              # scorer resizes each view to this
+    view_cfg['should_augment_prob'] = ds_cfg.get('should_augment_prob', 0.0)
+
+    saved = {k: ds_cfg.get(k) for k in ('crop_to_points', 'max_res', 'should_augment_prob')}
+    ds_cfg['crop_to_points'] = False
+    ds_cfg['max_res'] = -1
+    ds_cfg['should_augment_prob'] = 0.0
+    base = PosetailDataset(config, split=split)
+    for k, v in saved.items():
+        ds_cfg[k] = v
+    return ScorerTripletDataset(base, view_cfg)
+
+
 def run(config_path, fabric):
     torch.set_float32_matmul_precision('medium')
     config = load_config(config_path)
@@ -157,9 +183,10 @@ def run(config_path, fabric):
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    # triplet build (rotation + appearance aug + corruption) runs in the DataLoader workers
+    # triplet build (rotation + crop + resize + appearance aug + corruption) runs in the DataLoader
+    # workers; the base returns full un-augmented frames (see _build_scorer_dataset).
     corruption_cfg = dict(config.scorer.get('corruption', {}))
-    train_dataset = ScorerTripletDataset(PosetailDataset(config, split='train'), corruption_cfg)
+    train_dataset = _build_scorer_dataset(config, 'train', corruption_cfg)
     sampler = DistributedSampler(train_dataset, num_replicas=fabric.world_size,
                                  rank=fabric.global_rank, shuffle=True,
                                  seed=config.training.get('seed', None))
@@ -172,7 +199,7 @@ def run(config_path, fabric):
 
     val = config.dataset.val.get('split_dir', None)
     if val:
-        val_dataset = ScorerTripletDataset(PosetailDataset(config, split='val'), corruption_cfg)
+        val_dataset = _build_scorer_dataset(config, 'val', corruption_cfg)
         val_loader = DataLoader(val_dataset, batch_size=config.dataset.batch_size,
                                 collate_fn=triplet_collate, shuffle=True,
                                 num_workers=config.dataset.num_workers, prefetch_factor=2,
@@ -233,11 +260,15 @@ def run(config_path, fabric):
     for i in range(iters_per_gpu):
         if interrupted:
             break
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            batch = next(train_iter)
+        # keep fetching until a valid batch: a None (retry-exhausted sample) must not be skipped
+        # with `continue`, which would desync this rank's collective count from the others.
+        batch = None
+        while batch is None:
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                batch = next(train_iter)
 
         global_i = start_iteration + i * fabric.world_size + fabric.local_rank
         result_dict = {'iteration': global_i}
@@ -286,6 +317,8 @@ def run(config_path, fabric):
                 for j, vbatch in enumerate(val_loader):
                     if j >= config.training.get('val_batches', 20):
                         break
+                    if vbatch is None:
+                        continue
                     vtrip = _triplet_to_device(vbatch, device)
                     vs, vlp, vl = model.score_triplet(vtrip)
                     val_loss(vs, vlp, vl)
