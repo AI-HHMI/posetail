@@ -9,7 +9,7 @@
 # Each section/line is tagged below.
 
 [wandb]                       # infra
-project_name = "posetail-scorer"
+project_name = "posetail-scorer-2"
 path = "/groups/karashchuk/home/karashchukl/results/posetail-scorer"
 mode = "online"
 
@@ -90,7 +90,7 @@ anchor_rotate_2d_deg = 45.0
 # are visibly corrupted (sub-pixel values like 0.1 were effectively no corruption).
 [scorer.corruption.mag_3d]
 const_offset = 16.0
-frame_noise = 12.0
+frame_noise = 9.0
 gradual_drift = 24.0
 sinusoid = 16.0
 
@@ -151,8 +151,8 @@ prob_2d_only = 0.25
 no_nan_coords = false            # SCORER: allow partially-occluded tracks (missing-point token)
 min_valid_frames = 6             # SCORER: drop points seen in <6 frames (no_nan_coords off)
 crop_3d_enabled = true
-crop_3d_fraction = [0.2, 0.75]
-crop_3d_prob = 0.2
+crop_3d_fraction = [0.3, 0.75]
+crop_3d_prob = 0.25
 
 [dataset.val]
 split_dir = "val"
@@ -160,8 +160,8 @@ n_frames = 16
 max_res = 256
 cams_to_sample = 5
 kpts_to_sample = 128
-aug_prob = 0.5                   # SCORER: same in-loop appearance aug as train
-per_image_aug_prob = 0.5
+aug_prob = 0.4                   # SCORER: same in-loop appearance aug as train
+per_image_aug_prob = 0.4
 should_augment_prob = 0.0        # SCORER: base sample clean; rotation+appearance done in the loop
 crop_to_points = true
 speed_thresh = 1.0
