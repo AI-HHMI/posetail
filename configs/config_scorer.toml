@@ -10,7 +10,7 @@
 
 [wandb]                       # infra
 project_name = "posetail-scorer-2"
-path = "/groups/karashchuk/home/karashchukl/results/posetail-scorer"
+path = "/groups/karashchuk/home/karashchukl/results/posetail-scorer-2"
 mode = "online"
 
 [dataset]                     # infra / data location
@@ -70,7 +70,7 @@ pool_num_heads = 8            # attention-pooling heads (pools over time & camer
 score_hidden = 64            # width of the score-feature MLP
 use_precision = true         # precision (uncertainty) head + precision-weighted loss
 triplet_margin = 0.25         # ranking margin between clean and corrupt
-precision_reg_weight = 0.10  # anti-collapse reg on log-precision
+precision_reg_weight = 0.15  # anti-collapse reg on log-precision
 score_reg_weight = 0.001     # L2 on raw scores: anchors level, stops magnitude drift
 
 # SCORER: synthetic corruption that builds the "bad" sample (every point corrupted).
@@ -89,7 +89,7 @@ anchor_rotate_2d_deg = 45.0
 # missing points are orthogonal to quality and must not lower the score. Per point, drops
 # use a contiguous window OR per-frame random (50/50). Only currently-valid frames are
 # dropped, and every point keeps >= the dataset's min_valid_frames valid frames.
-point_drop_prob = 0.5             # per-point chance of getting any drop
+point_drop_prob = 0.3             # per-point chance of getting any drop
 point_drop_max_frac = 0.4         # contiguous-window length up to this fraction of T frames
 point_drop_bernoulli_rate = 0.2   # per-frame drop prob for the per-frame-random pattern
 
