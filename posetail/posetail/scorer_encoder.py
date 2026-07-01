@@ -112,6 +112,19 @@ class ScorerEncoder(TrackerEncoder):
 
         return cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius
 
+    @staticmethod
+    def _fill_nearest_valid(coords, valid):
+        """Fill missing (NaN) slots with the point's nearest observed frame: forward-fill then
+        back-fill along time. coords: [b, t, k, R]; valid: [b, t, k]. Valid slots are returned
+        unchanged; an all-missing point falls through as 0 after the caller's nan_to_num."""
+        b, t, k, R = coords.shape
+        idx = torch.arange(t, device=coords.device)[None, :, None]     # [1, t, 1]
+        fwd = torch.where(valid, idx, torch.full_like(idx, -1)).cummax(dim=1).values   # nearest <= t
+        bwd = torch.where(valid, idx, torch.full_like(idx, t)).flip(1).cummin(dim=1).values.flip(1)
+        src = torch.where(fwd >= 0, fwd, bwd).clamp(0, t - 1)           # [b, t, k]
+        src = src.unsqueeze(-1).expand(b, t, k, R)
+        return torch.gather(torch.nan_to_num(coords, nan=0.0), 1, src)
+
     # ----------------------------------------------------------------------------------
     # Score one sample from precomputed scene features. query = target.
     # ----------------------------------------------------------------------------------
@@ -121,19 +134,24 @@ class ScorerEncoder(TrackerEncoder):
         B, T, K, R = coords_full.shape
         n_cams = len(camera_group)
 
-        # Support missing (NaN) track points. Sanitize NaN coords to a finite placeholder
-        # (each point's mean over its observed frames) BEFORE projection/rays/patches, so no
-        # NaN reaches the decoder's temporal/camera self-attention (which would poison every
-        # other frame/cam of the point). The valid mask drives the missing-point token below.
+        # Missing (NaN) track points: the learnable missing-point token owns their *content*
+        # (query embedding, below) and they are masked out of the score pooling, so their
+        # *position* is never fabricated from an average. Scene scalars are computed from the
+        # RAW (NaN-carrying) coords -> observed points only (get_camera_scale drops NaN via
+        # is_point_visible, scene_center uses nanmean), so missing slots can't bias the scene
+        # scale/centroid. Missing coords are then filled with a finite, in-view placeholder
+        # (nearest observed frame) purely to keep projection/rays finite -- a NaN value in a
+        # masked key would still poison the decoder's self-attention.
         valid = torch.isfinite(coords_full).all(dim=-1)                 # [b, t, k]
-        mean_pos = torch.nanmean(coords_full.to(torch.float32), dim=1, keepdim=True)  # [b,1,k,R]
-        coords_full = torch.where(valid.unsqueeze(-1), coords_full.to(torch.float32),
-                                  mean_pos.expand_as(coords_full))
-        coords_full = torch.nan_to_num(coords_full, nan=0.0)            # guard all-NaN points
+        coords_full = coords_full.to(torch.float32)
 
-        coords_flat = rearrange(coords_full, 'b t k r -> b (t k) r').to(torch.float32)
+        coords_raw_flat = rearrange(coords_full, 'b t k r -> b (t k) r')
         cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius = \
-            self._scene_scalars(coords_flat, camera_group, device)
+            self._scene_scalars(coords_raw_flat, camera_group, device)
+
+        coords_full = self._fill_nearest_valid(coords_full, valid)      # ffill/bfill over time
+        coords_full = torch.nan_to_num(coords_full, nan=0.0)            # guard all-missing points
+        coords_flat = rearrange(coords_full, 'b t k r -> b (t k) r')
 
         # query == target: each (t, k) token lives at its own frame t, evaluated at t.
         query_coords = coords_flat
@@ -178,7 +196,16 @@ class ScorerEncoder(TrackerEncoder):
         # third decoder return is the per-point latent [b, t, k, cams, dim]
         latents = self.decoder(scene_features, query_embeds, query_rays, mode_idx)[2]
 
-        pooled = self.attn_pool(latents)                            # [b, k, d]
+        # Pool only observed (t, cams) slots per point: mask missing slots so missingness does
+        # not shift the score (missing points are orthogonal to track quality). [b,k,t,cams],
+        # True == drop. min_valid_frames guarantees >=1 observed frame/point, so a point is
+        # never fully masked; force-unmask defensively in case that ever breaks (softmax over
+        # all -inf -> NaN).
+        pool_mask = repeat(~valid, 'b t k -> b k t cams', cams=latents.shape[3]).contiguous()
+        all_masked = pool_mask.flatten(2).all(dim=-1)               # [b, k]
+        if all_masked.any():
+            pool_mask[all_masked] = False
+        pooled = self.attn_pool(latents, key_padding_mask=pool_mask)   # [b, k, d]
         feats = self.score_feature(pooled)
         scores = self.score_head(feats)[..., 0]                     # [b, k]
         if self.precision_head is not None:
