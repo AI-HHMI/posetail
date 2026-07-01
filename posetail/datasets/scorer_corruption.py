@@ -25,11 +25,13 @@ import random
 
 import numpy as np
 import torch
+from einops import rearrange
 from easydict import EasyDict as edict
 
-from posetail.posetail.cube import get_camera_scale
+from posetail.posetail.cube import get_camera_scale, is_point_visible
 from posetail.datasets.posetail_dataset import (rotate_points_image_plane,
-                                                rotate_camera_image_plane_3d)
+                                                rotate_camera_image_plane_3d,
+                                                _vis_2d_bounds)
 
 
 # --------------------------------------------------------------------------------------
@@ -337,6 +339,25 @@ def resize_views(views, cgroup, target_res, coords=None):
 # Triplet assembly
 # --------------------------------------------------------------------------------------
 
+def _visible_points_mask(coords, cgroup, mode, cam_thresh):
+    """Per-point [n] bool mask: point is visible in >= `cam_thresh` cameras in >= 1 frame.
+
+    coords: [b, t, n, R] (b == 1). 3D projects world coords with `is_point_visible`; 2D uses
+    pixel-bounds (`_vis_2d_bounds`). NaN (dropped/occluded) slots count as not-visible, so a
+    point survives as long as it is seen in at least one un-dropped frame. Mirrors the base
+    loader's post-rotation visibility check (PosetailDataset.get_item_actual)."""
+    c = coords[0]                                                  # [t, n, R]
+    t, n, _ = c.shape
+    if mode == '3d':
+        flat = rearrange(c, 't n r -> (t n) r')
+        vis = torch.stack([is_point_visible(cam, flat) for cam in cgroup])   # [cams, t*n]
+        vis = rearrange(vis, 'cams (t n) -> t n cams', t=t, n=n)
+        n_cams_vis = vis.sum(dim=-1)                               # [t, n]
+    else:
+        n_cams_vis = _vis_2d_bounds(c, cgroup[0]['size']).to(torch.int64)    # [t, n] (single cam)
+    return (n_cams_vis >= cam_thresh).any(dim=0)                   # [n]
+
+
 def make_triplet(batch, dataset, corruptor_3d, corruptor_2d, cfg):
     """Build a (good, bad, anchor) triplet from one collated batch.
 
@@ -393,9 +414,6 @@ def make_triplet(batch, dataset, corruptor_3d, corruptor_2d, cfg):
         s_coords = apply_drop_mask(s_coords, drop_mask)
         bad_coords = apply_drop_mask(bad_coords, drop_mask)
 
-    good = (s_views, s_coords, s_cgroup)
-    bad = (s_views, bad_coords, s_cgroup)                              # shares good's augmented pixels
-
     # (B) independent transform for the anchor, on the SAME track as its source
     from_good = random.random() < 0.5
     a_src_coords = s_coords if from_good else bad_coords
@@ -426,6 +444,28 @@ def make_triplet(batch, dataset, corruptor_3d, corruptor_2d, cfg):
         if random.random() < aug_prob:
             a_views = apply_appearance_aug(a_views, dataset)
 
+    # The in-plane rotation (an extrinsic Z-roll about the principal point) can swing an
+    # off-centre track fully off-frame; crop_cgroup_to_points clamps its box to [0, size] and
+    # cannot recover points at negative pixels, so those points stay invisible. The base loader
+    # (PosetailDataset.get_item_actual) drops such points right after rotating and rejects the
+    # sample if <2 remain -- make_triplet reimplements rotate+crop but skipped that, letting an
+    # all-off-frame sample reach get_camera_scale and produce an all-NaN cube_scale (-> NaN loss/
+    # grads). Re-filter here: keep only points visible under EVERY view (good & bad share
+    # s_cgroup; anchor has its own a_cgroup), preserving good/bad/anchor point correspondence.
+    cam_thresh = getattr(dataset, 'cam_thresh_for_vis', 1)
+    keep = (_visible_points_mask(s_coords, s_cgroup, mode, cam_thresh)
+            & _visible_points_mask(bad_coords, s_cgroup, mode, cam_thresh)
+            & _visible_points_mask(a_coords, a_cgroup, mode, cam_thresh))
+    if int(keep.sum()) < 2:
+        # let ScorerTripletDataset.__getitem__ retry a different sample (mirrors base return None)
+        raise ValueError(f"triplet has <2 points visible across all views after rotation "
+                         f"({int(keep.sum())}/{keep.numel()})")
+    s_coords = s_coords[:, :, keep]
+    bad_coords = bad_coords[:, :, keep]
+    a_coords = a_coords[:, :, keep]
+
+    good = (s_views, s_coords, s_cgroup)
+    bad = (s_views, bad_coords, s_cgroup)                             # shares good's augmented pixels
     anchor = (a_views, a_coords, a_cgroup)
     anchor_label = 1.0 if from_good else -1.0
     return {
