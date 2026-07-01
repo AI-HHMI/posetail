@@ -115,7 +115,7 @@ sinusoid = 8.0
 # ======================================================================================
 [training]
 seed = 100
-checkpoint_path = "/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260628_134003-39yczenk/files/checkpoints/checkpoint_00778240.pth"  # SCORER: tracker to warm-start from
+checkpoint_path = "/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260628_134003-39yczenk/files/checkpoints/checkpoint_01024000.pth"  # SCORER: tracker to warm-start from
 n_iterations = 8000000
 scheduler_type = "muon"      # TRACKER ENC: reuse the run's SF-Muon setup
 max_grad_norm = 20.0
