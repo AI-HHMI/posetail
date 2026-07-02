@@ -22,14 +22,21 @@ cam_thresh_for_vis = 1
 balance_datasets = true
 n_samples_per_dataset = -1
 crop_to_points = true
-speed_thresh = 3.0
+speed_thresh = 3.0   # ignored in speed_target mode (kept for legacy fallback)
 query_anytime = true
 query_edge_bias = 200.0
 prop_dynamic_kpts_to_sample = 0.95
 prob_2d_only = 0.25
+# Speed-targeted 3D crop: solve the crop size so a coherent cluster realizes a target
+# per-track head-speed drawn from crop_3d_fraction = [s_lo, s_hi] (head-speed BAND; keep
+# s_hi == head_3d_grid_radius). Fills the gridresid edge bins, equalized across datasets.
+# Validated in scripts/speed_target_coverage.py.
+sampling_mode = 'speed_target'
 crop_3d_enabled = true
-crop_3d_fraction = [0.05, 0.75]
+crop_3d_fraction = [0.5, 1.8]   # target head-speed band (s_hi == head_3d_grid_radius)
 crop_3d_prob = 0.4
+crop_3d_ref_pct = 97.0          # percentile of per-axis residual pinned to s* (low OOG)
+crop_3d_high_bias = 0.5         # bias s* toward the high end (counters the 0->peak ramp)
 # No causal_masking: the encoder's temporal self-attention is bidirectional (TapNext-only).
 
 [dataset.train.curriculum]
@@ -114,12 +121,18 @@ scene_proj_mlp = false
 #
 
 # without subpixel
+# Grid grounded on the actual pretraining-v3 A/B: pi2fpadz (eps=0.1, thr=60) beat yn5g6tas
+# (eps=0.05, thr=70). Pretraining models keep a BROAD soft-argmax (temp ~0.47, not the 0.99 of
+# the finetuned 39yczenk in gridresid_combined.md), so the smaller reach (0.345) denoises better
+# than the report's reach~0.5 rule -- that rule only holds once the softmax sharpens.
+# eps is baked into the learned bin centers => fixed through finetuning; thr is decode-time only
+# and can be raised at finetune if the model sharpens temp (reach~0.5 => thr~87 at eps=0.1).
 output_mode = "gridresid"
-head_3d_grid_size = 1024
-head_3d_grid_radius = 1.8
+head_3d_grid_size = 1024              # 512 = ~half the head memory, ~no observable accuracy loss
+head_3d_grid_radius = 1.8            # OOG=0% at 16 frames; == crop_3d_fraction s_hi (speed-target band top)
 log_3d_output = true
-log_3d_eps = 0.1
-soft_argmax_threshold = 60
+log_3d_eps = 0.1                     # pretraining A/B winner (pi2fpadz); fixed through finetuning
+soft_argmax_threshold = 60          # reach = 60*2*ln(19)/1024 ~= 0.345 (broad-softmax optimum); retune at finetune
 grid_decode_space = "warped"
 enable_subpixel_refinement = false
 
