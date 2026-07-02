@@ -236,6 +236,41 @@ def pick_med_cam(cams, pts):
     return cams[int(order[0])], float(med)
 
 
+def sphere_mask(win, speed_thresh, f_lo, f_hi):
+    """Legacy 'speed_thresh' crop: keep a log-uniform sphere fraction of points about a
+    speed_thresh-biased center (mirrors sample_keypoints_sphere). Returns a point mask, or None.
+    The crop itself is the natural in-frame trajectory bbox of the subset (containment with a
+    tiny target), so this is an apples-to-apples head measurement vs the contained speed_target."""
+    L, P, _ = win.shape
+    valid = torch.isfinite(win).all(-1)
+    has = valid.any(0)
+    if int(has.sum()) < 2:
+        return None
+    fv = valid.float().argmax(0)
+    kpt = win[fv, torch.arange(P)]
+    # per-point avg speed = mean frame-to-frame displacement over valid steps
+    step = torch.linalg.norm(win[1:] - win[:-1], dim=-1)                 # (L-1,P)
+    sv = torch.isfinite(step)
+    avg_speed = torch.where(sv, step, torch.zeros_like(step)).sum(0) / sv.float().sum(0).clamp_min(1)
+    tot_mov = torch.nan_to_num(win.amax(0) - win.amin(0)).norm(dim=-1)   # extent proxy
+    cand = torch.where(has)[0]
+    dyn = (avg_speed >= speed_thresh) & has
+    if bool(dyn.any()):
+        pool = torch.where(dyn)[0]
+        ci = int(pool[np.random.randint(len(pool))])
+    else:
+        w = tot_mov[cand] + 2.0
+        ci = int(cand[torch.multinomial(w / w.sum(), 1).item()])
+    dists = torch.linalg.norm(kpt - kpt[ci], dim=-1)
+    dists = torch.where(has, dists, torch.full_like(dists, float('inf')))
+    fd = dists[torch.isfinite(dists)]
+    if fd.numel() < 2 or float(fd.max()) == 0:
+        return None
+    frac = float(np.exp(np.random.uniform(np.log(f_lo), np.log(f_hi))))
+    mask = (dists <= float(fd.max()) * frac) & has
+    return mask if int(mask.sum()) >= 2 else None
+
+
 def process_clip(tpath, args, rng):
     traj = _load_traj(os.path.join(tpath, "pose3d.npz"))
     if traj is None:
@@ -259,12 +294,18 @@ def process_clip(tpath, args, rng):
         return None
     acc = {k: [] for k in ('all', 'lat', 'dep', 'tmax', 'oof')}
     for _ in range(args.n_draws):
-        s_star = draw_sstar(args.s_lo, args.s_hi, args.high_bias)
-        sol = solve_crop(win, med_cam, cube, s_star, args.ref_pct, args.n_radii,
-                         args.frac_lo, args.min_kpts, args.s_lo, args.s_hi, args.fallback)
-        if sol is None:
-            continue
-        mask, crop_px = sol
+        if args.mode == 'speed_thresh':
+            mask = sphere_mask(win, args.speed_thresh, args.st_frac_lo, args.st_frac_hi)
+            if mask is None:
+                continue
+            crop_px = 1   # containment bumps to the natural in-frame trajectory bbox
+        else:
+            s_star = draw_sstar(args.s_lo, args.s_hi, args.high_bias)
+            sol = solve_crop(win, med_cam, cube, s_star, args.ref_pct, args.n_radii,
+                             args.frac_lo, args.min_kpts, args.s_lo, args.s_hi, args.fallback)
+            if sol is None:
+                continue
+            mask, crop_px = sol
         h = realized_head(scale_cams, win[:, mask], crop_px, args.image_size,
                           vis_mask=not args.no_vis_mask, contain=not args.legacy_crop)
         for kk in acc:
@@ -328,6 +369,11 @@ def main():
                     help="supervise out-of-frame points too (fills edge bins with the sweep-out motion)")
     ap.add_argument("--legacy-crop", action="store_true",
                     help="A/B: use the OLD fixed centroid crop (points sweep out) instead of the contained crop")
+    ap.add_argument("--mode", default="speed_target", choices=["speed_target", "speed_thresh"],
+                    help="which sampling mode to simulate for the head-coverage comparison")
+    ap.add_argument("--speed-thresh", type=float, default=3.0, help="speed_thresh mode: dynamic-center threshold")
+    ap.add_argument("--st-frac-lo", type=float, default=0.05, help="speed_thresh mode: sphere-fraction low")
+    ap.add_argument("--st-frac-hi", type=float, default=0.75, help="speed_thresh mode: sphere-fraction high")
     args = ap.parse_args()
     rng = random.Random(args.seed)
     torch.manual_seed(args.seed)

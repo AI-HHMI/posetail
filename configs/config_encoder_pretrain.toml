@@ -22,23 +22,21 @@ cam_thresh_for_vis = 1
 balance_datasets = true
 n_samples_per_dataset = -1
 crop_to_points = true
-speed_thresh = 3.0   # ignored in speed_target mode (kept for legacy fallback)
+speed_thresh = 3.0   # bias the 3D-crop center toward points with avg_speed >= this
 query_anytime = true
 query_edge_bias = 200.0
 prop_dynamic_kpts_to_sample = 0.95
 prob_2d_only = 0.25
-# Speed-targeted 3D crop: solve the crop size so a coherent cluster realizes a target
-# per-track head-speed drawn from crop_3d_fraction = [s_lo, s_hi] (head-speed BAND; keep
-# s_hi == head_3d_grid_radius). The crop is CONTAINED (>= the cluster's trajectory bbox) so
-# points stay in frame -- lift comes from cluster selection, not an out-of-frame sweep (which
-# is under-constrained for few-view clips and blew up the geometry gradients).
-# Validated in scripts/speed_target_coverage.py.
-sampling_mode = 'speed_target'
+# Legacy 'speed_thresh' 3D crop: keep a log-uniform sphere fraction (crop_3d_fraction) of points
+# about a speed_thresh-biased center, then crop-to-points (natural, in-frame). In an offline head
+# -coverage A/B (scripts/speed_target_coverage.py) this fills the gridresid edge bins BETTER than
+# the speed_target solver (pooled in-band 10.8% vs 7.4%) with fewer out-of-frame points -- and it
+# stays in frame, avoiding the few-view out-of-frame degeneracy that diverged run tonsvydq. The
+# speed_target mode + its contained-crop fix remain in the code for reference.
+sampling_mode = 'speed_thresh'
 crop_3d_enabled = true
-crop_3d_fraction = [0.5, 1.8]   # target head-speed band (s_hi == head_3d_grid_radius)
+crop_3d_fraction = [0.05, 0.75]   # sphere fraction [f_lo, f_hi] (NOT a head-speed band in this mode)
 crop_3d_prob = 0.4
-crop_3d_ref_pct = 90.0          # percentile of per-axis residual pinned to s* (off the extreme tail)
-crop_3d_high_bias = 1.0         # uniform s* draw (don't slam to the band top)
 # No causal_masking: the encoder's temporal self-attention is bidirectional (TapNext-only).
 
 [dataset.train.curriculum]
@@ -131,7 +129,7 @@ scene_proj_mlp = false
 # and can be raised at finetune if the model sharpens temp (reach~0.5 => thr~87 at eps=0.1).
 output_mode = "gridresid"
 head_3d_grid_size = 1024              # 512 = ~half the head memory, ~no observable accuracy loss
-head_3d_grid_radius = 1.8            # OOG=0% at 16 frames; == crop_3d_fraction s_hi (speed-target band top)
+head_3d_grid_radius = 1.8            # OOG=0% at 16 frames (grid covers |head| <= this)
 log_3d_output = true
 log_3d_eps = 0.1                     # pretraining A/B winner (pi2fpadz); fixed through finetuning
 soft_argmax_threshold = 60          # reach = 60*2*ln(19)/1024 ~= 0.345 (broad-softmax optimum); retune at finetune
