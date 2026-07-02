@@ -764,6 +764,7 @@ def run_inference(
     n_overlap=2,
     n_views=None,
     view_seed=None,
+    cam_indices=None,
     max_kpts=None,
     per_subject=False,
     device=None,
@@ -802,7 +803,14 @@ def run_inference(
     cam_indices_used = list(range(n_cams_total))
     cam_names_used = [cam_names[i] for i in cam_indices_used]
 
-    if n_views is not None and n_views < n_cams_total:
+    if cam_indices is not None:
+        # Explicit camera selection (e.g. views0123 -> [0,1,2,3]); overrides n_views.
+        cam_indices_used = sorted(cam_indices)
+        print(f'Using explicit cameras {cam_indices_used} of {n_cams_total}')
+        camera_group = [camera_group[i] for i in cam_indices_used]
+        video_paths  = [video_paths[i] for i in cam_indices_used]
+        cam_names_used = [cam_names[i] for i in cam_indices_used]
+    elif n_views is not None and n_views < n_cams_total:
         rng = np.random.default_rng(view_seed)
         cam_indices_used = sorted(rng.choice(n_cams_total, n_views, replace=False).tolist())
         print(f'Subsampling {n_views}/{n_cams_total} cameras: indices {cam_indices_used}')
