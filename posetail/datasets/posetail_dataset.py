@@ -13,7 +13,8 @@ from easydict import EasyDict as edict
 from einops import rearrange
 
 from posetail.datasets.utils import get_dirs, load_yaml, disassemble_extrinsics, format_sample_input
-from posetail.posetail.cube import project_points_torch, is_point_visible
+from posetail.posetail.cube import (project_points_torch, is_point_visible, get_camera_scale,
+                                     project_cam, points_to_rays, to_homogeneous, from_homogeneous)
 from train_utils import format_camera_group, dict_to_device
 
 from pprint import pprint
@@ -418,7 +419,9 @@ class PosetailDataset(Dataset):
         # for sampling cameras, keypoints
         self.cams_to_sample = format_sample_input(config.dataset[split].get('cams_to_sample', None))
         self.kpts_to_sample = format_sample_input(config.dataset[split].get('kpts_to_sample', None))
-        self.speed_thresh = config.dataset[split].get('speed_thresh', None) 
+        # Active in legacy sampling_mode='speed_thresh' (stratified fast/slow keypoint +
+        # sphere-center selection); ignored in 'speed_target' mode (movement-weighted).
+        self.speed_thresh = config.dataset[split].get('speed_thresh', None)
         self.prop_dynamic_kpts_to_sample = config.dataset[split].get('prop_dynamic_kpts_to_sample', 0.7)
         self.cam_thresh_for_vis = config.dataset[split].get('cam_thresh_for_vis', 1) 
         self.enable_kpt_filtering = config.dataset[split].get('enable_kpt_filtering', False)
@@ -435,11 +438,43 @@ class PosetailDataset(Dataset):
         # points the scorer can't meaningfully evaluate).
         self.min_valid_frames = config.dataset[split].get('min_valid_frames', 1)
 
-        # 3D sphere subvolume crop augmentation
+        # 3D crop augmentation. sampling_mode selects between:
+        #   'speed_thresh' (DEFAULT, legacy): the original log-uniform sphere-fraction crop
+        #       (sample_keypoints_sphere) + speed_thresh-stratified keypoint selection. Kept
+        #       as default so existing runs / validation are byte-identical.
+        #   'speed_target' (new): solves the crop SIZE so a spatially-coherent cluster of
+        #       tracks realizes a chosen per-track head-speed s* drawn from a target band,
+        #       filling the gridresid edge bins (equalized across datasets). Lever:
+        #         head = raylocal_residual / (cube_scale * crop_size)   (image_size cancels)
+        #       -> crop_size* = motion_ref / (cube_scale * s*), motion_ref = a high percentile
+        #       (crop_3d_ref_pct) of the cluster's per-axis ray-local residual; the crop is a
+        #       fixed square centered on the cluster (points may sweep out of frame -- still
+        #       supervised -- which is what produces the large head residuals the edge bins
+        #       need). Validated in scripts/speed_target_coverage.py.
+        # crop_3d_fraction is interpreted per mode: sphere fraction [f_lo, f_hi] in legacy,
+        # target head-speed band [s_lo, s_hi] in speed_target (keep s_hi == grid radius).
+        self.sampling_mode = config.dataset[split].get('sampling_mode', 'speed_thresh')
+        assert self.sampling_mode in {'speed_thresh', 'speed_target'}, \
+            f"sampling_mode must be 'speed_thresh' or 'speed_target', got {self.sampling_mode}"
         self.crop_3d_enabled = config.dataset[split].get('crop_3d_enabled', False)
-        self.crop_3d_fraction = config.dataset[split].get('crop_3d_fraction', [0.3, 0.7])
+        self.crop_3d_fraction = config.dataset[split].get(
+            'crop_3d_fraction', [0.5, 2.0] if self.sampling_mode == 'speed_target' else [0.3, 0.7])
         self.crop_3d_min_kpts = config.dataset[split].get('crop_3d_min_kpts', 4)
         self.crop_3d_prob = config.dataset[split].get('crop_3d_prob', self.aug_prob)
+        # --- speed_target-only knobs (ignored in legacy mode) ---
+        # percentile of the cluster's per-axis ray-local residual set equal to s* (higher =>
+        # only the fastest frames reach s*; ~97 places the target at the head-motion tail
+        # with minimal out-of-grid overflow).
+        self.crop_3d_ref_pct = config.dataset[split].get('crop_3d_ref_pct', 97.0)
+        # bias of the s* draw toward the high end (per-track residuals ramp 0->peak within a
+        # window, so pooled per-axis head is intrinsically bottom-heavy; sampling s* high
+        # counteracts it). s* = s_lo + (s_hi-s_lo) * U**high_bias; <1 => high-emphasis.
+        self.crop_3d_high_bias = config.dataset[split].get('crop_3d_high_bias', 0.5)
+        self.crop_3d_n_radii = config.dataset[split].get('crop_3d_n_radii', 6)
+        self.crop_3d_max_svd_pts = config.dataset[split].get('crop_3d_max_svd_pts', 512)
+        # tightest cluster radius (fraction of the max intra-cluster distance) in the nested
+        # radius search -- smaller reaches higher achievable s* on fast clips.
+        self.crop_3d_cluster_frac_lo = config.dataset[split].get('crop_3d_cluster_frac_lo', 0.03)
 
         # augmentation curriculum
         curriculum_cfg = config.dataset[split].get('curriculum', {})
@@ -788,20 +823,38 @@ class PosetailDataset(Dataset):
             if torch.sum(good) < 2:
                 return None
 
-            fire_3d = self.crop_3d_enabled and (np.random.rand() < self.crop_3d_prob * intensity)
-            if fire_3d:
+            # 3D crop augmentation (see sampling_mode). target_crop_px is set only by the
+            # speed_target mode's solver, which forces a fixed crop size to hit a target
+            # head-speed; legacy mode leaves it None (natural trajectory-bounded crop).
+            target_crop_px = None
+            fire_3d = (self.crop_3d_enabled and not is_2d_mode
+                       and np.random.rand() < self.crop_3d_prob * intensity)
+            if fire_3d and self.sampling_mode == 'speed_target':
+                # solve a crop size so a coherent cluster realizes a target head-speed;
+                # on infeasibility fall back to the natural path
+                res = self.sample_speed_targeted(
+                    cgroup, coords, vis, vis_2d, total_movement, avg_speed)
+                if res is None:
+                    fire_3d = False
+                else:
+                    coords, vis, vis_2d, target_crop_px = res
+                    if coords.shape[1] < self.crop_3d_min_kpts:
+                        return None
+            elif fire_3d:
+                # legacy: log-uniform sphere-fraction crop
                 coords, vis, vis_2d = self.sample_keypoints_sphere(
                     coords, vis, vis_2d, total_movement, avg_speed)
                 if coords.shape[1] < self.crop_3d_min_kpts:
                     return None
-            elif self.kpts_to_sample:
+
+            if not fire_3d and self.kpts_to_sample:
                 coords, vis, vis_2d = self.sample_keypoints(coords, vis, vis_2d, total_movement, avg_speed)
 
             if coords.shape[1] < 2:
                 return None
 
             if self.crop_to_points:
-                cgroup, crops = self.crop_cgroup_to_points(cgroup, coords)
+                cgroup, crops = self.crop_cgroup_to_points(cgroup, coords, target_size=target_crop_px)
 
             if self.max_res != -1:
                 cgroup = self.resize_camera_group(cgroup)
@@ -1009,18 +1062,39 @@ class PosetailDataset(Dataset):
 
         return cgroup_cropped, [crop], coords_shifted
 
-    def crop_cgroup_to_points(self, cgroup, coords):
-            
+    def crop_cgroup_to_points(self, cgroup, coords, target_size=None):
+        # When target_size (original px, scalar) is given, the speed-targeted crop takes a
+        # FIXED square of that side centered on the projected-points centroid, NOT enlarged
+        # to the trajectory bbox: fast points sweep toward/out of frame over the window
+        # (still supervised), which is exactly what drives the large head residuals the
+        # gridresid edge bins need. Otherwise the crop bounds the whole trajectory as before.
+
         # compute crops locations
         p2d = project_points_torch(cgroup, coords)
         crops = []
 
         for cnum in range(p2d.shape[0]):
-            
+
             size = cgroup[cnum]['size']
             pflat = p2d[cnum].reshape(-1, 2)
             good = torch.all(torch.isfinite(pflat), dim=1)
             pflat = pflat[good]
+
+            if target_size is not None:
+                # fixed square of side S centered on the point centroid, frame-capped
+                S = min(max(int(self.min_crop_dim), int(target_size)),
+                        int(size[0]), int(size[1]))
+                if pflat.shape[0] > 0:
+                    center = pflat.mean(dim=0)
+                else:
+                    center = size.to(torch.float32) / 2
+                low = torch.clamp(center - S / 2,
+                                  torch.tensor([0., 0.]),
+                                  (size.to(torch.float32) - S).clamp_min(0)).to(torch.int32)
+                high = low + S
+                crops.append(torch.cat([low, high]))
+                continue
+
             low = torch.clamp(torch.min(pflat, dim=0).values - 20, torch.tensor([0,0]), size).to(torch.int32)
             high = torch.clamp(torch.max(pflat, dim=0).values + 20, torch.tensor([0,0]), size).to(torch.int32)
 
@@ -1101,9 +1175,158 @@ class PosetailDataset(Dataset):
         return coords, vis, vis_2d, cam_names
 
 
-    def sample_keypoints(self, coords, vis, vis_2d, total_movement, avg_speed): 
+    def _pick_center_kpt(self, total_movement, has_any):
+        """Movement-weighted random center keypoint among points valid at some frame."""
+        cand = torch.where(has_any)[0]
+        probs = (total_movement[cand] + 2)
+        probs = probs / probs.sum()
+        return int(cand[torch.multinomial(probs, 1).item()])
 
-        if isinstance(self.kpts_to_sample, int): 
+
+    def _axis_residuals(self, cam, cluster, at_pixel):
+        """Per-axis |ray-local residual| (world units) of a cluster (T,k,3) about each point's
+        first-valid anchor, using one ray frame built at `at_pixel` (1,2). Returns the pooled
+        finite values over non-anchor valid frames -- the quantity the gridresid loss bins
+        (head = this / (cube_scale * image_size))."""
+        valid = torch.isfinite(cluster).all(dim=-1)                       # (T,k)
+        fv = valid.float().argmax(dim=0)
+        k = cluster.shape[1]
+        rays = points_to_rays(cam, at_pixel, normalize_t=False)[0]        # (4,4)
+        p_rl = from_homogeneous(torch.einsum('xr,...r->...x', rays, to_homogeneous(cluster)))
+        anchor = p_rl[fv, torch.arange(k)]
+        resid = (p_rl - anchor[None]).abs()                              # (T,k,3)
+        keep = valid.clone()
+        keep[fv, torch.arange(k)] = False
+        m = keep[..., None].expand_as(resid) & torch.isfinite(resid)
+        return resid[m]
+
+
+    def sample_speed_targeted(self, cgroup, coords, vis, vis_2d, total_movement, avg_speed):
+        """Solve a crop size so a coherent cluster of tracks realizes a target per-track
+        head-speed s*, drawn from the band crop_3d_fraction=[s_lo, s_hi] (high-biased). This
+        fills the gridresid edge bins and equalizes the target across datasets.
+
+        Lever (validated offline in scripts/speed_target_coverage.py):
+            head = raylocal_residual / (cube_scale * crop_size)   (image_size cancels)
+        Setting a high percentile (crop_3d_ref_pct) of the cluster's per-axis ray-local
+        residual equal to s* gives crop_size* = motion_ref / (cube_scale * s*). cube_scale is
+        measured on the CLUSTER points (not the full scene) so the resize identity
+        cube_cluster*crop == cube_cropped*image_size holds exactly -- i.e. it matches the
+        scale the loss will apply. Nested cluster radii (tight->loose) give each cluster an
+        achievable band [lo,hi]=motion_ref/(cube*[frame_px, anchor_bbox_px]); the crop is a
+        fixed square of crop_size centered on the cluster (points may sweep out of frame --
+        that sweep, still supervised, is what produces the large head residuals the edge bins
+        need), applied via crop_cgroup_to_points(target_size=crop_px).
+
+        Returns (coords, vis, vis_2d, crop_px) for the chosen cluster, or None (the caller
+        then falls back to the natural crop-to-points path).
+        """
+        s_lo, s_hi = float(self.crop_3d_fraction[0]), float(self.crop_3d_fraction[1])
+        min_kpts = self.crop_3d_min_kpts
+        T, N, _ = coords.shape
+        valid = torch.isfinite(coords).all(dim=-1)          # (T, N)
+        has_any = valid.any(dim=0)                           # (N,)
+        if int(has_any.sum()) < min_kpts:
+            return None
+        first_valid_t = valid.float().argmax(dim=0)
+        kpt_coords = coords[first_valid_t, torch.arange(N)]  # (N, 3) anchor coord per point
+
+        # --- pick the median-cube_scale camera as the solver camera (matches the loss's
+        # median-over-cams aggregation); exclude orthographic / huge-focal cams ---
+        scale_cams = [cam for cam in cgroup
+                      if 0.5 * (float(cam['mat'][0, 0]) + float(cam['mat'][1, 1])) < 1e6]
+        if not scale_cams:
+            return None
+        pts0 = coords.reshape(-1, 3)
+        pts0 = pts0[torch.isfinite(pts0).all(dim=1)]
+        if pts0.shape[0] < 8:
+            return None
+        if pts0.shape[0] > self.crop_3d_max_svd_pts:
+            pts0 = pts0[torch.randperm(pts0.shape[0])[: self.crop_3d_max_svd_pts]]
+        cs0 = get_camera_scale(scale_cams, pts0[None].float()).reshape(-1).cpu().numpy()
+        cmed = np.nanmedian(cs0)
+        if not np.isfinite(cmed) or cmed <= 0:
+            return None
+        med_cam = scale_cams[int(np.argsort(np.abs(np.nan_to_num(cs0, nan=np.inf) - cmed))[0])]
+        frame_px = float(max(med_cam['size'][0], med_cam['size'][1]))
+
+        # --- distances from a movement-weighted center for the nested cluster radii ---
+        center = kpt_coords[self._pick_center_kpt(total_movement, has_any)]
+        dists = torch.linalg.norm(kpt_coords - center, dim=-1)
+        dists = torch.where(has_any, dists, torch.full_like(dists, float('inf')))
+        finite_d = dists[torch.isfinite(dists)]
+        if finite_d.numel() < min_kpts or float(finite_d.max()) == 0:
+            return None
+        d_max = float(finite_d.max())
+
+        cands = []
+        for frac in np.geomspace(float(self.crop_3d_cluster_frac_lo), 1.0, int(self.crop_3d_n_radii)):
+            mask = (dists <= d_max * float(frac)) & has_any
+            if int(mask.sum()) < min_kpts:
+                continue
+            cluster = coords[:, mask]
+            # anchor-frame projected bbox on the solver camera (+ crop pad), frame-capped
+            auv = project_cam(med_cam, kpt_coords[mask])
+            auv = auv[torch.all(torch.isfinite(auv), dim=1)]
+            if auv.shape[0] < 2:
+                continue
+            abox = float(max(auv[:, 0].max() - auv[:, 0].min(),
+                             auv[:, 1].max() - auv[:, 1].min())) + 40.0
+            abox = min(max(abox, float(self.min_crop_dim)), frame_px)
+            # cube on the CLUSTER points (resize-invariant identity holds on the same points)
+            cpts = cluster.reshape(-1, 3)
+            cpts = cpts[torch.isfinite(cpts).all(dim=1)]
+            if cpts.shape[0] < 8:
+                continue
+            if cpts.shape[0] > self.crop_3d_max_svd_pts:
+                cpts = cpts[torch.randperm(cpts.shape[0])[: self.crop_3d_max_svd_pts]]
+            cube_c = float(torch.nanmedian(get_camera_scale([med_cam], cpts[None].float())))
+            if not np.isfinite(cube_c) or cube_c <= 0:
+                continue
+            ctr_px = project_cam(med_cam, kpt_coords[mask].mean(0, keepdim=True))
+            rvals = self._axis_residuals(med_cam, cluster, ctr_px)
+            if rvals.numel() < 10:
+                continue
+            motion_ref = float(np.percentile(rvals.cpu().numpy(), self.crop_3d_ref_pct))
+            if motion_ref <= 0:
+                continue
+            cands.append(dict(mask=mask, abox=abox, motion_ref=motion_ref, cube=cube_c,
+                              hi=motion_ref / (cube_c * abox), lo=motion_ref / (cube_c * frame_px)))
+        if not cands:
+            return None
+
+        # target speed, biased toward the high end (per-track residuals ramp 0->peak, so the
+        # pooled head is bottom-heavy; sampling s* high counteracts it)
+        s_star = float(s_lo + (s_hi - s_lo) * (np.random.uniform() ** self.crop_3d_high_bias))
+        s_lo_all = min(c['lo'] for c in cands)
+        s_hi_all = max(c['hi'] for c in cands)
+        if not (s_lo_all <= s_star <= s_hi_all):
+            # resample within the clip's achievable band (never pile at a boundary)
+            b_lo, b_hi = max(s_lo, s_lo_all), min(s_hi, s_hi_all)
+            s_star = (float(np.random.uniform(b_lo, b_hi)) if b_lo < b_hi
+                      else float(np.clip(s_star, s_lo_all, s_hi_all)))
+
+        bracket = [c for c in cands if c['lo'] <= s_star <= c['hi']]
+        chosen = (min(bracket, key=lambda c: int(c['mask'].sum())) if bracket
+                  else min(cands, key=lambda c: min(abs(c['lo'] - s_star), abs(c['hi'] - s_star))))
+        crop_px = float(np.clip(chosen['motion_ref'] / (chosen['cube'] * s_star),
+                                chosen['abox'], frame_px))
+
+        mask = chosen['mask']
+        coords = coords[:, mask]
+        if vis is not None:
+            vis = vis[:, mask]
+            vis_2d = vis_2d[:, mask]
+        if self.kpts_to_sample:
+            coords, vis, vis_2d = self.sample_keypoints(
+                coords, vis, vis_2d, total_movement[mask], avg_speed[mask])
+
+        return coords, vis, vis_2d, int(round(crop_px))
+
+
+    def sample_keypoints(self, coords, vis, vis_2d, total_movement, avg_speed):
+
+        if isinstance(self.kpts_to_sample, int):
             num_kpts_to_sample = self.kpts_to_sample
 
         else: # sample between a high and low bound 
@@ -1111,8 +1334,9 @@ class PosetailDataset(Dataset):
 
         # sample if there are more keypoints than the number to sample
         if coords.shape[1] > num_kpts_to_sample:
-            # sample a proportion of static vs dynamic points if a speed thresh is provided
-            if self.speed_thresh is not None:
+            # legacy 'speed_thresh' mode: sample a proportion of static vs dynamic points.
+            # In 'speed_target' mode speed_thresh is ignored (movement-weighted selection).
+            if self.sampling_mode == 'speed_thresh' and self.speed_thresh is not None:
 
                 n_dyn = int(num_kpts_to_sample * self.prop_dynamic_kpts_to_sample)
                 n_stat = num_kpts_to_sample - n_dyn
@@ -1144,16 +1368,16 @@ class PosetailDataset(Dataset):
                 coords = coords[:, ix_p]
 
             # otherwise, default to sampling probabilities based on total movement
-            else: 
+            else:
                 prob = (total_movement + 2) / torch.sum(total_movement + 2)
                 prob = prob.numpy()
-                
+
                 ix_p = np.random.choice(coords.shape[1], size = num_kpts_to_sample,
                                         replace = False, p = prob)
                 coords = coords[:, ix_p]
 
             # sample corresponding visibilities
-            if vis is not None: 
+            if vis is not None:
                 vis = vis[:, ix_p]
                 vis_2d = vis_2d[:, ix_p]
 
@@ -1161,6 +1385,8 @@ class PosetailDataset(Dataset):
 
 
     def sample_keypoints_sphere(self, coords, vis, vis_2d, total_movement, avg_speed):
+        # Legacy 'speed_thresh' 3D crop: keep a log-uniform sphere fraction of points around a
+        # (speed_thresh-biased) center. Used only when sampling_mode == 'speed_thresh'.
         T, N, _ = coords.shape
 
         valid = torch.isfinite(coords).all(dim=-1)   # (T, N)
