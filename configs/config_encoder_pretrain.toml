@@ -29,14 +29,16 @@ prop_dynamic_kpts_to_sample = 0.95
 prob_2d_only = 0.25
 # Speed-targeted 3D crop: solve the crop size so a coherent cluster realizes a target
 # per-track head-speed drawn from crop_3d_fraction = [s_lo, s_hi] (head-speed BAND; keep
-# s_hi == head_3d_grid_radius). Fills the gridresid edge bins, equalized across datasets.
+# s_hi == head_3d_grid_radius). The crop is CONTAINED (>= the cluster's trajectory bbox) so
+# points stay in frame -- lift comes from cluster selection, not an out-of-frame sweep (which
+# is under-constrained for few-view clips and blew up the geometry gradients).
 # Validated in scripts/speed_target_coverage.py.
 sampling_mode = 'speed_target'
 crop_3d_enabled = true
 crop_3d_fraction = [0.5, 1.8]   # target head-speed band (s_hi == head_3d_grid_radius)
 crop_3d_prob = 0.4
-crop_3d_ref_pct = 97.0          # percentile of per-axis residual pinned to s* (low OOG)
-crop_3d_high_bias = 0.5         # bias s* toward the high end (counters the 0->peak ramp)
+crop_3d_ref_pct = 90.0          # percentile of per-axis residual pinned to s* (off the extreme tail)
+crop_3d_high_bias = 1.0         # uniform s* draw (don't slam to the band top)
 # No causal_masking: the encoder's temporal self-attention is bidirectional (TapNext-only).
 
 [dataset.train.curriculum]

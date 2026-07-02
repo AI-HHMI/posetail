@@ -448,9 +448,9 @@ class PosetailDataset(Dataset):
         #         head = raylocal_residual / (cube_scale * crop_size)   (image_size cancels)
         #       -> crop_size* = motion_ref / (cube_scale * s*), motion_ref = a high percentile
         #       (crop_3d_ref_pct) of the cluster's per-axis ray-local residual; the crop is a
-        #       fixed square centered on the cluster (points may sweep out of frame -- still
-        #       supervised -- which is what produces the large head residuals the edge bins
-        #       need). Validated in scripts/speed_target_coverage.py.
+        #       CONTAINED square (>= the cluster's projected trajectory bbox) so points stay in
+        #       frame -- lift comes from cluster selection, not an out-of-frame sweep (which is
+        #       under-constrained for few-view clips). Validated in scripts/speed_target_coverage.py.
         # crop_3d_fraction is interpreted per mode: sphere fraction [f_lo, f_hi] in legacy,
         # target head-speed band [s_lo, s_hi] in speed_target (keep s_hi == grid radius).
         self.sampling_mode = config.dataset[split].get('sampling_mode', 'speed_thresh')
@@ -463,13 +463,14 @@ class PosetailDataset(Dataset):
         self.crop_3d_prob = config.dataset[split].get('crop_3d_prob', self.aug_prob)
         # --- speed_target-only knobs (ignored in legacy mode) ---
         # percentile of the cluster's per-axis ray-local residual set equal to s* (higher =>
-        # only the fastest frames reach s*; ~97 places the target at the head-motion tail
-        # with minimal out-of-grid overflow).
-        self.crop_3d_ref_pct = config.dataset[split].get('crop_3d_ref_pct', 97.0)
+        # only the fastest frames reach s*). 90 keeps the target off the extreme tail so the
+        # contained crop is not driven to a degenerate size.
+        self.crop_3d_ref_pct = config.dataset[split].get('crop_3d_ref_pct', 90.0)
         # bias of the s* draw toward the high end (per-track residuals ramp 0->peak within a
-        # window, so pooled per-axis head is intrinsically bottom-heavy; sampling s* high
-        # counteracts it). s* = s_lo + (s_hi-s_lo) * U**high_bias; <1 => high-emphasis.
-        self.crop_3d_high_bias = config.dataset[split].get('crop_3d_high_bias', 0.5)
+        # window, so pooled per-axis head is intrinsically bottom-heavy). s* = s_lo +
+        # (s_hi-s_lo) * U**high_bias; <1 => high-emphasis, 1.0 => uniform (default: don't slam
+        # s* to the band top, which the containment cap can't always deliver anyway).
+        self.crop_3d_high_bias = config.dataset[split].get('crop_3d_high_bias', 1.0)
         self.crop_3d_n_radii = config.dataset[split].get('crop_3d_n_radii', 6)
         self.crop_3d_max_svd_pts = config.dataset[split].get('crop_3d_max_svd_pts', 512)
         # tightest cluster radius (fraction of the max intra-cluster distance) in the nested
@@ -1064,10 +1065,12 @@ class PosetailDataset(Dataset):
 
     def crop_cgroup_to_points(self, cgroup, coords, target_size=None):
         # When target_size (original px, scalar) is given, the speed-targeted crop takes a
-        # FIXED square of that side centered on the projected-points centroid, NOT enlarged
-        # to the trajectory bbox: fast points sweep toward/out of frame over the window
-        # (still supervised), which is exactly what drives the large head residuals the
-        # gridresid edge bins need. Otherwise the crop bounds the whole trajectory as before.
+        # CONTAINED square: the requested side, but never smaller than the cluster's projected
+        # trajectory bbox in THIS camera, so points stay in frame over the whole window (no
+        # out-of-frame sweep). Head-speed is lifted by cluster selection, not by cropping below
+        # the trajectory -- an out-of-frame point supervised from a few-view clip is exactly the
+        # under-constrained geometry that blew up the gradients. Otherwise the crop bounds the
+        # whole trajectory as before (target_size=None -- legacy 'speed_thresh' path, unchanged).
 
         # compute crops locations
         p2d = project_points_torch(cgroup, coords)
@@ -1081,14 +1084,21 @@ class PosetailDataset(Dataset):
             pflat = pflat[good]
 
             if target_size is not None:
-                # fixed square of side S centered on the point centroid, frame-capped
-                S = min(max(int(self.min_crop_dim), int(target_size)),
-                        int(size[0]), int(size[1]))
+                # Contained square: at least target_size, but never below this camera's
+                # projected trajectory bbox (min/max over the whole window) so nothing sweeps
+                # out of frame; centered on the bbox, frame-capped. pflat already spans all
+                # frames x points, so its extent IS the per-camera trajectory bbox.
                 if pflat.shape[0] > 0:
-                    center = pflat.mean(dim=0)
+                    pmin = torch.min(pflat, dim=0).values
+                    pmax = torch.max(pflat, dim=0).values
+                    traj_side = float((pmax - pmin).max()) + 40.0   # +40 ~ the natural-path pad
+                    bbox_center = (pmin + pmax) / 2
                 else:
-                    center = size.to(torch.float32) / 2
-                low = torch.clamp(center - S / 2,
+                    traj_side = float(self.min_crop_dim)
+                    bbox_center = size.to(torch.float32) / 2
+                S = min(max(int(self.min_crop_dim), int(target_size), int(traj_side)),
+                        int(size[0]), int(size[1]))
+                low = torch.clamp(bbox_center - S / 2,
                                   torch.tensor([0., 0.]),
                                   (size.to(torch.float32) - S).clamp_min(0)).to(torch.int32)
                 high = low + S
@@ -1213,10 +1223,12 @@ class PosetailDataset(Dataset):
         measured on the CLUSTER points (not the full scene) so the resize identity
         cube_cluster*crop == cube_cropped*image_size holds exactly -- i.e. it matches the
         scale the loss will apply. Nested cluster radii (tight->loose) give each cluster an
-        achievable band [lo,hi]=motion_ref/(cube*[frame_px, anchor_bbox_px]); the crop is a
-        fixed square of crop_size centered on the cluster (points may sweep out of frame --
-        that sweep, still supervised, is what produces the large head residuals the edge bins
-        need), applied via crop_cgroup_to_points(target_size=crop_px).
+        achievable band [lo,hi]=motion_ref/(cube*[frame_px, traj_bbox_px]); the crop is a
+        CONTAINED square (>= the cluster's projected trajectory bbox), so points stay in frame
+        over the window -- lift comes from cluster selection, not an out-of-frame sweep (that
+        sweep is under-constrained for few-view clips and blows up the geometry gradients).
+        Applied via crop_cgroup_to_points(target_size=crop_px), which enforces containment
+        per camera.
 
         Returns (coords, vis, vis_2d, crop_px) for the chosen cluster, or None (the caller
         then falls back to the natural crop-to-points path).
@@ -1265,14 +1277,17 @@ class PosetailDataset(Dataset):
             if int(mask.sum()) < min_kpts:
                 continue
             cluster = coords[:, mask]
-            # anchor-frame projected bbox on the solver camera (+ crop pad), frame-capped
-            auv = project_cam(med_cam, kpt_coords[mask])
-            auv = auv[torch.all(torch.isfinite(auv), dim=1)]
-            if auv.shape[0] < 2:
+            # projected trajectory bbox over the WHOLE window on the solver camera (+ crop pad),
+            # frame-capped -- the tight end of the contained crop: the crop is never smaller than
+            # this, so the cluster stays in frame (no out-of-frame sweep). Tighter nested clusters
+            # have a smaller tbox and thus still reach a higher achievable s*.
+            tuv = project_cam(med_cam, cluster.reshape(-1, 3))
+            tuv = tuv[torch.all(torch.isfinite(tuv), dim=1)]
+            if tuv.shape[0] < 2:
                 continue
-            abox = float(max(auv[:, 0].max() - auv[:, 0].min(),
-                             auv[:, 1].max() - auv[:, 1].min())) + 40.0
-            abox = min(max(abox, float(self.min_crop_dim)), frame_px)
+            tbox = float(max(tuv[:, 0].max() - tuv[:, 0].min(),
+                             tuv[:, 1].max() - tuv[:, 1].min())) + 40.0
+            tbox = min(max(tbox, float(self.min_crop_dim)), frame_px)
             # cube on the CLUSTER points (resize-invariant identity holds on the same points)
             cpts = cluster.reshape(-1, 3)
             cpts = cpts[torch.isfinite(cpts).all(dim=1)]
@@ -1290,8 +1305,8 @@ class PosetailDataset(Dataset):
             motion_ref = float(np.percentile(rvals.cpu().numpy(), self.crop_3d_ref_pct))
             if motion_ref <= 0:
                 continue
-            cands.append(dict(mask=mask, abox=abox, motion_ref=motion_ref, cube=cube_c,
-                              hi=motion_ref / (cube_c * abox), lo=motion_ref / (cube_c * frame_px)))
+            cands.append(dict(mask=mask, tbox=tbox, motion_ref=motion_ref, cube=cube_c,
+                              hi=motion_ref / (cube_c * tbox), lo=motion_ref / (cube_c * frame_px)))
         if not cands:
             return None
 
@@ -1310,7 +1325,7 @@ class PosetailDataset(Dataset):
         chosen = (min(bracket, key=lambda c: int(c['mask'].sum())) if bracket
                   else min(cands, key=lambda c: min(abs(c['lo'] - s_star), abs(c['hi'] - s_star))))
         crop_px = float(np.clip(chosen['motion_ref'] / (chosen['cube'] * s_star),
-                                chosen['abox'], frame_px))
+                                chosen['tbox'], frame_px))
 
         mask = chosen['mask']
         coords = coords[:, mask]
