@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from einops import rearrange, repeat, einsum
 from posetail.posetail.cube import get_camera_scale, project_points_torch, is_point_visible
-from posetail.posetail.cube import to_homogeneous, from_homogeneous, signed_log1p
+from posetail.posetail.cube import to_homogeneous, from_homogeneous, signed_log1p, solve_scale_offset
 
 from collections import defaultdict
 
@@ -679,8 +679,38 @@ class TotalLoss(nn.Module):
                     denom = denom * rearrange(feff, 'cams -> cams 1 1 1 1').to(denom.dtype)
                     denom_d = denom_d * rearrange(feff, 'cams -> cams 1 1 1').to(denom_d.dtype)
 
+                # gridnorm gauge. Use the forward's SOLVED (s_c,t_c)/(scale_d,offset_d) for
+                # 3D-input batches; for fake-2D (network sees R==2 but 3D GT is available)
+                # ESTIMATE it here from the raw decoded grid @ query frames <-> the known
+                # ray-local query (the same fixed-rotation solve, detached). This lets the
+                # grid CE run for fake 2D too.
+                gn_s_c = gn_t_c = gn_scale_d = gn_offset_d = None
+                if g.get('is_gridnorm', False):
+                    if g.get('s_c') is not None:
+                        gn_s_c, gn_t_c = g['s_c'], g['t_c']
+                        gn_scale_d, gn_offset_d = g['scale_d'], g['offset_d']
+                    else:
+                        ncam = p_raylocal.shape[0]
+                        qt = g['query_times']                                    # (b,n)
+                        idx3 = repeat(qt, 'b n -> cams b 1 n r', cams=ncam, r=3)  # (cams,b,1,n,3)
+                        g_q = torch.gather(g['g_raw'], 2, idx3)[:, :, 0]         # (cams,b,n,3)
+                        q_k = torch.gather(p_raylocal, 2, idx3)[:, :, 0]         # (cams,b,n,3)
+                        gn_s_c, gn_t_c = solve_scale_offset(g_q, q_k)            # (cams,b),(cams,b,3)
+                        idx1 = repeat(qt, 'b n -> cams b 1 n', cams=ncam)        # (cams,b,1,n)
+                        dg_q = torch.gather(g['depth_g'], 2, idx1)[:, :, 0]       # (cams,b,n)
+                        dk_q = torch.gather(depths_true[..., 0], 2, idx1)[:, :, 0]  # (cams,b,n)
+                        gn_scale_d, _off = solve_scale_offset(dg_q[..., None], dk_q[..., None])
+                        gn_offset_d = _off[..., 0]                               # (cams,b)
+
                 if self.coords_softmax_3d_weight > 0:
-                    if g.get('is_resid', False):
+                    if g.get('is_gridnorm', False):
+                        # gridnorm: the 3D bins are a gauge-free grid mapped to ray-local
+                        # metric by (s_c, t_c) (solved in forward for 3D, estimated above for
+                        # fake 2D). CE target = the GT ray-local position in that gauge.
+                        s_c = rearrange(gn_s_c, 'cams b -> cams b 1 1 1')
+                        t_c = rearrange(gn_t_c, 'cams b r -> cams b 1 1 r')
+                        target_3d = (p_raylocal - t_c) / s_c
+                    elif g.get('is_resid', False):
                         # gridresid: the 3D bins encode the motion offset from the
                         # per-track query anchor, normalized by cube*image_size
                         # (~pixels; NO f_eff -> ortho-safe). Subtract the (detached)
@@ -700,9 +730,16 @@ class TotalLoss(nn.Module):
                         g['logits_3d'], target_3d, lo3d, hi3d, vis_true_cams)
 
                 if self.depth_softmax_weight > 0:
-                    target_logd = torch.log(depths_true[..., 0] / denom_d + 1e-6)  # (cams,b,t,n)
+                    if g.get('is_gridnorm', False):
+                        # gridnorm: linear depth gauge -> target = (metric depth - offset_d)/scale_d
+                        # (solved in forward for 3D, estimated above for fake 2D), linear bins.
+                        scale_d = rearrange(gn_scale_d, 'cams b -> cams b 1 1')
+                        offset_d = rearrange(gn_offset_d, 'cams b -> cams b 1 1')
+                        target_depth = (depths_true[..., 0] - offset_d) / scale_d
+                    else:
+                        target_depth = torch.log(depths_true[..., 0] / denom_d + 1e-6)  # (cams,b,t,n)
                     depth_softmax = self.depth_softmax_weight * grid_softmax_loss(
-                        g['logits_depth'][..., None, :], target_logd[..., None],
+                        g['logits_depth'][..., None, :], target_depth[..., None],
                         g['gd_lo'], g['gd_hi'], vis_true_cams)
 
             if depth_pred is not None:

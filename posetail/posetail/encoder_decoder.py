@@ -802,8 +802,12 @@ class Decoder(nn.Module):
         #   "gridresid" = the grid head emits a motion residual offset (added to the
         #                 per-track query anchor); depth stays the absolute log grid.
         # Both supervise the bins with cross-entropy (losses.py grid_softmax_loss).
-        self.is_grid = output_mode in ('grid', 'gridresid')
+        self.is_grid = output_mode in ('grid', 'gridresid', 'gridnorm')
         self.is_resid = output_mode in ('residual', 'resdirect', 'gridresid')
+        # gridnorm: the grid works in a gauge-free frame; a per-camera (scale, offset)
+        # is solved from the query correspondences downstream (tracker_encoder), so the
+        # decoder emits raw soft-argmax values (no cube_scale/f_eff, linear depth gauge).
+        self.is_gridnorm = output_mode == 'gridnorm'
 
         if self.is_grid:
             G = head_3d_grid_size
@@ -817,15 +821,23 @@ class Decoder(nn.Module):
             else:
                 grid_1d = torch.linspace(-head_3d_grid_radius, head_3d_grid_radius, G)
             self.register_buffer("grid_1d", grid_1d)
-            # Depth grid is ALWAYS linear-in-log over [depth_log_min, depth_log_max]
-            # (its own representation; never touched by log_3d_output).
-            self.register_buffer("depth_grid", torch.linspace(depth_log_min, depth_log_max, G))
+            if self.is_gridnorm:
+                # gridnorm: LINEAR depth gauge over the same fixed box as the 3D grid; a
+                # per-camera affine (scale_d, offset_d) solved from query depths maps it to
+                # metric downstream (no exp/log, no cube_scale/f_eff).
+                self.register_buffer("depth_grid",
+                                     torch.linspace(-head_3d_grid_radius, head_3d_grid_radius, G))
+                self.gd_lo, self.gd_hi = -head_3d_grid_radius, head_3d_grid_radius
+            else:
+                # Depth grid is linear-in-log over [depth_log_min, depth_log_max]
+                # (its own representation; never touched by log_3d_output).
+                self.register_buffer("depth_grid", torch.linspace(depth_log_min, depth_log_max, G))
+                self.gd_lo, self.gd_hi = depth_log_min, depth_log_max
             # 2D pixel bin centres at i+0.5 to match coordinate_softmax_loss's
             # round(target-0.5) quantization (losses.py:25-30).
             P = image_size
             self.register_buffer("pix_grid", torch.arange(P, dtype=torch.float32) + 0.5)
             self.g3d_lo, self.g3d_hi = -head_3d_grid_radius, head_3d_grid_radius
-            self.gd_lo, self.gd_hi = depth_log_min, depth_log_max
 
         if self.use_camera_self_attention:
             self.camera_attns = nn.ModuleList([
@@ -1103,9 +1115,11 @@ class Decoder(nn.Module):
                     out_3d = (p3d * self.grid_1d.to(p3d.dtype)).sum(-1)    # (..., 3) head-space decode (default)
 
             logits_depth = self.heads_depth[m](x)                          # (..., G)
-            # decode log-depth then exp -> normalized depth (>0); tracker_encoder
-            # multiplies by cube_scale [* f_eff] and must NOT softplus this.
-            out_depth = torch.exp(self._grid_decode(logits_depth, self.depth_grid))[..., None]
+            # grid/gridresid: decode log-depth then exp -> normalized depth (>0);
+            # tracker_encoder multiplies by cube_scale [* f_eff] and must NOT softplus this.
+            # gridnorm: decode a LINEAR gauge value (affine-solved to metric downstream).
+            _depth_dec = self._grid_decode(logits_depth, self.depth_grid)
+            out_depth = (_depth_dec if self.is_gridnorm else torch.exp(_depth_dec))[..., None]
 
             raw_2d = self.heads_2d[m](x)                                    # (..., 2P) [x|y]
             logits_2d_da = rearrange(raw_2d, '... (a p) -> ... a p', a=2, p=self.image_size)

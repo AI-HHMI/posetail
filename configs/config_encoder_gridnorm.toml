@@ -1,0 +1,220 @@
+[wandb]
+project_name = 'posetail-finetuning-v3'
+path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3'
+mode = 'online' # 'online', 'offline', 'disabled'
+
+[dataset]
+# batch_size=1 REQUIRED for mixed 2D+3D (2D loss assumes B=cams=1). Multi-GPU: --strategy ddp.
+batch_size = 1
+num_workers = 12
+prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3'
+# prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v3'
+
+[dataset.train]
+split_dir = 'train'
+n_frames = 16
+min_res = 256
+max_res = 256
+cams_to_sample = [1, 8]
+kpts_to_sample = [128, 128]
+aug_prob = 0.25
+enable_kpt_filtering = false
+cam_thresh_for_vis = 1
+balance_datasets = true
+n_samples_per_dataset = -1
+crop_to_points = true
+speed_thresh = 3.0
+query_anytime = true
+query_edge_bias = 200.0
+prop_dynamic_kpts_to_sample = 0.95
+# gridnorm's solve runs only in 3D (needs 3D query targets); 2D batches skip the solve
+# and emit the raw grid output (no forward normalization — the 2D loss normalizes by mean
+# depth, as for the other modes). Both are supported.
+prob_2d_only = 0.25
+crop_3d_enabled = true
+crop_3d_fraction = [0.05, 0.75]
+crop_3d_prob = 0.4
+# No causal_masking: the encoder's temporal self-attention is bidirectional (TapNext-only).
+
+[dataset.train.dataset_weights]
+kubric-multiview = 3.0
+
+[dataset.train.curriculum]
+enabled = false
+ramp_start_frac = 0.0
+ramp_end_frac   = 0.4
+intensity_floor = 0.0
+
+[dataset.val]
+split_dir = 'val'
+n_frames = 16
+max_res = 256
+cams_to_sample = 5
+kpts_to_sample = 128
+aug_prob = 0.0
+crop_to_points = true
+speed_thresh = 1.0
+prop_dynamic_kpts_to_sample = 0.7
+query_anytime = false
+
+[dataset.test]
+split_dir = 'test'
+max_res = 256
+n_frames = 16
+project_2d = false
+aug_prob = 0.0
+
+[devices]
+device = 'cuda'
+
+
+[model]
+mode_3d = "encoder"
+
+video_encoder_version = 'large'
+# VJEPA backbone frozen for all of pretraining; finetuning unlocks the whole encoder.
+video_encoder_requires_grad = true
+video_encoder_hierarchical = true
+
+# Inert while the encoder is frozen.
+video_encoder_finetune_last_n_layers = 12
+
+soft_argmax_temperature_learnable = true
+
+# processing
+stride_length = 16
+stride_overlap = 4
+unroll_windows = false
+image_size = 256
+query_patch_size = 9
+per_camera_cube_scale = true
+
+# query encoder
+max_freq = 10
+embedding_dim = 256
+use_volume_embedding = false
+corr_radius = 2
+principal_point_embedding = true
+intrinsic_embedding = true
+metric_ray_translation = true
+
+# decoder
+latent_dim = 512
+n_heads = 8
+n_time_space_blocks = 6
+embedding_factor = 4
+use_camera_self_attention = true
+use_temporal_self_attention = true
+# gridnorm is self-calibrating (solves its own per-camera scale/offset) -> f_eff unused.
+f_eff_scale = false
+# Projecting encoder features to the decoder dim trains notably better than false.
+scene_encoder_proj = true
+
+cross_attn_dim = 512
+
+scene_proj_dim = 512
+scene_proj_prenorm = false
+scene_proj_mlp = false
+
+
+# "gridnorm" = gauge-free per-axis soft-argmax bin grid. The 3D grid and the (linear) depth
+# grid each carry an arbitrary scale/offset that is SOLVED per-camera from the query points
+# (replacing cube_scale/query_local and cube_scale*f_eff respectively) -> self-calibrating,
+# ortho-safe, no coverage parameter. log_3d_output=false (linear 3D grid + linear depth grid).
+output_mode = "gridnorm"
+head_3d_grid_size = 1024
+head_3d_grid_radius = 2.0          # fixed gauge box (the network self-scales into it); not tuned
+log_3d_output = false              # linear 3D grid; the depth grid is linear too (see Decoder)
+log_3d_eps = 0.1                   # unused when log_3d_output=false
+soft_argmax_threshold = 60         # re-derive in gauge units if needed (gridresid value borrowed)
+grid_decode_space = "head"         # (decode-space knob is a no-op without log_3d_output)
+enable_subpixel_refinement = false
+
+# gridresid with subpixel refinement
+# output_mode = "gridresid"
+# head_3d_grid_size = 512
+# head_3d_grid_radius = 1.8
+# log_3d_output = true
+# log_3d_eps = 0.1
+# enable_subpixel_refinement = true
+# subpixel_scale = 0.6
+
+
+# Depth log-grid range = log(depth/(cube*f_eff)); covers every dataset's reach with margin.
+depth_log_min = -2.5
+depth_log_max = 2.5
+
+
+[training]
+seed = 27
+
+finetune = true
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260630_195317-pi2fpadz/files/checkpoints/checkpoint_00799996.pth'
+
+n_iterations = 8000000
+scheduler_type = 'muon'
+max_grad_norm = 10.0
+checkpoint_freq = 10240 # in iterations
+eval_metric_freq = 24 # in iterations
+val_freq = 48 # in iterations
+print_freq = 96 # in iterations
+debug_ix = -1 # only works for val
+
+[training.optimizer]
+# Decoder trains from scratch on the frozen backbone -> 5e-4 base LR (6i8ryveg). encoder_lr_scale
+# moot (encoder frozen).
+learning_rate = 9e-5
+muon_schedulefree = true
+weight_decay = 0.002
+warmup_steps = 2000
+muon_warmup_steps = 2000
+beta1 = 0.9
+beta2 = 0.95
+
+encoder_lr_scale = 0.2
+
+[training.scheduler]
+
+[training.losses]
+gamma = 0.8
+pixel_thresh = 3
+delta = 6
+use_huber_loss = true
+
+# weights for calculating total loss (use 0 to not compute a specific loss)
+vis_loss_weight = 5.0
+vis_loss_3d_weight = 1.0
+conf_loss_weight = 0.0
+conf_2d_loss_weight = 0.0
+
+occluded_coords_loss_weight = 0.1
+feature_loss_weight = 0.0
+
+# Reweight. gridnorm: coords_loss_direct pins the 3D solve, coords_loss_rays pins the depth
+# solve (metric-through-solve terms that stop CE's gauge from collapsing) -> both must be > 0.
+coords_loss_weight = 0.1
+coords_loss_direct_weight = 0.1
+coords_loss_rays_weight = 0.1
+coords_loss_triangulate_weight = 0.0
+coords_loss_2d_weight = 1.5
+coords_loss_depth_weight = 0.5
+
+# reproj weights
+coords_loss_direct_reproj_weight = 1.0
+coords_loss_rays_reproj_weight = 0.05
+coords_loss_triangulate_reproj_weight = 1.0
+
+# Position-bin CE raised back to a meaningful auxiliary. depth highest: the one CE term that
+# actually descends.
+coords_softmax_2d_weight = 0.6
+coords_softmax_3d_weight = 0.4
+depth_softmax_weight = 1.5
+
+# Rescale of the multi-cam 3D loss branch; lowered 500->150 to revive direct 3D regression
+# there. If 2d_loss/mte degrade early the branch is too hot, raise back up.
+coords_3d_loss_scale = 50.0
+
+smoothness_loss_3d_weight = 0.5
+smoothness_loss_2d_weight = 0.5
+smoothness_loss_order = 4
+smoothness_loss_tolerance = 1.5
