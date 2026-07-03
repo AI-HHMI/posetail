@@ -1,6 +1,6 @@
 [wandb]
-project_name = 'posetail-finetuning-v3'
-path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3'
+project_name = 'posetail-pretraining-v3'
+path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3'
 mode = 'online' # 'online', 'offline', 'disabled'
 
 [dataset]
@@ -36,8 +36,8 @@ crop_3d_fraction = [0.05, 0.75]
 crop_3d_prob = 0.4
 # No causal_masking: the encoder's temporal self-attention is bidirectional (TapNext-only).
 
-[dataset.train.dataset_weights]
-kubric-multiview = 3.0
+# [dataset.train.dataset_weights]
+# kubric-multiview = 3.0
 
 [dataset.train.curriculum]
 enabled = false
@@ -73,7 +73,7 @@ mode_3d = "encoder"
 
 video_encoder_version = 'large'
 # VJEPA backbone frozen for all of pretraining; finetuning unlocks the whole encoder.
-video_encoder_requires_grad = true
+video_encoder_requires_grad = false
 video_encoder_hierarchical = true
 
 # Inert while the encoder is frozen.
@@ -147,10 +147,6 @@ depth_log_max = 2.5
 
 [training]
 seed = 27
-
-finetune = true
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260630_195317-pi2fpadz/files/checkpoints/checkpoint_00799996.pth'
-
 n_iterations = 8000000
 scheduler_type = 'muon'
 max_grad_norm = 10.0
@@ -163,15 +159,15 @@ debug_ix = -1 # only works for val
 [training.optimizer]
 # Decoder trains from scratch on the frozen backbone -> 5e-4 base LR (6i8ryveg). encoder_lr_scale
 # moot (encoder frozen).
-learning_rate = 9e-5
+learning_rate = 5e-4
 muon_schedulefree = true
-weight_decay = 0.002
+weight_decay = 0.001
 warmup_steps = 2000
 muon_warmup_steps = 2000
 beta1 = 0.9
 beta2 = 0.95
 
-encoder_lr_scale = 0.2
+encoder_lr_scale = 1.0 # not used
 
 [training.scheduler]
 
@@ -194,7 +190,7 @@ feature_loss_weight = 0.0
 # solve (metric-through-solve terms that stop CE's gauge from collapsing) -> both must be > 0.
 coords_loss_weight = 0.1
 coords_loss_direct_weight = 0.1
-coords_loss_rays_weight = 0.1
+coords_loss_rays_weight = 0.0
 coords_loss_triangulate_weight = 0.0
 coords_loss_2d_weight = 1.5
 coords_loss_depth_weight = 0.5
