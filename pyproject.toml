@@ -80,6 +80,7 @@ dev = {features = ["dev"], solve-group = "default"}
 python = "3.11.*"
 cuda-toolkit = "12.8.*"
 numpy = "==1.26"
+scipy = "<1.17"
 setuptools = "<81"
 pip = "*"
 
