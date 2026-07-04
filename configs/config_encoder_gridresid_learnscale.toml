@@ -108,6 +108,9 @@ scene_proj_dim = 512
 scene_proj_prenorm = false
 scene_proj_mlp = false
 
+learnable_scale = true
+learnable_scale_depth = true
+
 
 # "gridresid" = per-axis soft-argmax bin grid (CE-supervised): 3D head emits a motion residual
 # from a query anchor, depth is a log grid, plus a 2D pixel-bin position head.
@@ -136,19 +139,6 @@ enable_subpixel_refinement = false
 # Depth log-grid range = log(depth/(cube*f_eff)); covers every dataset's reach with margin.
 depth_log_min = -2.5
 depth_log_max = 2.5
-
-# learnable_scale: decode a bounded per-track scale from the latent and multiply the
-# (residual) 3D output [and depth] by it -- an adaptive, per-scene correction on the base
-# cube_scale normalization (movement capacity + a self-known scale). Init 1.0 (no-op) so
-# training starts identical to plain gridresid; s = scale_init * exp(clamp(head, ±scale_delta))
-# stays strictly positive (floor scale_init*e^-delta). The grid CE target is divided by the
-# DETACHED scale, so CE shapes the normalized grid while the metric regression loss learns the
-# scale (identifiable -> no product collapse). scale_init MUST be > 0.
-learnable_scale = true
-learnable_scale_depth = true
-scale_init = 1.0
-scale_delta = 2.0
-
 
 [training]
 seed = 3
