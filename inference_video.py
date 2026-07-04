@@ -622,13 +622,118 @@ def resolve_video_paths(video_paths):
     return video_paths
 
 
-def load_trial(trial_path, start_frame=0):
+def run_query_first_on_videos(model, video_paths, camera_group, query_points_3d, query_times,
+                              start_frame=0, n_frames=128, max_kpts=None, device=None,
+                              pred_key_3d='coords_pred'):
+    """Single-forward tracking with per-point query times (mvtracker query_first).
+
+    Unlike run_tracker_encoder_on_videos (which anchors all points at the chunk start and
+    re-anchors across chunks), this feeds the whole clip in one forward and lets the model's
+    internal windowing + latent carry handle each point's introduction at its query frame
+    (TrackerEncoder._forward_windows already masks frames before a track's query time). 3D-only.
+    """
+    R = query_points_3d.shape[-1]
+    if R == 2:
+        raise ValueError('run_query_first_on_videos is 3D-only')
+    n_kpts = query_points_3d.shape[0]
+
+    # keypoint chunking for memory (each chunk keeps its own query_times)
+    if max_kpts is not None and n_kpts > max_kpts:
+        outs = []
+        for s in range(0, n_kpts, max_kpts):
+            e = min(s + max_kpts, n_kpts)
+            print(f'  keypoint chunk {s}:{e} of {n_kpts}')
+            outs.append(run_query_first_on_videos(
+                model, video_paths, camera_group, query_points_3d[s:e], query_times[s:e],
+                start_frame, n_frames, None, device, pred_key_3d))
+        return {
+            'coords_pred':   torch.cat([o['coords_pred'] for o in outs], dim=2),
+            'vis_pred':      torch.cat([o['vis_pred'] for o in outs], dim=2),
+            'conf_pred':     torch.cat([o['conf_pred'] for o in outs], dim=2),
+            'frame_numbers': outs[0]['frame_numbers'],
+            'crop_history':  outs[0]['crop_history'],
+        }
+
+    if device is None:
+        device = next(model.parameters()).device
+    model = model.to(device).eval()
+    camera_group = camera_group_to_device(camera_group, device)
+    readers, reader_lengths = build_video_readers(video_paths)
+    max_available = min(reader_lengths)
+    end_frame = min(start_frame + n_frames, max_available)
+    T = end_frame - start_frame
+
+    q = query_points_3d.to(device=device, dtype=torch.float32).unsqueeze(0)          # (1,N,3)
+    qt = query_times.to(device=device, dtype=torch.int32).clamp_(max=max(T - 1, 0)).unsqueeze(0)
+
+    with torch.no_grad():
+        camera_group_chunk, crop_boxes = crop_camera_group_to_queries(
+            camera_group=camera_group, query_coords=q,
+            min_crop_dim=model.image_size, padding=20, is_2d=False)
+        camera_group_chunk = resize_camera_group(camera_group_chunk, model.image_size)
+        target_sizes = [tuple(cam['size'].tolist()) for cam in camera_group_chunk]
+
+        views, actual = load_multiview_clip(
+            readers, start_frame, T, crop_boxes=crop_boxes, target_sizes=target_sizes)
+        if actual < model.n_frames:                     # model needs >= n_frames; pad with last
+            for i in range(len(views)):
+                pad = views[i][-1:].expand(model.n_frames - actual, -1, -1, -1)
+                views[i] = torch.cat([views[i], pad], dim=0)
+        views = [v.unsqueeze(0).to(device=device, dtype=torch.float32) / 255.0 for v in views]
+
+        outputs = model(views=views, coords=q, query_times=qt,
+                        camera_group=camera_group_chunk, init_latent=None)
+        coords_pred = outputs[pred_key_3d][:, :T]
+        vis_pred = outputs['vis_pred'][:, :T]
+        conf_pred = outputs['conf_pred'][:, :T]
+
+    del readers
+    Tret = coords_pred.shape[1]
+    return {
+        'coords_pred':   coords_pred.cpu(),
+        'vis_pred':      vis_pred.cpu(),
+        'conf_pred':     conf_pred.cpu(),
+        'frame_numbers': torch.arange(start_frame, start_frame + Tret, dtype=torch.int64),
+        'crop_history':  [{'start_frame': start_frame, 'n_frames': Tret, 'crop_boxes': crop_boxes}],
+    }
+
+
+def compute_query_first(coords, vis_gt, start_frame, n_frames):
+    """mvtracker/training 'query_first': anchor each point at its FIRST valid frame.
+
+    A frame is valid for a point when its coord is finite AND (if vis available) the point
+    is visible in >=1 camera. Returns per-point:
+      query_time (N,) int  -- index within [start_frame, start_frame+n_frames) of the first
+                              valid frame (0 for points that are never valid; they are dropped
+                              via `valid`),
+      query_coord (N, R)   -- the coordinate at that frame,
+      valid (N,) bool      -- point has at least one valid frame in the window.
+
+    coords: (T_full, N, R) for one subject. vis_gt: (T_full, N, cams) or None.
+    """
+    T_full = coords.shape[0]
+    hi = T_full if n_frames is None else min(T_full, start_frame + n_frames)
+    sl = slice(start_frame, hi)
+    c = coords[sl]                                       # (T, N, R)
+    good = np.all(np.isfinite(c), axis=-1)              # (T, N)
+    if vis_gt is not None:
+        good = good & vis_gt[sl].any(axis=-1)
+    valid = good.any(axis=0)                            # (N,)
+    query_time = np.argmax(good, axis=0).astype(np.int32)   # first True frame (0 if none)
+    query_coord = c[query_time, np.arange(c.shape[1])]      # (N, R)
+    return query_time, query_coord, valid
+
+
+def load_trial(trial_path, start_frame=0, n_frames=None, query_first=True):
     """Load metadata, video/image paths, and query points from a trial directory,
     following the PosetailDataset convention.
 
     Detects 2D vs 3D from which pose file is present: pose3d.npz -> 3D (multi-view,
     metadata.yaml required), pose2d.npz -> 2D (single camera, metadata optional).
     Query points have last dim 3 (3D world coords) or 2 (2D pixel coords) accordingly.
+
+    query_first (3D only): anchor each point at its first valid+visible frame (mvtracker /
+    training convention) instead of all points at start_frame. Returns per-point query_times.
     """
 
     pose3d_path = os.path.join(trial_path, 'pose3d.npz')
@@ -695,29 +800,38 @@ def load_trial(trial_path, start_frame=0):
     n_subjects = coords.shape[0]
     n_kpts = coords.shape[2]
 
-    coords_at_start = coords[:, start_frame, :, :]  # (subjects, n_kpts, R)
+    # query_first is 3D-only (needs vis to define first-visible frame); 2D falls back.
+    use_query_first = query_first and mode == '3d'
 
     per_subject_queries = []
     per_subject_valid_masks = []
+    per_subject_query_times = []
     for s in range(n_subjects):
-        subject_coords = coords_at_start[s]
-        valid = np.all(np.isfinite(subject_coords), axis=1)
+        if use_query_first:
+            qt_s, qc_s, valid = compute_query_first(
+                coords[s], vis_gt[s] if vis_gt is not None else None, start_frame, n_frames)
+        else:
+            qc_s = coords[:, start_frame, :, :][s]              # (n_kpts, R)
+            valid = np.all(np.isfinite(qc_s), axis=1)
+            qt_s = np.zeros(qc_s.shape[0], dtype=np.int32)
         per_subject_valid_masks.append(valid)
-        per_subject_queries.append(
-            torch.as_tensor(subject_coords[valid], dtype=torch.float32)
-        )
+        per_subject_queries.append(torch.as_tensor(qc_s[valid], dtype=torch.float32))
+        per_subject_query_times.append(torch.as_tensor(qt_s[valid], dtype=torch.int32))
 
-    coords_flat = coords_at_start.reshape(-1, R)
-    valid_flat = np.all(np.isfinite(coords_flat), axis=1)
-    coords_flat = coords_flat[valid_flat]
+    # flat (all subjects concatenated, s-major then kpt) — matches GT-extraction ordering
+    query_points = torch.cat(per_subject_queries, dim=0) if per_subject_queries \
+        else torch.empty((0, R))
+    query_times_flat = torch.cat(per_subject_query_times, dim=0) if per_subject_query_times \
+        else torch.empty((0,), dtype=torch.int32)
+    valid_flat = np.concatenate(per_subject_valid_masks) if per_subject_valid_masks \
+        else np.zeros(0, dtype=bool)
 
-    if coords_flat.shape[0] == 0:
-        raise ValueError(f'No valid (non-NaN) query points at frame {start_frame}')
-
-    query_points = torch.as_tensor(coords_flat, dtype=torch.float32)
+    if query_points.shape[0] == 0:
+        raise ValueError(f'No valid query points in trial {trial_path}')
 
     return (mode, metadata_path, cam_names, video_paths, query_points, per_subject_queries,
-            coords, vis_gt, valid_flat, per_subject_valid_masks)
+            coords, vis_gt, valid_flat, per_subject_valid_masks,
+            query_times_flat, per_subject_query_times)
 
 
 def parse_args():
@@ -736,6 +850,9 @@ def parse_args():
     parser.add_argument('--max-kpts', type=int, default=None, help='Max keypoints per model forward pass.')
     parser.add_argument('--per-subject', action='store_true', default=False,
                         help='Track each subject independently instead of concatenating all keypoints')
+    parser.add_argument('--no-query-first', dest='query_first', action='store_false', default=True,
+                        help='disable query-first (default ON): with this flag all points are '
+                             'anchored at start_frame instead of their first valid+visible frame')
     parser.add_argument('--checkpoint', type=int, default=None,
                         help='Optional checkpoint step number; if omitted, use latest checkpoint')
     parser.add_argument('--device', type=str, default=None)
@@ -770,19 +887,25 @@ def run_inference(
     outpath=None,
     pred_key_3d='coords_pred',
     clip_len=None,
+    query_first=True,
 ):
     """Run inference on one trial with an already-loaded model.
 
     Factored out of main() so a caller (e.g. a batch driver) can load the model
     once and reuse it across many trials. If outpath is given the outputs are
     saved as .npz; the outputs dict is always returned.
+
+    query_first (3D only): anchor each point at its first valid+visible frame (mvtracker /
+    training convention), via a single full-clip forward, instead of all points at start_frame.
     """
     if device is None:
         device = next(model.parameters()).device
 
     (mode, metadata_path, cam_names, video_paths, query_points_3d, per_subject_queries,
-    coords_gt, vis_gt_raw, valid_flat, per_subject_valid_masks) = load_trial(
-            trial_path, start_frame=start_frame)
+    coords_gt, vis_gt_raw, valid_flat, per_subject_valid_masks,
+    query_times_flat, per_subject_query_times) = load_trial(
+            trial_path, start_frame=start_frame, n_frames=n_frames, query_first=query_first)
+    use_query_first = query_first and mode == '3d'
 
     R = coords_gt.shape[-1]
 
@@ -818,19 +941,26 @@ def run_inference(
                 print(f'Skipping subject {subj_idx}: no valid query points')
                 continue
             print(f'Tracking subject {subj_idx} ({subj_queries.shape[0]} keypoints)')
-            subj_out = run_tracker_encoder_on_videos(
-                model=model,
-                video_paths=video_paths,
-                camera_group=camera_group,
-                query_points_3d=subj_queries,
-                start_frame=start_frame,
-                n_frames=n_frames,
-                n_overlap=n_overlap,
-                max_kpts=max_kpts,
-                device=device,
-                pred_key_3d=pred_key_3d,
-                clip_len=clip_len,
-            )
+            if use_query_first:
+                subj_out = run_query_first_on_videos(
+                    model=model, video_paths=video_paths, camera_group=camera_group,
+                    query_points_3d=subj_queries, query_times=per_subject_query_times[subj_idx],
+                    start_frame=start_frame, n_frames=n_frames, max_kpts=max_kpts,
+                    device=device, pred_key_3d=pred_key_3d)
+            else:
+                subj_out = run_tracker_encoder_on_videos(
+                    model=model,
+                    video_paths=video_paths,
+                    camera_group=camera_group,
+                    query_points_3d=subj_queries,
+                    start_frame=start_frame,
+                    n_frames=n_frames,
+                    n_overlap=n_overlap,
+                    max_kpts=max_kpts,
+                    device=device,
+                    pred_key_3d=pred_key_3d,
+                    clip_len=clip_len,
+                )
             subj_out['subject_idx'] = subj_idx
             all_subject_outputs.append(subj_out)
 
@@ -871,6 +1001,12 @@ def run_inference(
             subject_indices = [so['subject_idx'] for so in all_subject_outputs]
             outputs['subject_kpt_counts'] = np.array(subject_kpt_counts, dtype=np.int32)
             outputs['subject_indices'] = np.array(subject_indices, dtype=np.int32)
+    elif use_query_first:
+        outputs = run_query_first_on_videos(
+            model=model, video_paths=video_paths, camera_group=camera_group,
+            query_points_3d=query_points_3d, query_times=query_times_flat,
+            start_frame=start_frame, n_frames=n_frames, max_kpts=max_kpts,
+            device=device, pred_key_3d=pred_key_3d)
     else:
         outputs = run_tracker_encoder_on_videos(
             model=model,
@@ -930,6 +1066,15 @@ def run_inference(
             vis_true = vis_flat_all[:, frame_nums_gt].T[:, :, np.newaxis][np.newaxis]  # (1, T, K_valid, 1)
         else:
             vis_true = np.all(np.isfinite(coords_true), axis=-1, keepdims=True)
+
+    # per-point query times, in the same keypoint order as coords_pred/coords_true
+    if per_subject and 'subject_indices' in outputs:
+        qt_parts = [np.asarray(per_subject_query_times[s]) for s in outputs['subject_indices']]
+        query_times_out = np.concatenate(qt_parts) if qt_parts else np.zeros(0, dtype=np.int32)
+    else:
+        query_times_out = np.asarray(query_times_flat)
+    outputs['query_times'] = query_times_out.astype(np.int32)   # (K,)
+    outputs['query_first'] = bool(use_query_first)
 
     outputs['coords_true'] = coords_true   # (1, T, K, 3)
     outputs['vis_true'] = vis_true      # (1, T, K, 1)
@@ -1010,6 +1155,7 @@ def main():
         outpath=args.outpath,
         pred_key_3d=args.pred_key_3d,
         clip_len=args.clip_len,
+        query_first=args.query_first,
     )
 
 
