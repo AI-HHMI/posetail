@@ -193,8 +193,8 @@ class ScorerEncoder(TrackerEncoder):
 
         mode_idx = torch.tensor([1 if R == 3 else 0], dtype=torch.long, device=device)
 
-        # third decoder return is the per-point latent [b, t, k, cams, dim]
-        latents = self.decoder(scene_features, query_embeds, query_rays, mode_idx)[2]
+        # decoder returns a dict; the per-point latent is [b, t, k, cams, dim]
+        latents = self.decoder(scene_features, query_embeds, query_rays, mode_idx)['latent']
 
         # Pool only observed (t, cams) slots per point: mask missing slots so missingness does
         # not shift the score (missing points are orthogonal to track quality). [b,k,t,cams],

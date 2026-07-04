@@ -719,6 +719,11 @@ class TotalLoss(nn.Module):
                         target_3d = (p_raylocal - g['anchor_local']) / denom_resid
                     else:
                         target_3d = p_raylocal / denom                # absolute: / cube*f_eff
+                    if g.get('learnable_scale', False) and g.get('s3d') is not None:
+                        # forward multiplied the (residual) 3D output by the decoded per-track
+                        # scale s3d; divide the CE target by it (DETACHED) so CE only shapes the
+                        # normalized grid, while the metric regression loss learns s3d.
+                        target_3d = target_3d / g['s3d'][..., None].clamp_min(1e-6)
                     lo3d, hi3d = g['g3d_lo'], g['g3d_hi']
                     if g.get('log_warp', False):
                         # quantize in the same signed-log space the warped bin
@@ -737,7 +742,12 @@ class TotalLoss(nn.Module):
                         offset_d = rearrange(gn_offset_d, 'cams b -> cams b 1 1')
                         target_depth = (depths_true[..., 0] - offset_d) / scale_d
                     else:
-                        target_depth = torch.log(depths_true[..., 0] / denom_d + 1e-6)  # (cams,b,t,n)
+                        denom_d_eff = denom_d
+                        if g.get('sdep') is not None:
+                            # decoded depth scale multiplied the forward depth; fold it into the
+                            # normalizer (detached) so the log-depth CE target matches.
+                            denom_d_eff = denom_d * g['sdep'].clamp_min(1e-6)
+                        target_depth = torch.log(depths_true[..., 0] / denom_d_eff + 1e-6)  # (cams,b,t,n)
                     depth_softmax = self.depth_softmax_weight * grid_softmax_loss(
                         g['logits_depth'][..., None, :], target_depth[..., None],
                         g['gd_lo'], g['gd_hi'], vis_true_cams)

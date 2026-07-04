@@ -58,7 +58,11 @@ class TrackerEncoder(nn.Module):
                  enable_subpixel_refinement = False,
                  subpixel_scale = 0.05,
                  subpixel_temperature = 10.0,
-                 grid_decode_space = 'head'):
+                 grid_decode_space = 'head',
+                 learnable_scale = False,
+                 learnable_scale_depth = False,
+                 scale_init = 1.0,
+                 scale_delta = 2.0):
         super().__init__()
 
         self.mode_3d = mode_3d
@@ -136,7 +140,15 @@ class TrackerEncoder(nn.Module):
         # the depth head is a linear gauge with its own solved affine (scale_d, offset_d).
         self.is_grid = output_mode in ('grid', 'gridresid', 'gridnorm')
         self.is_gridnorm = output_mode == 'gridnorm'
-        
+
+        # learnable_scale: decode a bounded per-track scale from the latent and multiply the
+        # (residual) 3D output [and depth] by it — a cross-mode, adaptive correction on the
+        # base scale. Redundant with gridnorm (which SOLVES the gauge), so disallow the combo.
+        self.learnable_scale = bool(learnable_scale)
+        self.learnable_scale_depth = bool(learnable_scale_depth)
+        assert not (self.is_gridnorm and (self.learnable_scale or self.learnable_scale_depth)), \
+            'learnable_scale is redundant with gridnorm (it already solves the per-camera gauge)'
+
         # self.transform_norm = transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)
         self.transform_norm = transforms.Compose([
             PadToSize(self.image_size),
@@ -192,6 +204,10 @@ class TrackerEncoder(nn.Module):
             subpixel_scale=subpixel_scale,
             subpixel_temperature=subpixel_temperature,
             grid_decode_space=grid_decode_space,
+            learnable_scale=learnable_scale,
+            learnable_scale_depth=learnable_scale_depth,
+            scale_init=scale_init,
+            scale_delta=scale_delta,
         )
 
     def unfreeze_video_encoder(self, iteration):
@@ -552,13 +568,35 @@ class TrackerEncoder(nn.Module):
         query_rays = rearrange(query_rays_flat, 'cams b (t n) d e -> b t n cams d e', t=T, n=N)
 
         mode_idx = torch.tensor([1 if R == 3 else 0], dtype=torch.long, device=query_embeds.device)
-        outputs, grid_logits, latent = self.decoder(
+        dec = self.decoder(
             scene_features, query_embeds, query_rays, mode_idx, prev_latent=prev_latent)
-        outputs = rearrange(outputs, 'b t n cams outdim -> cams b t n outdim')
+        grid_logits = dec['grid_logits']
+        latent = dec['latent']
 
-        points_3d_raw, points_pred, vis_pred_2d_logits, conf_pred_2d_logits, depth_pred, conf_3d_logits = torch.split(
-            outputs, [3, 2, 1, 1, 1, 1], dim=-1
-        )
+        def _to_cams(t):
+            return rearrange(t, 'b t n cams d -> cams b t n d')
+
+        points_3d_raw       = _to_cams(dec['out_3d'])         # (cams,b,t,n,3)
+        points_pred         = _to_cams(dec['out_2d'])         # (cams,b,t,n,2)
+        vis_pred_2d_logits  = _to_cams(dec['out_vis'])        # (cams,b,t,n,1)
+        conf_pred_2d_logits = _to_cams(dec['out_conf'])       # (cams,b,t,n,1)
+        depth_pred          = _to_cams(dec['out_depth'])      # (cams,b,t,n,1)
+        conf_3d_logits      = _to_cams(dec['out_conf_3d'])    # (cams,b,t,n,1)
+
+        # Decoded per-token scales -> per-TRACK (gather at each track's query frame),
+        # broadcast over time; matches the anchored residual (one scale per track). None
+        # unless learnable_scale[_depth]. Detached copies for the CE target go in grid dict.
+        s3d = s3d_track = sdep = sdep_track = None
+        if 'scale_3d' in dec:
+            s3d_raw = _to_cams(dec['scale_3d'])[..., 0]       # (cams,b,t,n)
+            tq_s = repeat(query_times, 'b n -> cams b 1 n', cams=n_cams)
+            s3d_track = torch.gather(s3d_raw, 2, tq_s)[:, :, 0]           # (cams,b,n)
+            s3d = s3d_track[:, :, None, :].expand(-1, -1, T, -1)         # (cams,b,t,n)
+        if 'scale_depth' in dec:
+            sdep_raw = _to_cams(dec['scale_depth'])[..., 0]   # (cams,b,t,n)
+            tq_s = repeat(query_times, 'b n -> cams b 1 n', cams=n_cams)
+            sdep_track = torch.gather(sdep_raw, 2, tq_s)[:, :, 0]         # (cams,b,n)
+            sdep = sdep_track[:, :, None, :].expand(-1, -1, T, -1)       # (cams,b,t,n)
 
 
         vis_pred_2d = F.sigmoid(vis_pred_2d_logits)
@@ -603,6 +641,9 @@ class TrackerEncoder(nn.Module):
             if self.f_eff_scale:
                 # depth is absolute in every output mode -> always f_eff-scaled
                 depth_pred_scaled = depth_pred_scaled * rearrange(f_eff, 'cams -> cams 1 1 1').to(depth_pred_scaled.dtype)
+            if sdep is not None:
+                # decoded depth scale: bounded correction on the base depth scale.
+                depth_pred_scaled = depth_pred_scaled * sdep
 
 
         if self.is_grid:
@@ -693,6 +734,12 @@ class TrackerEncoder(nn.Module):
                 # The residual branch (motion offset) is NOT scaled (handled by scale_3d only).
                 p3d_cams = p3d_cams * rearrange(f_eff, 'cams -> cams 1 1 1 1').to(p3d_cams.dtype)
 
+            if s3d is not None:
+                # decoded per-track scale: a bounded correction on the base metric scale.
+                # Applied BEFORE the anchor add, so for residual modes it scales the MOTION
+                # (not the anchor); for absolute modes it scales the whole output.
+                p3d_cams = p3d_cams * s3d[..., None]
+
             if add_residual:
                 if R == 3:
                     query_world = repeat(
@@ -769,6 +816,13 @@ class TrackerEncoder(nn.Module):
                 'is_resid': (self.output_mode == 'gridresid'),
                 'anchor_local': query_local.detach() if query_local is not None else None,
                 'image_size': self.image_size,
+                # learnable_scale: the forward multiplied the (residual) output by the decoded
+                # per-track scale s3d [and depth by sdep]. The loss divides the grid CE target
+                # by the DETACHED scale so CE shapes the normalized grid while the metric
+                # regression loss learns the scale (identifiability, Toy J).
+                'learnable_scale': self.learnable_scale,
+                's3d': s3d.detach() if s3d is not None else None,      # (cams,b,t,n)
+                'sdep': sdep.detach() if sdep is not None else None,   # (cams,b,t,n)
                 # gridnorm: 3D bins live in a gauge-free frame mapped to ray-local metric by
                 # the SOLVED per-camera (s_c, t_c); depth bins by the SOLVED (scale_d, offset_d).
                 # The loss builds its CE targets from these (detached).

@@ -736,7 +736,11 @@ class Decoder(nn.Module):
                  enable_subpixel_refinement=False,
                  subpixel_scale=0.05,
                  subpixel_temperature=10.0,
-                 grid_decode_space="head"):
+                 grid_decode_space="head",
+                 learnable_scale=False,
+                 learnable_scale_depth=False,
+                 scale_init=1.0,
+                 scale_delta=2.0):
         super().__init__()
 
         self.embed_dim = embed_dim
@@ -808,6 +812,22 @@ class Decoder(nn.Module):
         # is solved from the query correspondences downstream (tracker_encoder), so the
         # decoder emits raw soft-argmax values (no cube_scale/f_eff, linear depth gauge).
         self.is_gridnorm = output_mode == 'gridnorm'
+
+        # learnable_scale: decode a positive per-token scale from the latent and multiply
+        # the metric 3D output (and depth) by it (a bounded, adaptive correction on the
+        # mode's base scale). s = scale_init * exp(clamp(head(x), ±scale_delta)); head init
+        # 0 -> s = scale_init (no-op at scale_init=1). Composes with any mode; redundant for
+        # gridnorm (which already SOLVES the gauge), so it is asserted off there upstream.
+        self.learnable_scale = bool(learnable_scale)
+        self.learnable_scale_depth = bool(learnable_scale_depth)
+        self.scale_init = float(scale_init)
+        self.scale_delta = float(scale_delta)
+        # scale = scale_init * exp(clamp(head, ±delta)); the head is zero-init so the scale
+        # STARTS at scale_init (a no-op multiply when scale_init=1), and exp(clamp) floors it
+        # at scale_init*exp(-delta) > 0 forever. scale_init MUST be > 0: it also divides the
+        # grid CE target, so scale_init=0 would zero the residual and blow up the target.
+        if self.learnable_scale or self.learnable_scale_depth:
+            assert self.scale_init > 0, f'scale_init must be > 0, got {self.scale_init}'
 
         if self.is_grid:
             G = head_3d_grid_size
@@ -914,6 +934,26 @@ class Decoder(nn.Module):
         self.heads_conf    = _make_heads(1)
         self.heads_depth   = _make_heads(head_depth_out)
         self.heads_conf_3d = _make_heads(1)
+
+        # Decoded per-token scale head(s). Zero-init (weight & bias) -> head output 0 ->
+        # scale = scale_init at start (no-op when scale_init=1), so learnable_scale is a
+        # clean superset of the base mode. The metric regression loss learns the scale
+        # through the product; the grid CE (with the scale detached in its target) shapes
+        # the normalized grid — jointly identifiable (see plan / Toy J).
+        if self.learnable_scale:
+            self.scale_3d_head = _make_heads(1)
+            for m in range(2):
+                nn.init.zeros_(self.scale_3d_head[m][1].weight)
+                nn.init.zeros_(self.scale_3d_head[m][1].bias)
+        else:
+            self.scale_3d_head = None
+        if self.learnable_scale_depth:
+            self.scale_depth_head = _make_heads(1)
+            for m in range(2):
+                nn.init.zeros_(self.scale_depth_head[m][1].weight)
+                nn.init.zeros_(self.scale_depth_head[m][1].bias)
+        else:
+            self.scale_depth_head = None
 
         if self.enable_subpixel_refinement and self.is_grid:
             # Per-bin (3*G) sub-bin offset map: one learned offset per grid value per axis,
@@ -1033,10 +1073,10 @@ class Decoder(nn.Module):
                 the query tokens before the stack (sliding-window hand-off). None for the
                 first window / non-windowed pass.
         Returns:
-            outputs: [B, T, K, N_cams, out_dim]
-            grid_logits: dict or None
-            latent: [B, T, K, N_cams, embed_dim] — this window's final decoder latent,
-                to carry into the next window.
+            dict with per-head tensors [B, T, K, N_cams, ·]: 'out_3d','out_2d','out_vis',
+            'out_conf','out_depth','out_conf_3d'; 'grid_logits' (dict or None); 'latent'
+            [B,T,K,N_cams,embed_dim] (carried into the next window); and 'scale_3d'/
+            'scale_depth' [B,T,K,N_cams,1] when learnable_scale[_depth].
         """
         B, T, K, N_cams, embed_dim = query_embeds.shape
         assert embed_dim == self.embed_dim
@@ -1150,13 +1190,33 @@ class Decoder(nn.Module):
         out_vis     = self.heads_vis[m](x)
         out_conf    = self.heads_conf[m](x)
         out_conf_3d = self.heads_conf_3d[m](x)
-        output = torch.cat([out_3d, out_2d, out_vis, out_conf, out_depth, out_conf_3d], dim=-1)
 
-        output = rearrange(output, '(cams b) (t k) dim -> b t k cams dim',
-                           cams=N_cams, b=B, t=T, k=K)
-        latent = rearrange(x, '(cams b) (t k) dim -> b t k cams dim',
-                           cams=N_cams, b=B, t=T, k=K)
-        return output, grid_logits, latent
+        def _to_btkc(t):
+            return rearrange(t, '(cams b) (t k) d -> b t k cams d',
+                             cams=N_cams, b=B, t=T, k=K)
+
+        # Return a dict of named per-head tensors (b,t,k,cams,·) instead of a packed cat +
+        # positional split. `grid_logits` is None for non-grid modes; scale heads present
+        # only when learnable_scale[_depth].
+        dec = {
+            'out_3d': _to_btkc(out_3d),          # (b,t,k,cams,3)
+            'out_2d': _to_btkc(out_2d),          # (b,t,k,cams,2)
+            'out_vis': _to_btkc(out_vis),        # (b,t,k,cams,1)
+            'out_conf': _to_btkc(out_conf),      # (b,t,k,cams,1)
+            'out_depth': _to_btkc(out_depth),    # (b,t,k,cams,1)
+            'out_conf_3d': _to_btkc(out_conf_3d),  # (b,t,k,cams,1)
+            'grid_logits': grid_logits,
+            'latent': _to_btkc(x),               # (b,t,k,cams,embed_dim)
+        }
+        if self.learnable_scale:
+            s3d = self.scale_init * torch.exp(
+                self.scale_3d_head[m](x).clamp(-self.scale_delta, self.scale_delta))
+            dec['scale_3d'] = _to_btkc(s3d)      # (b,t,k,cams,1)
+        if self.learnable_scale_depth:
+            sdep = self.scale_init * torch.exp(
+                self.scale_depth_head[m](x).clamp(-self.scale_delta, self.scale_delta))
+            dec['scale_depth'] = _to_btkc(sdep)  # (b,t,k,cams,1)
+        return dec
 
 
 class AttentionPooling(nn.Module):
