@@ -17,7 +17,22 @@ from posetail.posetail.encoder_decoder import SceneRepresentation, QueryEncoder,
 from torchvision import transforms
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
-class TrackerEncoder(nn.Module): 
+# Time axis of each time-indexed window output, used both to stitch windows in
+# _forward_windows and (as t_axis + 1 = the point axis, since layout is always
+# (...,t,n,...)) to concatenate keypoint chunks in _forward_window.
+_T_AXIS = {
+    'coords_pred': 1, '3d_pred_direct': 1, '3d_pred_rays': 1,
+    '3d_pred_triangulate': 1, 'vis_pred': 1, 'conf_pred': 1,
+    '3d_pred_cams_direct': 2, '3d_pred_cams_rays': 2, 'conf_3d': 2,
+    '2d_pred': 2, 'vis_pred_2d': 2, 'conf_pred_2d': 2, 'depth_pred': 2,
+    '2d_logits': 2,
+}
+_GRID_T_AXIS = {'logits_3d': 2, 'logits_depth': 2, 'anchor_local': 2}
+# Point (n) axis for keypoint-chunk concatenation = t_axis + 1 (layout is (...,t,n,...)).
+_N_AXIS = {k: v + 1 for k, v in _T_AXIS.items()}
+
+
+class TrackerEncoder(nn.Module):
 
     def __init__(self, image_size = 256,
                  stride_length = 16, stride_overlap = None,
@@ -236,7 +251,8 @@ class TrackerEncoder(nn.Module):
         print("  scene representation params: {:,d}".format(count_parameters(self.scene_encoder)))
         print("  decoder params: {:,d}".format(count_parameters(self.decoder)))
         
-    def forward(self, views, coords, camera_group, query_times=None, init_latent=None):
+    def forward(self, views, coords, camera_group, query_times=None, init_latent=None,
+                kpt_chunk=None):
         '''
         B: batch size
         T: number of frames in video
@@ -323,11 +339,11 @@ class TrackerEncoder(nn.Module):
         return self._forward_windows(
             views_norm, coords, query_times, camera_group,
             cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
-            init_latent=init_latent)
+            init_latent=init_latent, kpt_chunk=kpt_chunk)
 
     def _forward_windows(self, views_norm, coords, query_times, camera_group,
                          cube_scale, cube_scale_shared, f_eff,
-                         scene_center, scene_radius, init_latent=None):
+                         scene_center, scene_radius, init_latent=None, kpt_chunk=None):
         """Run the encoder/decoder over the clip, optionally as a sliding window.
 
         When self.S >= T (window covers the whole clip) this is a single pass,
@@ -361,7 +377,7 @@ class TrackerEncoder(nn.Module):
             result, latent = self._forward_window(
                 views_norm, coords, query_times, camera_group,
                 cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
-                prev_latent=init_latent)
+                prev_latent=init_latent, kpt_chunk=kpt_chunk)
             # Expose the latent so a caller can thread it into a following chunk
             # (cross-chunk carry); harmless for the non-windowed model whose
             # latent_carry is untrained (a no-op).
@@ -383,15 +399,10 @@ class TrackerEncoder(nn.Module):
                 for v in views_norm
             ]
 
-        # Frame (t) axis of every time-indexed output, used to stitch windows.
-        t_axis = {
-            'coords_pred': 1, '3d_pred_direct': 1, '3d_pred_rays': 1,
-            '3d_pred_triangulate': 1, 'vis_pred': 1, 'conf_pred': 1,
-            '3d_pred_cams_direct': 2, '3d_pred_cams_rays': 2, 'conf_3d': 2,
-            '2d_pred': 2, 'vis_pred_2d': 2, 'conf_pred_2d': 2, 'depth_pred': 2,
-            '2d_logits': 2,
-        }
-        grid_t_axis = {'logits_3d': 2, 'logits_depth': 2, 'anchor_local': 2}
+        # Frame (t) axis of every time-indexed output, used to stitch windows (module-level
+        # so keypoint-chunk concat in _forward_window can reuse it as t_axis + 1).
+        t_axis = _T_AXIS
+        grid_t_axis = _GRID_T_AXIS
 
         def _put(store, key, src, axis, start, full):
             # Write a window's output slice into the full-length accumulator across
@@ -447,7 +458,7 @@ class TrackerEncoder(nn.Module):
             res, latent = self._forward_window(
                 views_w, coords_w, times_w, camera_group,
                 cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
-                prev_latent=carry_w)
+                prev_latent=carry_w, kpt_chunk=kpt_chunk)
 
             for key, ax in t_axis.items():
                 if key in res:
@@ -511,7 +522,7 @@ class TrackerEncoder(nn.Module):
 
     def _forward_window(self, views_norm, coords, query_times, camera_group,
                         cube_scale, cube_scale_shared, f_eff,
-                        scene_center, scene_radius, prev_latent=None):
+                        scene_center, scene_radius, prev_latent=None, kpt_chunk=None):
         """Single encoder/decoder pass over one window (or the whole clip).
 
         views_norm frames are already normalized/padded ('b t c h w'); coords are the
@@ -520,15 +531,63 @@ class TrackerEncoder(nn.Module):
         precomputed once in forward() and passed through unchanged. prev_latent is the
         previous window's final decoder latent (frame-aligned, B,T,N,cams,D) or None.
 
+        kpt_chunk: if set (>0) and N > kpt_chunk, encode the scene ONCE then run the
+        per-point query/decoder work in point-slices reusing scene_features (mirrors
+        ScorerEncoder.score). Numerically identical to the single pass because the decoder
+        has no cross-point attention and the scene scalars are computed over all N in
+        forward(). Disabled for gridnorm, whose per-camera gauge solve couples points.
+
         Returns (result_dict, latent) where latent is this window's final decoder
         latent, to be carried into the next window.
         """
+        scene_features = self.scene_encoder(views_norm)
+        N = coords.shape[1]
+        if kpt_chunk and N > kpt_chunk and not self.is_gridnorm:
+            results, latents = [], []
+            for k0 in range(0, N, kpt_chunk):
+                k1 = min(k0 + kpt_chunk, N)
+                pl = prev_latent[:, :, k0:k1] if prev_latent is not None else None
+                r, lat = self._decode_from_scene(
+                    scene_features, views_norm, coords[:, k0:k1], query_times[:, k0:k1],
+                    camera_group, cube_scale, cube_scale_shared, f_eff,
+                    scene_center, scene_radius, prev_latent=pl)
+                results.append(r); latents.append(lat)
+            return self._concat_point_chunks(results), torch.cat(latents, dim=2)
+        return self._decode_from_scene(
+            scene_features, views_norm, coords, query_times, camera_group,
+            cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
+            prev_latent=prev_latent)
+
+    # Loss-only, per-point grid logits: huge (they carry the P/K grid dim) and unused at
+    # inference. kpt_chunk is inference-only, so we DON'T reassemble them to full-N -- that
+    # would defeat the memory saving. Dropped from the concatenated result.
+    _CHUNK_SKIP = {'2d_logits', 'grid'}
+
+    @staticmethod
+    def _concat_point_chunks(results):
+        """Concatenate per-keypoint-chunk _decode_from_scene outputs along the point axis.
+        Point tensors use _N_AXIS; None passes through; the loss-only grid logits (_CHUNK_SKIP)
+        are dropped (inference doesn't use them and full-N reassembly would OOM)."""
+        base = results[0]
+        out = {}
+        for key, val in base.items():
+            if key in TrackerEncoder._CHUNK_SKIP:
+                continue
+            if val is None:
+                out[key] = None
+                continue
+            out[key] = torch.cat([r[key] for r in results], dim=_N_AXIS[key])
+        return out
+
+    def _decode_from_scene(self, scene_features, views_norm, coords, query_times, camera_group,
+                           cube_scale, cube_scale_shared, f_eff,
+                           scene_center, scene_radius, prev_latent=None):
+        """Per-point decode from precomputed scene_features (the body of one window's forward
+        after scene encoding). Returns (result_dict, latent). See _forward_window."""
         device = coords.device
         B, N, R = coords.shape
         T = views_norm[0].shape[1]
         n_cams = len(views_norm)
-
-        scene_features = self.scene_encoder(views_norm)
 
         # Hey, coords start at 0
         query_coords = repeat(coords, 'b n r -> b (t n) r', t=T).to(torch.float32)

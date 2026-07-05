@@ -637,22 +637,11 @@ def run_query_first_on_videos(model, video_paths, camera_group, query_points_3d,
         raise ValueError('run_query_first_on_videos is 3D-only')
     n_kpts = query_points_3d.shape[0]
 
-    # keypoint chunking for memory (each chunk keeps its own query_times)
-    if max_kpts is not None and n_kpts > max_kpts:
-        outs = []
-        for s in range(0, n_kpts, max_kpts):
-            e = min(s + max_kpts, n_kpts)
-            print(f'  keypoint chunk {s}:{e} of {n_kpts}')
-            outs.append(run_query_first_on_videos(
-                model, video_paths, camera_group, query_points_3d[s:e], query_times[s:e],
-                start_frame, n_frames, None, device, pred_key_3d))
-        return {
-            'coords_pred':   torch.cat([o['coords_pred'] for o in outs], dim=2),
-            'vis_pred':      torch.cat([o['vis_pred'] for o in outs], dim=2),
-            'conf_pred':     torch.cat([o['conf_pred'] for o in outs], dim=2),
-            'frame_numbers': outs[0]['frame_numbers'],
-            'crop_history':  outs[0]['crop_history'],
-        }
+    # Memory: keypoints are chunked INSIDE the model (kpt_chunk) so the V-JEPA scene encoding
+    # is computed once per window and reused across chunks (numerically identical; see
+    # TrackerEncoder._forward_window). This also keeps a single, consistent crop over all
+    # query points -- unlike the old external per-chunk recursion, which cropped each chunk
+    # separately. `max_kpts` becomes the internal chunk size.
 
     if device is None:
         device = next(model.parameters()).device
@@ -682,7 +671,7 @@ def run_query_first_on_videos(model, video_paths, camera_group, query_points_3d,
         views = [v.unsqueeze(0).to(device=device, dtype=torch.float32) / 255.0 for v in views]
 
         outputs = model(views=views, coords=q, query_times=qt,
-                        camera_group=camera_group_chunk, init_latent=None)
+                        camera_group=camera_group_chunk, init_latent=None, kpt_chunk=max_kpts)
         coords_pred = outputs[pred_key_3d][:, :T]
         vis_pred = outputs['vis_pred'][:, :T]
         conf_pred = outputs['conf_pred'][:, :T]
