@@ -42,7 +42,7 @@ class TrackerEncoder(nn.Module):
                  video_encoder_hierarchical = True,
                  video_encoder_finetune_last_n_layers = None,
                  scene_pos_embed_mode = 'learned',
-                 rope_base = 10000.0,
+                 rope_base = 100.0,
                  corr_radius = 3, 
                  max_freq = 10, n_iters = 4, embedding_dim = 256,
                  query_patch_size = 9,
