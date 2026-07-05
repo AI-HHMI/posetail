@@ -99,13 +99,16 @@ def load_trial_npz(npz_path):
     coords_true = torch.from_numpy(data['coords_true'].astype('float32'))
     vis_pred    = torch.from_numpy(data['vis_pred'].astype('float32'))
     vis_true    = torch.from_numpy(data['vis_true'].astype(bool))
+    # per-point query times (query_first); absent in legacy outputs -> None (anchor frame 0)
+    query_times = torch.from_numpy(data['query_times'].astype('int64')) \
+        if 'query_times' in data.files else None
 
-    return coords_pred, coords_true, vis_pred, vis_true
+    return coords_pred, coords_true, vis_pred, vis_true, query_times
 
 
 def run_trial(npz_path, thresholds, survival_threshold, prefix):
     """Load one output.npz, compute metrics, return dict."""
-    coords_pred, coords_true, vis_pred, vis_true = load_trial_npz(npz_path)
+    coords_pred, coords_true, vis_pred, vis_true, query_times = load_trial_npz(npz_path)
     metrics = get_eval_metrics(
         vis_pred=vis_pred,
         vis_true=vis_true,
@@ -114,6 +117,7 @@ def run_trial(npz_path, thresholds, survival_threshold, prefix):
         thresholds=thresholds,
         survival_threshold=survival_threshold,
         prefix=prefix,
+        query_times=query_times,
     )
     return metrics
 

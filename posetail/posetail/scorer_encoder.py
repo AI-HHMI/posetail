@@ -128,8 +128,13 @@ class ScorerEncoder(TrackerEncoder):
     # ----------------------------------------------------------------------------------
     # Score one sample from precomputed scene features. query = target.
     # ----------------------------------------------------------------------------------
-    def score(self, views_norm, scene_features, coords_full, camera_group):
-        """coords_full: [B, T, K, R] full trajectory. Returns scores, precision: [B, K]."""
+    def score(self, views_norm, scene_features, coords_full, camera_group, kpt_chunk=None):
+        """coords_full: [B, T, K, R] full trajectory. Returns scores, precision: [B, K].
+
+        Scene scalars (scale/centroid) are computed ONCE over all K, so setting ``kpt_chunk``
+        (run the per-point query/decoder/pool work in K-slices) is numerically identical to the
+        unchunked path while bounding peak memory — needed for dense point sets (thousands of
+        keypoints) or many cameras. ``kpt_chunk=None`` is the original single-pass behaviour."""
         device = coords_full.device
         B, T, K, R = coords_full.shape
         n_cams = len(camera_group)
@@ -151,74 +156,88 @@ class ScorerEncoder(TrackerEncoder):
 
         coords_full = self._fill_nearest_valid(coords_full, valid)      # ffill/bfill over time
         coords_full = torch.nan_to_num(coords_full, nan=0.0)            # guard all-missing points
-        coords_flat = rearrange(coords_full, 'b t k r -> b (t k) r')
+        # Per-point work over a K-slice. Everything above (valid, scene scalars, fill) is over
+        # the FULL K, so slicing here is exact. Runs in chunks to bound peak memory.
+        def _score_slice(cf, valid):
+            Kc = cf.shape[2]
+            coords_flat = rearrange(cf, 'b t k r -> b (t k) r')
 
-        # query == target: each (t, k) token lives at its own frame t, evaluated at t.
-        query_coords = coords_flat
-        query_time = repeat(torch.arange(T, device=device), 't -> b (t k)', b=B, k=K)
-        target_time = query_time
+            # query == target: each (t, k) token lives at its own frame t, evaluated at t.
+            query_coords = coords_flat
+            query_time = repeat(torch.arange(T, device=device), 't -> b (t k)', b=B, k=Kc)
+            target_time = query_time
 
-        query_embeds = self.query_encoder(
-            views_norm, camera_group,
-            query_coords=query_coords, query_time=query_time,
-            target_time=target_time, cube_scale=cube_scale)
-        query_embeds = rearrange(query_embeds, 'b (t k) cams d -> b t k cams d', t=T, k=K)
+            query_embeds = self.query_encoder(
+                views_norm, camera_group,
+                query_coords=query_coords, query_time=query_time,
+                target_time=target_time, cube_scale=cube_scale)
+            query_embeds = rearrange(query_embeds, 'b (t k) cams d -> b t k cams d', t=T, k=Kc)
 
-        # Replace embeddings of missing (NaN) slots with the learnable missing-point token
-        # (broadcast over cameras). Their sanitized coords only served to keep projection/rays
-        # finite; the token is what the decoder + pooling actually see for those slots.
-        query_embeds = torch.where(
-            (~valid)[..., None, None], self.missing_point.to(query_embeds.dtype), query_embeds)
+            # Replace embeddings of missing (NaN) slots with the learnable missing-point token
+            # (broadcast over cameras). Their sanitized coords only served to keep projection/rays
+            # finite; the token is what the decoder + pooling actually see for those slots.
+            query_embeds = torch.where(
+                (~valid)[..., None, None], self.missing_point.to(query_embeds.dtype), query_embeds)
 
-        if R == 3:
-            p2d_query = project_points_torch(camera_group, query_coords)       # [cams,b,(t k),2]
-            p2d_query = rearrange(p2d_query, 'cams b (t k) r -> cams b t k r', t=T, k=K)
-        else:
-            p2d_query = rearrange(query_coords, 'b (t k) r -> 1 b t k r', t=T, k=K)
+            if R == 3:
+                p2d_query = project_points_torch(camera_group, query_coords)   # [cams,b,(t k),2]
+                p2d_query = rearrange(p2d_query, 'cams b (t k) r -> cams b t k r', t=T, k=Kc)
+            else:
+                p2d_query = rearrange(query_coords, 'b (t k) r -> 1 b t k r', t=T, k=Kc)
 
-        query_rays_per_cam = []
-        for i in range(n_cams):
-            rays_per_b = []
-            for b in range(B):
-                p2d_ib = rearrange(p2d_query[i, b], 't k r -> (t k) r')
-                if self.metric_ray_translation:
-                    rays_per_b.append(points_to_rays(
-                        camera_group[i], p2d_ib, cube_scale_shared[b],
-                        scene_center=scene_center[b], scene_radius=scene_radius[b]))
-                else:
-                    rays_per_b.append(points_to_rays(camera_group[i], p2d_ib, cube_scale_shared[b]))
-            query_rays_per_cam.append(torch.stack(rays_per_b, dim=0))
-        query_rays = rearrange(torch.stack(query_rays_per_cam, dim=0),
-                               'cams b (t k) d e -> b t k cams d e', t=T, k=K)
+            query_rays_per_cam = []
+            for i in range(n_cams):
+                rays_per_b = []
+                for b in range(B):
+                    p2d_ib = rearrange(p2d_query[i, b], 't k r -> (t k) r')
+                    if self.metric_ray_translation:
+                        rays_per_b.append(points_to_rays(
+                            camera_group[i], p2d_ib, cube_scale_shared[b],
+                            scene_center=scene_center[b], scene_radius=scene_radius[b]))
+                    else:
+                        rays_per_b.append(points_to_rays(camera_group[i], p2d_ib, cube_scale_shared[b]))
+                query_rays_per_cam.append(torch.stack(rays_per_b, dim=0))
+            query_rays = rearrange(torch.stack(query_rays_per_cam, dim=0),
+                                   'cams b (t k) d e -> b t k cams d e', t=T, k=Kc)
 
-        mode_idx = torch.tensor([1 if R == 3 else 0], dtype=torch.long, device=device)
+            mode_idx = torch.tensor([1 if R == 3 else 0], dtype=torch.long, device=device)
 
-        # decoder returns a dict; the per-point latent is [b, t, k, cams, dim]
-        latents = self.decoder(scene_features, query_embeds, query_rays, mode_idx)['latent']
+            # decoder returns a dict; the per-point latent is [b, t, k, cams, dim]
+            latents = self.decoder(scene_features, query_embeds, query_rays, mode_idx)['latent']
 
-        # Pool only observed (t, cams) slots per point: mask missing slots so missingness does
-        # not shift the score (missing points are orthogonal to track quality). [b,k,t,cams],
-        # True == drop. min_valid_frames guarantees >=1 observed frame/point, so a point is
-        # never fully masked; force-unmask defensively in case that ever breaks (softmax over
-        # all -inf -> NaN).
-        pool_mask = repeat(~valid, 'b t k -> b k t cams', cams=latents.shape[3]).contiguous()
-        all_masked = pool_mask.flatten(2).all(dim=-1)               # [b, k]
-        if all_masked.any():
-            pool_mask[all_masked] = False
-        pooled = self.attn_pool(latents, key_padding_mask=pool_mask)   # [b, k, d]
-        feats = self.score_feature(pooled)
-        scores = self.score_head(feats)[..., 0]                     # [b, k]
-        if self.precision_head is not None:
-            precision = torch.sigmoid(self.precision_head(feats)[..., 0])  # [b, k], (0,1)
-        else:
-            precision = torch.ones_like(scores)  # full confidence -> weighting is a no-op
-        return scores, precision
+            # Pool only observed (t, cams) slots per point: mask missing slots so missingness does
+            # not shift the score (missing points are orthogonal to track quality). [b,k,t,cams],
+            # True == drop. min_valid_frames guarantees >=1 observed frame/point, so a point is
+            # never fully masked; force-unmask defensively in case that ever breaks (softmax over
+            # all -inf -> NaN).
+            pool_mask = repeat(~valid, 'b t k -> b k t cams', cams=latents.shape[3]).contiguous()
+            all_masked = pool_mask.flatten(2).all(dim=-1)               # [b, k]
+            if all_masked.any():
+                pool_mask[all_masked] = False
+            pooled = self.attn_pool(latents, key_padding_mask=pool_mask)   # [b, k, d]
+            feats = self.score_feature(pooled)
+            scores = self.score_head(feats)[..., 0]                     # [b, k]
+            if self.precision_head is not None:
+                precision = torch.sigmoid(self.precision_head(feats)[..., 0])  # [b, k], (0,1)
+            else:
+                precision = torch.ones_like(scores)  # full confidence -> weighting is a no-op
+            return scores, precision
 
-    def forward(self, views, coords, camera_group, query_times=None):
+        if kpt_chunk and K > kpt_chunk:
+            s_parts, p_parts = [], []
+            for k0 in range(0, K, kpt_chunk):
+                k1 = min(k0 + kpt_chunk, K)
+                s, p = _score_slice(coords_full[:, :, k0:k1], valid[:, :, k0:k1])
+                s_parts.append(s)
+                p_parts.append(p)
+            return torch.cat(s_parts, dim=1), torch.cat(p_parts, dim=1)   # [b, k]
+        return _score_slice(coords_full, valid)
+
+    def forward(self, views, coords, camera_group, query_times=None, kpt_chunk=None):
         """Single-sample inference path. views: list of [b,t,h,w,c];
         coords: full trajectory [b,t,k,R]. Returns scores, precision: [b, k]."""
         views_norm, scene_features = self.encode_scene(views)
-        return self.score(views_norm, scene_features, coords, camera_group)
+        return self.score(views_norm, scene_features, coords, camera_group, kpt_chunk=kpt_chunk)
 
     def score_triplet(self, trip):
         """Score a (good, bad, anchor) triplet in ONE forward pass (DDP-safe: a single

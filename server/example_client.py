@@ -66,9 +66,10 @@ def main():
     n_frames = info['n_frames']
 
     # Load trial: metadata path, per-camera video/image paths, 3D query points
-    metadata_path, video_paths, query_points_3d, _ = load_trial(
-        args.trial_path, start_frame=args.start_frame
-    )
+    trial = load_trial(args.trial_path, start_frame=args.start_frame)
+    metadata_path = trial['metadata_path']
+    video_paths = trial['video_paths']
+    query_points_3d = trial['query_points']
     print(f'Query points: {query_points_3d.shape}')
 
     # Load camera group as formatted dicts
