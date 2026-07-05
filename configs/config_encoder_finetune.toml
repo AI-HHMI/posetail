@@ -146,7 +146,11 @@ depth_log_max = 2.5
 seed = 27
 
 finetune = true
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260630_195317-pi2fpadz/files/checkpoints/checkpoint_00799996.pth'
+# pretraining
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260630_195317-pi2fpadz/files/checkpoints/checkpoint_00799996.pth'
+
+# finetuned 1
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260703_110311-8e2g5hfu/files/checkpoints/checkpoint_00860328.pth'
 
 n_iterations = 8000000
 scheduler_type = 'muon'
@@ -168,7 +172,7 @@ muon_warmup_steps = 2000
 beta1 = 0.9
 beta2 = 0.95
 
-encoder_lr_scale = 0.2
+encoder_lr_scale = 0.25
 
 [training.scheduler]
 
