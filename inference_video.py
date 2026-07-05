@@ -723,6 +723,10 @@ def load_trial(trial_path, start_frame=0, n_frames=None, query_first=True):
 
     query_first (3D only): anchor each point at its first valid+visible frame (mvtracker /
     training convention) instead of all points at start_frame. Returns per-point query_times.
+
+    Returns a dict with keys: 'mode', 'metadata_path', 'cam_names', 'video_paths',
+    'query_points', 'per_subject_queries', 'coords', 'vis_gt', 'valid_flat',
+    'per_subject_valid_masks', 'query_times_flat', 'per_subject_query_times'.
     """
 
     pose3d_path = os.path.join(trial_path, 'pose3d.npz')
@@ -818,9 +822,20 @@ def load_trial(trial_path, start_frame=0, n_frames=None, query_first=True):
     if query_points.shape[0] == 0:
         raise ValueError(f'No valid query points in trial {trial_path}')
 
-    return (mode, metadata_path, cam_names, video_paths, query_points, per_subject_queries,
-            coords, vis_gt, valid_flat, per_subject_valid_masks,
-            query_times_flat, per_subject_query_times)
+    return {
+        'mode': mode,
+        'metadata_path': metadata_path,
+        'cam_names': cam_names,
+        'video_paths': video_paths,
+        'query_points': query_points,
+        'per_subject_queries': per_subject_queries,
+        'coords': coords,
+        'vis_gt': vis_gt,
+        'valid_flat': valid_flat,
+        'per_subject_valid_masks': per_subject_valid_masks,
+        'query_times_flat': query_times_flat,
+        'per_subject_query_times': per_subject_query_times,
+    }
 
 
 def parse_args():
@@ -890,10 +905,20 @@ def run_inference(
     if device is None:
         device = next(model.parameters()).device
 
-    (mode, metadata_path, cam_names, video_paths, query_points_3d, per_subject_queries,
-    coords_gt, vis_gt_raw, valid_flat, per_subject_valid_masks,
-    query_times_flat, per_subject_query_times) = load_trial(
-            trial_path, start_frame=start_frame, n_frames=n_frames, query_first=query_first)
+    trial = load_trial(trial_path, start_frame=start_frame, n_frames=n_frames,
+                       query_first=query_first)
+    mode                    = trial['mode']
+    metadata_path           = trial['metadata_path']
+    cam_names               = trial['cam_names']
+    video_paths             = trial['video_paths']
+    query_points_3d         = trial['query_points']
+    per_subject_queries     = trial['per_subject_queries']
+    coords_gt               = trial['coords']
+    vis_gt_raw              = trial['vis_gt']
+    valid_flat              = trial['valid_flat']
+    per_subject_valid_masks = trial['per_subject_valid_masks']
+    query_times_flat        = trial['query_times_flat']
+    per_subject_query_times = trial['per_subject_query_times']
     use_query_first = query_first and mode == '3d'
 
     R = coords_gt.shape[-1]
