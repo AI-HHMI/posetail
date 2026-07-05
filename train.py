@@ -132,18 +132,26 @@ def run(config_path, fabric):
     )
 
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size = config.dataset.batch_size, 
+        train_dataset,
+        batch_size = config.dataset.batch_size,
         collate_fn = custom_collate,
         sampler = sampler,
         shuffle = False,
         num_workers = config.dataset.num_workers,
-        prefetch_factor = 2, 
+        prefetch_factor = 2,
         persistent_workers = True,
-        pin_memory = True
+        pin_memory = True,
+        # decorrelate dataloader RNG across (rank, worker): every rank runs
+        # set_seeds with the same broadcast seed, and torch's per-worker seed is
+        # rank-independent, so without this every GPU would apply correlated
+        # augmentation/subsampling. Folding global_rank in fixes the cross-GPU case.
+        worker_init_fn = make_worker_init_fn(seed, fabric.global_rank),
     )
 
     train_loader = fabric.setup_dataloaders(train_loader)
+    # keep a handle on the actual sampler so we can advance its epoch (below);
+    # fabric may wrap the loader, so read it back through the wrapper.
+    train_sampler = getattr(train_loader, 'sampler', sampler)
 
     # set up validation dataloader 
     val = config.dataset.val.get('split_dir', None)
@@ -154,14 +162,15 @@ def run(config_path, fabric):
         val_dataset = PosetailDataset(config, split = 'val')
 
         val_loader = DataLoader(
-            val_dataset, 
-            batch_size = config.dataset.batch_size, 
+            val_dataset,
+            batch_size = config.dataset.batch_size,
             collate_fn = custom_collate,
             shuffle = True,
             num_workers = config.dataset.num_workers,
-            prefetch_factor=2, 
+            prefetch_factor=2,
             persistent_workers=True,
-            pin_memory=True
+            pin_memory=True,
+            worker_init_fn = make_worker_init_fn(seed, fabric.global_rank),
         )
 
 
@@ -398,6 +407,12 @@ def run(config_path, fabric):
     # total_params = sum(p.numel() for p in model.parameters())
     # print(total_params)
 
+    # advance the DistributedSampler epoch on every pass so the base-clip order
+    # reshuffles (otherwise it repeats the same order every epoch, since set_epoch
+    # is never otherwise called with the infinite iterator below).
+    epoch = 0
+    if hasattr(train_sampler, 'set_epoch'):
+        train_sampler.set_epoch(epoch)
     train_iter = iter(train_loader)
 
     iter_time = time.time()
@@ -410,6 +425,9 @@ def run(config_path, fabric):
         try:
             batch = next(train_iter)
         except StopIteration:
+            epoch += 1
+            if hasattr(train_sampler, 'set_epoch'):
+                train_sampler.set_epoch(epoch)
             train_iter = iter(train_loader)
             batch = next(train_iter)
 

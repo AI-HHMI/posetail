@@ -4,6 +4,7 @@ import time
 import toml
 import torch
 import yaml
+import random
 
 import numpy as np
 
@@ -63,6 +64,28 @@ def set_seeds(seed = 3, set_backends = True):
         torch.backends.cudnn.benchmark = False
 
     return seed
+
+
+def make_worker_init_fn(base_seed, rank):
+    """Build a DataLoader `worker_init_fn` that decorrelates RNG per (rank, worker).
+
+    On `fork` (Linux default) every dataloader worker inherits the parent process's
+    numpy RNG state verbatim; PyTorch auto-reseeds torch/`random` per worker but NOT
+    numpy. Since PosetailDataset drives ~all of its sampling/augmentation through
+    `np.random.*`, workers would otherwise emit correlated draws. Worse under DDP:
+    every rank runs `set_seeds` with the same broadcast seed, and torch's per-worker
+    seed (`torch.initial_seed()+worker_id`) is rank-independent, so even torch draws
+    correlate rank-to-rank. Folding `rank` into the seed decorrelates both axes.
+
+    Model init still uses the shared broadcast seed (untouched), so DDP parameter
+    init stays identical across ranks -- only the dataloader streams are decorrelated.
+    """
+    def _init(worker_id):
+        s = (int(base_seed) + int(rank) * 100003 + int(worker_id)) % 2**32
+        np.random.seed(s)
+        torch.manual_seed(s)
+        random.seed(s)
+    return _init
 
 
 def load_config(config_path, easy = True): 
