@@ -30,7 +30,23 @@ from schedulefree import AdamWScheduleFree
 from einops import rearrange
 
 
+def resolve_seed(seed):
+    """0 or None => draw a fresh seed from OS entropy; otherwise pass through.
+
+    Range [1, 2**32-1] so the result is a valid numpy seed and never re-triggers
+    the sentinel. Use this when you want ``seed = 0`` in a config to mean "random".
+    """
+    if not seed:  # covers 0 and None
+        seed = int.from_bytes(os.urandom(4), 'little') % (2**32 - 1) + 1
+    return seed
+
+
 def set_seeds(seed = 3, set_backends = True):
+
+    # a falsy seed (0 / None) means "random run" -- the user doesn't care about
+    # reproducibility, so don't pay for deterministic backends either.
+    random_mode = not seed
+    seed = resolve_seed(seed)
 
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -40,11 +56,13 @@ def set_seeds(seed = 3, set_backends = True):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-    # seeds for nondeterministic operations - note that this
-    # could make the code less efficient
-    if set_backends:
-        torch.backends.cudnn.deterministic = True 
+    # deterministic backends only for a fixed seed; in random mode let cudnn
+    # benchmark for speed. note deterministic ops can be less efficient.
+    if set_backends and not random_mode:
+        torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+    return seed
 
 
 def load_config(config_path, easy = True): 

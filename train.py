@@ -105,7 +105,11 @@ def run(config_path, fabric):
     torch.set_float32_matmul_precision('medium')
 
     config = load_config(config_path)
-    set_seeds(config.training.seed)
+    seed = fabric.broadcast(resolve_seed(config.training.seed), src=0)
+    set_seeds(seed)
+    if fabric.is_global_zero:
+        print(f"[seed] using seed={seed}"
+              + (" (random)" if not config.training.get('seed') else ""))
 
     # signal handler for graceful interrupt
     interrupted = False
@@ -123,8 +127,8 @@ def run(config_path, fabric):
         train_dataset,
         num_replicas = fabric.world_size, 
         rank = fabric.global_rank,
-        shuffle = True, 
-        seed = config.training.get('seed', None)
+        shuffle = True,
+        seed = seed
     )
 
     train_loader = DataLoader(

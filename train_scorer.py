@@ -40,7 +40,7 @@ from posetail.datasets.scorer_corruption import (ScorerTripletDataset, triplet_c
                                                  seed_worker)
 from posetail.posetail.scorer_encoder import ScorerEncoder
 from posetail.posetail.losses_scorer import TripletScorerLoss
-from train_utils import (load_config, save_config, set_seeds, write_json,
+from train_utils import (load_config, save_config, set_seeds, resolve_seed, write_json,
                          build_optimizer_param_groups, load_checkpoint, save_checkpoint,
                          total_to_per_gpu, dict_to_device, get_timestamp)
 
@@ -173,7 +173,11 @@ def _build_scorer_dataset(config, split, corruption_cfg):
 def run(config_path, fabric):
     torch.set_float32_matmul_precision('medium')
     config = load_config(config_path)
-    set_seeds(config.training.seed)
+    seed = fabric.broadcast(resolve_seed(config.training.seed), src=0)
+    set_seeds(seed)
+    if fabric.is_global_zero:
+        print(f"[seed] using seed={seed}"
+              + (" (random)" if not config.training.get('seed') else ""))
 
     interrupted = False
     def signal_handler(sig, frame):
@@ -189,7 +193,7 @@ def run(config_path, fabric):
     train_dataset = _build_scorer_dataset(config, 'train', corruption_cfg)
     sampler = DistributedSampler(train_dataset, num_replicas=fabric.world_size,
                                  rank=fabric.global_rank, shuffle=True,
-                                 seed=config.training.get('seed', None))
+                                 seed=seed)
     train_loader = DataLoader(train_dataset, batch_size=config.dataset.batch_size,
                               collate_fn=triplet_collate, sampler=sampler, shuffle=False,
                               num_workers=config.dataset.num_workers, prefetch_factor=2,
