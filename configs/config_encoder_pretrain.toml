@@ -108,6 +108,7 @@ scene_proj_dim = 512
 scene_proj_prenorm = false
 scene_proj_mlp = false
 
+scene_pos_embed_mode = 'rope'
 
 # "gridresid" = per-axis soft-argmax bin grid (CE-supervised): 3D head emits a motion residual
 # from a query anchor, depth is a log grid, plus a 2D pixel-bin position head.
