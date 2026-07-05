@@ -695,21 +695,27 @@ class RoPECrossAttention(nn.Module):
     Unlike TemporalSelfAttention, out_proj is NOT zero-initialised: cross-attention is the main
     information pathway (not an added residual block), so it must contribute from step 0."""
 
-    def __init__(self, embed_dim, num_heads, kv_dim, dropout=0.0, rope_base=10000.0):
+    def __init__(self, embed_dim, num_heads, kv_dim, cross_attn_dim=None,
+                 dropout=0.0, rope_base=10000.0):
         super().__init__()
-        assert embed_dim % num_heads == 0
+        # Attention (q/k/v) width, decoupled from the decoder residual stream (embed_dim),
+        # exactly like DecoupledCrossAttention. Defaults to embed_dim, which keeps the
+        # projections at their original shapes so existing rope checkpoints load unchanged.
+        attn_dim = cross_attn_dim if cross_attn_dim is not None else embed_dim
+        assert attn_dim % num_heads == 0, (
+            f'cross_attn_dim ({attn_dim}) must be divisible by num_heads ({num_heads})')
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.head_dim = attn_dim // num_heads
         assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
         self.dropout = dropout
         # RoPE frequency base. The 10000 default is tuned for thousand-token contexts; over
         # short clips (~16-24 frames) most dim-pairs barely rotate, so a smaller base (~100-1000)
         # spreads angular resolution across the few positions actually present.
         self.rope_base = rope_base
-        self.q_proj = nn.Linear(embed_dim, embed_dim)
-        self.k_proj = nn.Linear(kv_dim, embed_dim)
-        self.v_proj = nn.Linear(kv_dim, embed_dim)
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.q_proj = nn.Linear(embed_dim, attn_dim)
+        self.k_proj = nn.Linear(kv_dim, attn_dim)
+        self.v_proj = nn.Linear(kv_dim, attn_dim)
+        self.out_proj = nn.Linear(attn_dim, embed_dim)
 
     def forward(self, query, kv, q_pos, k_pos):
         """query: (Bc, Lq, embed_dim); kv: (Bc, Lk, kv_dim);
@@ -953,19 +959,18 @@ class Decoder(nn.Module):
         if self.cross_attn_rope:
             self.cross_attns = nn.ModuleList([
                 RoPECrossAttention(embed_dim=embed_dim, num_heads=num_heads,
-                                   kv_dim=encoder_dim, dropout=dropout,
-                                   rope_base=cross_attn_rope_base)
+                                   kv_dim=encoder_dim, cross_attn_dim=self.cross_attn_dim,
+                                   dropout=dropout, rope_base=cross_attn_rope_base)
                 for _ in range(num_layers)
             ])
         else:
             self.cross_attns = nn.ModuleList([
-                nn.MultiheadAttention(
-                    embed_dim=embed_dim,
+                DecoupledCrossAttention(
+                    latent_dim=embed_dim,
+                    kv_dim=encoder_dim,
+                    cross_attn_dim=self.cross_attn_dim,
                     num_heads=num_heads,
-                    kdim=encoder_dim,
-                    vdim=encoder_dim,
                     dropout=dropout,
-                    batch_first=True
                 ) for _ in range(num_layers)
             ])
 
@@ -1216,9 +1221,7 @@ class Decoder(nn.Module):
             if self.cross_attn_rope:
                 attn_out = self.cross_attns[layer_idx](x_normed, kv, q_pos, k_pos)
             else:
-                attn_out, _ = self.cross_attns[layer_idx](
-                    query=x_normed, key=kv, value=kv, need_weights=False
-                )
+                attn_out = self.cross_attns[layer_idx](x_normed, kv)
             x = x + attn_out
 
             x = x + self.mlps[layer_idx](self.norm2s[layer_idx](x, mode_idx))
