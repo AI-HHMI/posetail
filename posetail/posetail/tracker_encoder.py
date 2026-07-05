@@ -41,6 +41,8 @@ class TrackerEncoder(nn.Module):
                  video_encoder_requires_grad = False,
                  video_encoder_hierarchical = True,
                  video_encoder_finetune_last_n_layers = None,
+                 scene_pos_embed_mode = 'learned',
+                 rope_base = 10000.0,
                  corr_radius = 3, 
                  max_freq = 10, n_iters = 4, embedding_dim = 256,
                  query_patch_size = 9,
@@ -116,7 +118,17 @@ class TrackerEncoder(nn.Module):
         self.video_encoder_version = video_encoder_version
         self.video_encoder_hierarchical = video_encoder_hierarchical
         self.video_encoder_finetune_last_n_layers = video_encoder_finetune_last_n_layers
-        
+        # 'rope' is a decoder-level positional scheme, not an additive scene term: it means
+        # "no additive scene pos_embed + 1-D temporal RoPE in the decoder cross-attention".
+        # So map it to scene pos_embed_mode='none' and flip the decoder rope flag.
+        assert scene_pos_embed_mode in ('learned', 'sincos', 'none', 'rope'), \
+            f"scene_pos_embed_mode must be 'learned'|'sincos'|'none'|'rope', got {scene_pos_embed_mode!r}"
+        self.scene_pos_embed_mode = scene_pos_embed_mode
+        self.cross_attn_rope = (scene_pos_embed_mode == 'rope')
+        scene_pos_embed_mode_resolved = 'none' if self.cross_attn_rope else scene_pos_embed_mode
+        # RoPE frequency base for the cross-attention rope (only used when mode == 'rope').
+        self.rope_base = rope_base
+
 
         # query encoder params
         self.corr_radius = corr_radius 
@@ -181,6 +193,7 @@ class TrackerEncoder(nn.Module):
             proj_prenorm = scene_proj_prenorm,
             proj_mlp = scene_proj_mlp,
             video_encoder_finetune_last_n_layers = self.video_encoder_finetune_last_n_layers,
+            pos_embed_mode = scene_pos_embed_mode_resolved,
         )
         
         self.query_encoder = QueryEncoder(
@@ -203,6 +216,8 @@ class TrackerEncoder(nn.Module):
             mlp_ratio=embedding_factor,
             use_camera_self_attention=self.use_camera_self_attention,
             use_temporal_self_attention=self.use_temporal_self_attention,
+            cross_attn_rope=self.cross_attn_rope,
+            cross_attn_rope_base=self.rope_base,
             output_mode=self.output_mode,
             head_3d_grid_size=head_3d_grid_size,
             head_3d_grid_radius=head_3d_grid_radius,
@@ -627,8 +642,21 @@ class TrackerEncoder(nn.Module):
         query_rays = rearrange(query_rays_flat, 'cams b (t n) d e -> b t n cams d e', t=T, n=N)
 
         mode_idx = torch.tensor([1 if R == 3 else 0], dtype=torch.long, device=query_embeds.device)
+        # Temporal-RoPE cross-attention: frame index (in query-frame units) of each scene
+        # token. Tokens are ordered (t,h,w) row-major, so token idx -> temporal slot
+        # idx // (gH*gW); converting to frame units (slot * tubelet, centred in the tubelet)
+        # puts keys on the same timeline as the query frames arange(T).
+        scene_frame_pos = None
+        if self.cross_attn_rope:
+            tub, ps = self.scene_encoder.tubelet_size, self.scene_encoder.patch_size
+            H, W = views_norm[0].shape[-2], views_norm[0].shape[-1]
+            gT, gH, gW = T // tub, H // ps, W // ps
+            slot = torch.arange(gT * gH * gW, device=query_embeds.device) // (gH * gW)
+            scene_frame_pos = slot.float() * tub + (tub - 1) / 2.0   # (N_tokens,)
+
         dec = self.decoder(
-            scene_features, query_embeds, query_rays, mode_idx, prev_latent=prev_latent)
+            scene_features, query_embeds, query_rays, mode_idx, prev_latent=prev_latent,
+            scene_frame_pos=scene_frame_pos)
         grid_logits = dec['grid_logits']
         latent = dec['latent']
 

@@ -186,6 +186,16 @@ def run(config_path, fabric):
             mode = config.wandb.mode,
             config = config)
 
+        # Record run identifiers so a run maps to its checkpoint folder: run_id is the
+        # short id (e.g. 'g6cy77bp'); run_dir is the full 'run-<timestamp>-<id>' folder
+        # name. Added to the wandb config (sortable columns in the runs table) and to
+        # the saved config.toml below.
+        run_id = run_dir = None
+        if wandb.run is not None:
+            run_id = wandb.run.id
+            run_dir = os.path.basename(os.path.dirname(wandb.run.dir))
+            wandb.config.update({'run_id': run_id, 'run_dir': run_dir})
+
     exp_dir = ''
     if fabric.is_global_zero and wandb.run is not None:
         exp_dir = wandb.run.dir
@@ -193,7 +203,8 @@ def run(config_path, fabric):
         json_path = os.path.join(exp_dir, 'results.json')
 
         wandb_config_path = os.path.join(exp_dir, 'config.toml')
-        save_config(config_path, wandb_config_path)
+        save_config(config_path, wandb_config_path,
+                    extra={'run_id': run_id, 'run_dir': run_dir} if run_id else None)
         wandb.save(wandb_config_path, base_path = exp_dir)
 
     # device = torch.device(config.devices.device)
@@ -495,14 +506,22 @@ def run(config_path, fabric):
                            (i + 1 == iters_per_gpu))
 
         if checkpoint_cond and fabric.is_global_zero:
-            save_checkpoint(model, optimizer, prefix = exp_dir, i = global_i, config = config)
+            ckpt_path = save_checkpoint(model, optimizer, prefix = exp_dir, i = global_i, config = config)
+            # Track the latest checkpoint in the wandb summary -> shows as a column in
+            # the runs table; last-write wins, so it ends on the final checkpoint.
+            if wandb.run is not None:
+                wandb.run.summary['final_checkpoint'] = os.path.basename(ckpt_path)
+                wandb.run.summary['final_checkpoint_iter'] = global_i
 
         train_loss.reset_history()
         val_loss.reset_history()
 
     # save checkpoint on interrupt
     if interrupted and fabric.is_global_zero:
-        save_checkpoint(model, optimizer, prefix = exp_dir, i = global_i, config = config)
+        ckpt_path = save_checkpoint(model, optimizer, prefix = exp_dir, i = global_i, config = config)
+        if wandb.run is not None:
+            wandb.run.summary['final_checkpoint'] = os.path.basename(ckpt_path)
+            wandb.run.summary['final_checkpoint_iter'] = global_i
 
     if fabric.is_global_zero:
         wandb.finish()
