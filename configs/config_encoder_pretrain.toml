@@ -108,7 +108,13 @@ scene_proj_dim = 512
 scene_proj_prenorm = false
 scene_proj_mlp = false
 
-scene_pos_embed_mode = 'learned'
+# 'ropepos' = temporal RoPE in the decoder cross-attention + a learned spatial-only scene
+# pos_embed (restores absolute spatial position that the RoPE video backbone lacks).
+scene_pos_embed_mode = 'ropepos'
+rope_base = 100.0
+# 'fourier_rel' = Fourier encodings of absolute query, absolute target, and the relative
+# (target-query) gap as a dedicated fusion term (length-agnostic, gap-consistent).
+time_embed_mode = 'fourier_rel'
 
 
 # "gridresid" = per-axis soft-argmax bin grid (CE-supervised): 3D head emits a motion residual

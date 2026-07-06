@@ -43,6 +43,7 @@ class TrackerEncoder(nn.Module):
                  video_encoder_finetune_last_n_layers = None,
                  scene_pos_embed_mode = 'learned',
                  rope_base = 100.0,
+                 time_embed_mode = 'learned',
                  corr_radius = 3, 
                  max_freq = 10, n_iters = 4, embedding_dim = 256,
                  query_patch_size = 9,
@@ -121,13 +122,23 @@ class TrackerEncoder(nn.Module):
         # 'rope' is a decoder-level positional scheme, not an additive scene term: it means
         # "no additive scene pos_embed + 1-D temporal RoPE in the decoder cross-attention".
         # So map it to scene pos_embed_mode='none' and flip the decoder rope flag.
-        assert scene_pos_embed_mode in ('learned', 'sincos', 'none', 'rope'), \
-            f"scene_pos_embed_mode must be 'learned'|'sincos'|'none'|'rope', got {scene_pos_embed_mode!r}"
+        # 'ropepos' is the same temporal RoPE but WITH a learned spatial-only additive scene
+        # pos_embed (scene mode 'spatial'): restores absolute spatial position (the RoPE video
+        # backbone is translation-equivariant) while keeping time relative via RoPE.
+        assert scene_pos_embed_mode in ('learned', 'sincos', 'none', 'rope', 'ropepos'), \
+            f"scene_pos_embed_mode must be 'learned'|'sincos'|'none'|'rope'|'ropepos', got {scene_pos_embed_mode!r}"
         self.scene_pos_embed_mode = scene_pos_embed_mode
-        self.cross_attn_rope = (scene_pos_embed_mode == 'rope')
-        scene_pos_embed_mode_resolved = 'none' if self.cross_attn_rope else scene_pos_embed_mode
+        self.cross_attn_rope = scene_pos_embed_mode in ('rope', 'ropepos')
+        if scene_pos_embed_mode == 'rope':
+            scene_pos_embed_mode_resolved = 'none'
+        elif scene_pos_embed_mode == 'ropepos':
+            scene_pos_embed_mode_resolved = 'spatial'
+        else:
+            scene_pos_embed_mode_resolved = scene_pos_embed_mode
         # RoPE frequency base for the cross-attention rope (only used when mode == 'rope').
         self.rope_base = rope_base
+        # Query/target time encoding scheme for the QueryEncoder ('learned' | 'fourier_rel').
+        self.time_embed_mode = time_embed_mode
 
 
         # query encoder params
@@ -206,6 +217,7 @@ class TrackerEncoder(nn.Module):
             use_volume_embedding=use_volume_embedding,
             principal_point_embedding=principal_point_embedding,
             intrinsic_embedding=intrinsic_embedding,
+            time_embed_mode=time_embed_mode,
         )
         self.decoder = Decoder(
             embed_dim=latent_dim,

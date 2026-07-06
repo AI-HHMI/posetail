@@ -224,7 +224,8 @@ class QueryEncoder(nn.Module):
                  n_frames=16, corr_radius=2, max_freq=10,
                  patch_size=9, use_volume_embedding=True,
                  principal_point_embedding=False,
-                 intrinsic_embedding=False):
+                 intrinsic_embedding=False,
+                 time_embed_mode='learned'):
         super().__init__()
         self.embed_dim = embed_dim
         self.decoder_dim = decoder_dim
@@ -236,8 +237,23 @@ class QueryEncoder(nn.Module):
         self.principal_point_embedding = principal_point_embedding
         self.intrinsic_embedding = intrinsic_embedding
 
-        self.t_query_embed = nn.Embedding(n_frames, embed_dim)
-        self.t_target_embed = nn.Embedding(n_frames, embed_dim)
+        # Query/target time encoding. 'learned' (default) = the original learned frame
+        # tables + length-interpolation (backward-compatible, bit-identical). 'fourier_rel'
+        # = Fourier encodings of absolute query, absolute target, AND the relative gap
+        # (target-query) as a third fusion term -- length-agnostic and gap-consistent.
+        assert time_embed_mode in ('learned', 'fourier_rel'), \
+            f"time_embed_mode must be 'learned' | 'fourier_rel', got {time_embed_mode!r}"
+        self.time_embed_mode = time_embed_mode
+        # Fixed normalizer for Fourier time encodings (NOT the runtime clip length -- a fixed
+        # constant keeps a given absolute frame gap mapped to the same encoding at any T).
+        self.time_norm = float(n_frames)
+        if self.time_embed_mode == 'learned':
+            self.t_query_embed = nn.Embedding(n_frames, embed_dim)
+            self.t_target_embed = nn.Embedding(n_frames, embed_dim)
+        else:  # 'fourier_rel'
+            self.linear_query_time = nn.Linear(2 * max_freq + 1, embed_dim)
+            self.linear_target_time = nn.Linear(2 * max_freq + 1, embed_dim)
+            self.linear_gap = nn.Linear(2 * max_freq + 1, embed_dim)
 
         self.vis_embed = nn.Embedding(2, embed_dim)
 
@@ -275,7 +291,9 @@ class QueryEncoder(nn.Module):
 
         self.n_fusion_terms = (6 + int(self.use_volume_embedding)
                                + int(self.principal_point_embedding)
-                               + int(self.intrinsic_embedding))
+                               + int(self.intrinsic_embedding)
+                               # fourier_rel adds a dedicated relative-gap fusion term
+                               + int(self.time_embed_mode == 'fourier_rel'))
         self.gate = nn.Sequential(
             nn.Linear(embed_dim * self.n_fusion_terms, self.n_fusion_terms),
             nn.Sigmoid()
@@ -300,6 +318,16 @@ class QueryEncoder(nn.Module):
         w = F.interpolate(emb.weight.t().unsqueeze(0), size=n_frames,
                           mode='linear', align_corners=False).squeeze(0).t()
         return F.embedding(times, w)
+
+    def _fourier_time(self, times, linear):
+        """Fourier-encode a scalar frame quantity (absolute frame or relative gap) and
+        project to embed_dim. times: (B, T) int/float -> (B, T, embed_dim). Uses a FIXED
+        normalizer (self.time_norm) so a given absolute value maps to the same encoding at
+        any clip length. Mirrors the depth Fourier pattern."""
+        # get_fourier_encoding expects (b, s, n, r); use n=r=1 for the scalar time, then squeeze.
+        s = (times.to(torch.float32) / self.time_norm)[..., None, None]   # (B, T, 1, 1)
+        feat = torch.cat([s, get_fourier_encoding(s, min_freq=0, max_freq=self.max_freq)], dim=-1)
+        return linear(feat)[..., 0, :]                                    # (B, T, embed_dim)
 
     def forward(self, preprocessed_views, camera_group,
                 query_coords, query_time, target_time,
@@ -381,13 +409,23 @@ class QueryEncoder(nn.Module):
         embed_patch = rearrange(embed_flat, '(cams b t) d -> b t cams d',
                                 cams=n_cams, b=B, t=T_query)
 
-        # Time embeddings (shared). Resize the learned time tables to the actual clip length so
-        # n_frames can differ from training (no-op when it matches).
-        n_frames_cur = preprocessed_views[0].shape[1]
-        embed_query_time  = repeat(self._interp_time_embed(self.t_query_embed, query_time, n_frames_cur),
-                                   'b t d -> b t cams d', cams=n_cams)
-        embed_target_time = repeat(self._interp_time_embed(self.t_target_embed, target_time, n_frames_cur),
-                                   'b t d -> b t cams d', cams=n_cams)
+        # Time embeddings (shared, not per-camera -> computed at (b,t,d) then broadcast over cams).
+        embed_gap = None
+        if self.time_embed_mode == 'learned':
+            # Resize the learned time tables to the actual clip length so n_frames can differ
+            # from training (no-op when it matches).
+            n_frames_cur = preprocessed_views[0].shape[1]
+            embed_query_time  = repeat(self._interp_time_embed(self.t_query_embed, query_time, n_frames_cur),
+                                       'b t d -> b t cams d', cams=n_cams)
+            embed_target_time = repeat(self._interp_time_embed(self.t_target_embed, target_time, n_frames_cur),
+                                       'b t d -> b t cams d', cams=n_cams)
+        else:  # 'fourier_rel': absolute query + absolute target + relative gap (extra term)
+            embed_query_time  = repeat(self._fourier_time(query_time, self.linear_query_time),
+                                       'b t d -> b t cams d', cams=n_cams)
+            embed_target_time = repeat(self._fourier_time(target_time, self.linear_target_time),
+                                       'b t d -> b t cams d', cams=n_cams)
+            embed_gap = repeat(self._fourier_time(target_time - query_time, self.linear_gap),
+                               'b t d -> b t cams d', cams=n_cams)
 
         # Depth, visibility, volume: computed for 3D; missing tokens for 2D
         if coord_dim == 3:
@@ -430,8 +468,11 @@ class QueryEncoder(nn.Module):
                 embed_volume = repeat(self.missing_volume, 'd -> b t c d', b=B, t=T_query, c=n_cams)
 
         # Gated fusion (shared)
-        embed_terms = [embed_patch, embed_query_time, embed_target_time,
-                       embed_pos, embed_depth, embed_vis]
+        embed_terms = [embed_patch, embed_query_time, embed_target_time]
+        if embed_gap is not None:
+            # fourier_rel: dedicated relative-gap fusion term (kept adjacent to the time terms).
+            embed_terms.append(embed_gap)
+        embed_terms += [embed_pos, embed_depth, embed_vis]
         if self.principal_point_embedding:
             embed_terms.append(embed_pp)
         if self.intrinsic_embedding:
@@ -504,11 +545,16 @@ class SceneRepresentation(nn.Module):
         #               -- length-agnostic, no parameter, no interpolation.
         #   'none'    : ablation -- no added positional signal; rely solely on the backbone.
         # Only 'learned' registers a parameter; the rest of the module is identical.
-        assert pos_embed_mode in ('learned', 'sincos', 'none'), \
-            f"pos_embed_mode must be 'learned' | 'sincos' | 'none', got {pos_embed_mode!r}"
+        #   'spatial' : learned SPATIAL-ONLY table (gH*gW), shared across all frames --
+        #               pairs with decoder temporal RoPE (see TrackerEncoder 'ropepos'):
+        #               spatial position is additive/absolute, temporal is relative RoPE.
+        assert pos_embed_mode in ('learned', 'sincos', 'none', 'spatial'), \
+            f"pos_embed_mode must be 'learned' | 'sincos' | 'none' | 'spatial', got {pos_embed_mode!r}"
         self.pos_embed_mode = pos_embed_mode
         # Encoder-dim positional width (self.embed_dim is reassigned to decoder_dim below).
         self.pos_embed_dim = self.embed_dim
+        self._pe_grid = None
+        self._pe_grid_spatial = None
         if self.pos_embed_mode == 'learned':
             n_tokens = (n_frames // self.tubelet_size) * (image_size // self.patch_size) * (image_size // self.patch_size)
             self.pos_embed = nn.Parameter(
@@ -523,9 +569,16 @@ class SceneRepresentation(nn.Module):
             self._pe_grid = (n_frames // self.tubelet_size,
                              image_size // self.patch_size,
                              image_size // self.patch_size)
+        elif self.pos_embed_mode == 'spatial':
+            # Spatial-only learned table (gH*gW, D), broadcast across all frames. No time
+            # axis: temporal position is supplied by the decoder's cross-attention RoPE.
+            gH0 = image_size // self.patch_size
+            gW0 = image_size // self.patch_size
+            self.pos_embed = nn.Parameter(torch.zeros(1, gH0 * gW0, self.embed_dim))
+            nn.init.trunc_normal_(self.pos_embed, mean=0.0, std=0.02, a=-2 * 0.02, b=2 * 0.02)
+            self._pe_grid_spatial = (gH0, gW0)
         else:
             self.pos_embed = None
-            self._pe_grid = None
         # Per-(grid,device,dtype) cache for the fixed sincos table (recomputing the
         # ~N*D tensor every forward would be wasteful; the grid is constant in practice).
         self._sincos_cache = {}
@@ -607,6 +660,23 @@ class SceneRepresentation(nn.Module):
         pe = F.interpolate(pe, size=(gT, gH, gW), mode='trilinear', align_corners=False)
         return pe.permute(0, 2, 3, 4, 1).reshape(1, gT * gH * gW, D)
 
+    def _spatial_pos_embed_for(self, gT, gH, gW):
+        """Spatial-only learned pos_embed for grid (gH,gW), tiled across gT frames.
+        Bilinearly interpolates the stored (gH0,gW0) table when the requested spatial grid
+        differs (identity otherwise), then repeats it t-major -> (1, gT*gH*gW, D). The same
+        spatial code is shared by every frame; time is handled by the decoder RoPE."""
+        sH, sW = self._pe_grid_spatial
+        D = self.pos_embed.shape[-1]
+        if (gH, gW) == (sH, sW):
+            spatial = self.pos_embed                                   # (1, gH*gW, D)
+        else:
+            pe = self.pos_embed.reshape(1, sH, sW, D).permute(0, 3, 1, 2)
+            pe = F.interpolate(pe, size=(gH, gW), mode='bilinear', align_corners=False)
+            spatial = pe.permute(0, 2, 3, 1).reshape(1, gH * gW, D)
+        # Tokens are ordered t-major, so tiling the spatial block gT times gives each frame
+        # the identical spatial code.
+        return spatial.repeat(1, gT, 1)                               # (1, gT*gH*gW, D)
+
     def _sincos_pos_embed_for(self, gT, gH, gW, device, dtype):
         """Fixed factorized 3-D sin/cos table for grid (gT,gH,gW), cached per
         (grid, device, dtype) since the grid is constant across a run."""
@@ -636,6 +706,8 @@ class SceneRepresentation(nn.Module):
                 gW = view.shape[4] // self.patch_size
                 if self.pos_embed_mode == 'learned':
                     feat = feat + self._pos_embed_for(gT, gH, gW)
+                elif self.pos_embed_mode == 'spatial':
+                    feat = feat + self._spatial_pos_embed_for(gT, gH, gW)
                 else:  # 'sincos'
                     feat = feat + self._sincos_pos_embed_for(gT, gH, gW, feat.device, feat.dtype)
             if self.kv_proj is not None:
