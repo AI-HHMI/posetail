@@ -42,7 +42,8 @@ from posetail.posetail.scorer_encoder import ScorerEncoder
 from posetail.posetail.losses_scorer import TripletScorerLoss
 from train_utils import (load_config, save_config, set_seeds, resolve_seed, write_json,
                          build_optimizer_param_groups, load_checkpoint, save_checkpoint,
-                         total_to_per_gpu, dict_to_device, get_timestamp)
+                         total_to_per_gpu, dict_to_device, get_timestamp,
+                         drop_nan_motion_metrics)
 
 
 def parse_args():
@@ -332,7 +333,7 @@ def run(config_path, fabric):
         if fabric.is_global_zero:
             result_dict['train/iter_time'] = time.time() - iter_time
             iter_time = time.time()
-            wandb.log(result_dict)
+            wandb.log(drop_nan_motion_metrics(result_dict))
             if wandb.run is not None:
                 write_json(json_path, result_dict)
             if i % print_freq == 0:

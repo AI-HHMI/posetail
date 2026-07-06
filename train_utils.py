@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import time
 import toml
 import torch
@@ -888,6 +889,20 @@ def train_epoch(config, model, fabric, dataloader,
         train_dict.update(avg_metrics_dict)
 
     return train_dict
+
+
+def drop_nan_motion_metrics(metrics):
+    ''' Return a copy of the metrics dict with NaN-valued mte_mo_* entries removed.
+    Empty motion bins produce NaN mte_mo_* values; logging them clutters the wandb
+    visualizer, so drop those keys for this step. Other NaN metrics are kept, since
+    a NaN there is meaningful. '''
+    def _is_nan(v):
+        try:
+            return math.isnan(float(v))
+        except (TypeError, ValueError):
+            return False
+    return {k: v for k, v in metrics.items()
+            if not ('mte_mo' in k and _is_nan(v))}
 
 
 def average_metrics(dicts, prefix, name = None, nan_safe = False):

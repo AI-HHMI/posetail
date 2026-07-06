@@ -494,7 +494,7 @@ def run(config_path, fabric):
                                                  - result_dict['train/elapsed_time']
                                                  - result_dict.get('val/elapsed_time', 0.0) )
             iter_time = time.time()
-            wandb.log(result_dict)
+            wandb.log(drop_nan_motion_metrics(result_dict))
             write_json(json_path, result_dict)
             wandb.save(json_path, base_path = exp_dir)
 
