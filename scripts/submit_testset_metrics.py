@@ -90,7 +90,7 @@ def main():
     ap.add_argument('--wandb-folder', help='explicit wandb run dir (overrides --runid/--wandb-project)')
     ap.add_argument('--datasets', nargs='+', default=ALL_DATASETS, choices=ALL_DATASETS)
     ap.add_argument('--out', help='output/predictions dir '
-                    '(default: ~/ghome/results/posetail-inference/testset-eval-<runid>)')
+                    '(default: ~/results/posetail-inference/testset-eval-<runid>)')
     # eval passthrough
     ap.add_argument('--checkpoint', type=int, default=None, help='default: latest checkpoint')
     ap.add_argument('--force', action='store_true', help='recompute even if predictions exist')
@@ -107,7 +107,7 @@ def main():
 
     wandb_folder, runid = resolve_run(args)
     out_dir = os.path.abspath(os.path.expanduser(
-        args.out or f'~/ghome/results/posetail-inference/testset-eval-{runid}'))
+        args.out or f'~/results/posetail-inference/testset-eval-{runid}'))
     job = build_job_script(args, wandb_folder, runid, out_dir)
 
     print(f'run id      : {runid}')
