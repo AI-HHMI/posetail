@@ -1216,6 +1216,15 @@ class Decoder(nn.Module):
                                torch.exp(self.log_soft_argmax_temp)
                                if self.log_soft_argmax_temp is not None
                                else self._soft_argmax_temp_fixed)
+        # Bound the (learnable) softmax sharpness. exp(log_temp) is unclamped, so an upward
+        # drift makes softmax(logits * T) near one-hot and its gradient at a near-tied argmax
+        # explodes (isolated grad-norm spikes with normal loss). Clamp the effective temp of
+        # BOTH the soft-argmax path and the subpixel path (passed in via `temp`). T_MAX is a
+        # few x the subpixel init (10.0) so intentional sharpness is preserved; the min is
+        # cheap insurance against collapse to a near-uniform softmax. Differentiable clamp
+        # keeps the parameter learnable inside the range.
+        if torch.is_tensor(softmax_temperature):
+            softmax_temperature = softmax_temperature.clamp(min=1e-2, max=30.0)
         K = logits.shape[-1]
         argmax = logits.argmax(dim=-1, keepdim=True)
         index = torch.arange(K, device=logits.device)

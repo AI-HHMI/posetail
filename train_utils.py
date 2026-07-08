@@ -672,7 +672,17 @@ def train_iteration(config, model, fabric, batch,
             grad_norm += p.grad.detach().data.norm(2).item() ** 2
     grad_norm = grad_norm ** 0.5
 
-    # torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm, 
+    # Track the learnable soft-argmax temperatures (exp of unclamped log-params). An upward
+    # drift is the suspected driver of isolated grad-norm spikes; log so it can be confirmed
+    # (and confirmed pinned once _grid_softmax clamps the effective temperature).
+    temp_dict = {}
+    for name, p in model.named_parameters():
+        if name.endswith('log_soft_argmax_temp'):
+            temp_dict[f'{prefix}soft_argmax_temp'] = float(torch.exp(p.detach()).item())
+        elif name.endswith('log_subpixel_temp'):
+            temp_dict[f'{prefix}subpixel_temp'] = float(torch.exp(p.detach()).item())
+
+    # torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm,
     #                                error_if_nonfinite = False)
 
     try:
@@ -726,6 +736,7 @@ def train_iteration(config, model, fabric, batch,
                   f'{prefix}elapsed_time_hms': elapsed_time_hms,
                   f'{prefix}learning_rate': learning_rate,
                   f'{prefix}grad_norm': grad_norm}
+    train_dict.update(temp_dict)
     train_dict.update(loss_dict)
 
     # average evaluation metrics if we evaluated
