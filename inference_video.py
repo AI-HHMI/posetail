@@ -87,6 +87,25 @@ def camera_group_to_device(camera_group, device):
     return [dict_to_device(cam_dict, device) for cam_dict in camera_group]
 
 
+def crop_frames_with_padding(frames, x1, y1, x2, y2, pad_value=0):
+    """Crop frames[..., y1:y2, x1:x2] with zero-padding for out-of-frame regions.
+
+    Unlike a raw numpy slice (which wraps for negative coords and truncates for
+    coords past the edge), this returns exactly a (x2-x1) x (y2-y1) crop with any
+    off-frame area filled with ``pad_value``, so the pixels stay aligned with the
+    camera geometry that assumes the crop spans [x1,x2) x [y1,y2).
+
+    ``frames`` is (..., H, W, C); x/y are ints that may fall outside [0, W)/[0, H).
+    """
+    *lead, H, W, C = frames.shape
+    out = np.full((*lead, y2 - y1, x2 - x1, C), pad_value, dtype=frames.dtype)
+    sx1, sy1 = max(x1, 0), max(y1, 0)
+    sx2, sy2 = min(x2, W), min(y2, H)
+    if sx2 > sx1 and sy2 > sy1:
+        out[..., sy1 - y1:sy2 - y1, sx1 - x1:sx2 - x1, :] = frames[..., sy1:sy2, sx1:sx2, :]
+    return out
+
+
 def load_multiview_clip(readers, start_frame, n_frames, crop_boxes=None, target_sizes=None):
     max_available = min(len(reader) for reader in readers)
     end_frame = min(start_frame + n_frames, max_available)
@@ -103,7 +122,7 @@ def load_multiview_clip(readers, start_frame, n_frames, crop_boxes=None, target_
 
         if crop_boxes is not None:
             x1, y1, x2, y2 = crop_boxes[cam_idx].cpu().to(torch.int32).tolist()
-            frames = frames[:, y1:y2, x1:x2, :]
+            frames = crop_frames_with_padding(frames, x1, y1, x2, y2)
 
         if target_sizes is not None:
             target_size_cam = target_sizes[cam_idx]
@@ -148,19 +167,24 @@ def crop_camera_group_to_queries(camera_group, query_coords, min_crop_dim, paddi
             current_width = high[0] - low[0]
             current_height = high[1] - low[1]
 
-            min_dim = max(min_crop_dim, current_width, current_height)
+            # Cap each axis at the image dimension so the crop never exceeds the
+            # frame (matches posetail_dataset.crop_cgroup_to_points). Without the
+            # per-axis cap, a wide bbox forces min_dim > frame height, and
+            # `low = high - min_dim` yields a negative offset -> load_multiview_clip's
+            # numpy slice wraps instead of padding, breaking the 2D<->3D geometry.
+            base = max(min_crop_dim, int(current_width), int(current_height))
+            min_dim_x = min(base, int(size[0]))
+            min_dim_y = min(base, int(size[1]))
 
-            if current_width < min_dim:
+            if current_width < min_dim_x:
                 center_x = (low[0] + high[0]) // 2
-                low[0] = torch.clamp(center_x - min_dim // 2, 0, size[0] - min_dim)
-                high[0] = torch.clamp(low[0] + min_dim, 0, size[0])
-                low[0] = high[0] - min_dim
+                low[0] = torch.clamp(center_x - min_dim_x // 2, 0, size[0] - min_dim_x)
+                high[0] = low[0] + min_dim_x
 
-            if current_height < min_dim:
+            if current_height < min_dim_y:
                 center_y = (low[1] + high[1]) // 2
-                low[1] = torch.clamp(center_y - min_dim // 2, 0, size[1] - min_dim)
-                high[1] = torch.clamp(low[1] + min_dim, 0, size[1])
-                low[1] = high[1] - min_dim
+                low[1] = torch.clamp(center_y - min_dim_y // 2, 0, size[1] - min_dim_y)
+                high[1] = low[1] + min_dim_y
 
         crops.append(torch.cat([low, high]))
 
@@ -195,7 +219,10 @@ def resize_camera_group(camera_group, target_res):
         cam['mat'][2, 2] = 1
 
         if 'offset' in cam:
-            cam['offset'] = torch.round(cam['offset'] * scale).to(torch.int32)
+            # Keep offset float (matches posetail_dataset.resize_camera_group).
+            # Rounding to int here left a sub-pixel (<0.5px) mismatch against the
+            # exact `mat * scale`, since project_cam does `mat @ X - offset`.
+            cam['offset'] = cam['offset'] * scale
 
         camera_group_scaled.append(cam)
 
@@ -446,11 +473,13 @@ def run_tracker_encoder_on_videos(
             )
 
             # For 2D, queries are pixel coords in the ORIGINAL frame; the model
-            # expects them in the cropped+resized model-input frame. The crop is
-            # square, so a single uniform scale maps between the two spaces.
+            # expects them in the cropped+resized model-input frame. resize_camera_group
+            # scales by target/max(width,height), so use the SAME max here (crops are
+            # non-square after the per-axis cap; width-only would mis-scale portrait crops).
             if is_2d:
                 crop_low = crop_boxes[0][:2].to(device=device, dtype=torch.float32)
-                crop_side = (crop_boxes[0][2] - crop_boxes[0][0]).to(torch.float32)
+                crop_wh = (crop_boxes[0][2:] - crop_boxes[0][:2]).to(torch.float32)
+                crop_side = torch.max(crop_wh)
                 model_scale = float(model.image_size) / float(crop_side)
                 queries_model = (current_queries - crop_low) * model_scale
             else:
@@ -934,10 +963,9 @@ def run_inference(
             f'number of cameras ({len(camera_group)}) in metadata'
         )
     
-    # subsample cameras 
+    # subsample cameras
     n_cams_total = len(camera_group)
     cam_indices_used = list(range(n_cams_total))
-    cam_names_used = [cam_names[i] for i in cam_indices_used]
 
     if n_views is not None and n_views < n_cams_total:
         rng = np.random.default_rng(view_seed)
@@ -947,6 +975,9 @@ def run_inference(
         video_paths  = [video_paths[i] for i in cam_indices_used]
     elif n_views is not None:
         print(f'--n-views={n_views} >= available cameras ({n_cams_total}); using all cameras')
+
+    # Record the cameras actually used, after any subsampling above.
+    cam_names_used = [cam_names[i] for i in cam_indices_used]
 
     if per_subject:
         all_subject_outputs = []
@@ -1102,7 +1133,7 @@ def run_inference(
     outputs['n_frames_requested'] = n_frames
     outputs['n_overlap'] = n_overlap
     outputs['per_subject'] = per_subject
-    outputs['n_cams_total'] = len(camera_group)
+    outputs['n_cams_total'] = n_cams_total
     outputs['cam_names_used'] = np.array(cam_names_used, dtype=str)
 
     if isinstance(outputs['coords_pred'], torch.Tensor) and outputs['coords_pred'].ndim >= 2:

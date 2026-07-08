@@ -182,8 +182,17 @@ def load_image(cam_img_path, crop_coords=None, target_size=None, rotation=None):
         img = cv2.warpAffine(img, M_2x3, new_size)
 
     if crop_coords is not None:
-        x1, y1, x2, y2 = crop_coords
-        img = img[y1:y2, x1:x2]
+        x1, y1, x2, y2 = (int(c) for c in crop_coords)
+        # Pad-safe crop: off-frame regions are zero-filled rather than wrapped
+        # (raw negative slicing) so pixels stay aligned with the crop geometry.
+        # crop_cgroup_to_points* already keep boxes in-bounds; this guards any
+        # future off-frame box (e.g. from the rotation-augment path).
+        h, w = img.shape[:2]
+        out = np.zeros((y2 - y1, x2 - x1, img.shape[2]), dtype=img.dtype)
+        sx1, sy1, sx2, sy2 = max(x1, 0), max(y1, 0), min(x2, w), min(y2, h)
+        if sx2 > sx1 and sy2 > sy1:
+            out[sy1 - y1:sy2 - y1, sx1 - x1:sx2 - x1] = img[sy1:sy2, sx1:sx2]
+        img = out
 
     if target_size is not None:
         img = cv2.resize(img, target_size)
