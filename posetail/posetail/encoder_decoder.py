@@ -224,7 +224,8 @@ class QueryEncoder(nn.Module):
                  n_frames=16, corr_radius=2, max_freq=10,
                  patch_size=9, use_volume_embedding=True,
                  principal_point_embedding=False,
-                 intrinsic_embedding=False):
+                 intrinsic_embedding=False,
+                 time_embed_mode='learned'):
         super().__init__()
         self.embed_dim = embed_dim
         self.decoder_dim = decoder_dim
@@ -236,8 +237,23 @@ class QueryEncoder(nn.Module):
         self.principal_point_embedding = principal_point_embedding
         self.intrinsic_embedding = intrinsic_embedding
 
-        self.t_query_embed = nn.Embedding(n_frames, embed_dim)
-        self.t_target_embed = nn.Embedding(n_frames, embed_dim)
+        # Query/target time encoding. 'learned' (default) = the original learned frame
+        # tables + length-interpolation (backward-compatible, bit-identical). 'fourier_rel'
+        # = Fourier encodings of absolute query, absolute target, AND the relative gap
+        # (target-query) as a third fusion term -- length-agnostic and gap-consistent.
+        assert time_embed_mode in ('learned', 'fourier_rel'), \
+            f"time_embed_mode must be 'learned' | 'fourier_rel', got {time_embed_mode!r}"
+        self.time_embed_mode = time_embed_mode
+        # Fixed normalizer for Fourier time encodings (NOT the runtime clip length -- a fixed
+        # constant keeps a given absolute frame gap mapped to the same encoding at any T).
+        self.time_norm = float(n_frames)
+        if self.time_embed_mode == 'learned':
+            self.t_query_embed = nn.Embedding(n_frames, embed_dim)
+            self.t_target_embed = nn.Embedding(n_frames, embed_dim)
+        else:  # 'fourier_rel'
+            self.linear_query_time = nn.Linear(2 * max_freq + 1, embed_dim)
+            self.linear_target_time = nn.Linear(2 * max_freq + 1, embed_dim)
+            self.linear_gap = nn.Linear(2 * max_freq + 1, embed_dim)
 
         self.vis_embed = nn.Embedding(2, embed_dim)
 
@@ -275,7 +291,9 @@ class QueryEncoder(nn.Module):
 
         self.n_fusion_terms = (6 + int(self.use_volume_embedding)
                                + int(self.principal_point_embedding)
-                               + int(self.intrinsic_embedding))
+                               + int(self.intrinsic_embedding)
+                               # fourier_rel adds a dedicated relative-gap fusion term
+                               + int(self.time_embed_mode == 'fourier_rel'))
         self.gate = nn.Sequential(
             nn.Linear(embed_dim * self.n_fusion_terms, self.n_fusion_terms),
             nn.Sigmoid()
@@ -300,6 +318,16 @@ class QueryEncoder(nn.Module):
         w = F.interpolate(emb.weight.t().unsqueeze(0), size=n_frames,
                           mode='linear', align_corners=False).squeeze(0).t()
         return F.embedding(times, w)
+
+    def _fourier_time(self, times, linear):
+        """Fourier-encode a scalar frame quantity (absolute frame or relative gap) and
+        project to embed_dim. times: (B, T) int/float -> (B, T, embed_dim). Uses a FIXED
+        normalizer (self.time_norm) so a given absolute value maps to the same encoding at
+        any clip length. Mirrors the depth Fourier pattern."""
+        # get_fourier_encoding expects (b, s, n, r); use n=r=1 for the scalar time, then squeeze.
+        s = (times.to(torch.float32) / self.time_norm)[..., None, None]   # (B, T, 1, 1)
+        feat = torch.cat([s, get_fourier_encoding(s, min_freq=0, max_freq=self.max_freq)], dim=-1)
+        return linear(feat)[..., 0, :]                                    # (B, T, embed_dim)
 
     def forward(self, preprocessed_views, camera_group,
                 query_coords, query_time, target_time,
@@ -381,13 +409,23 @@ class QueryEncoder(nn.Module):
         embed_patch = rearrange(embed_flat, '(cams b t) d -> b t cams d',
                                 cams=n_cams, b=B, t=T_query)
 
-        # Time embeddings (shared). Resize the learned time tables to the actual clip length so
-        # n_frames can differ from training (no-op when it matches).
-        n_frames_cur = preprocessed_views[0].shape[1]
-        embed_query_time  = repeat(self._interp_time_embed(self.t_query_embed, query_time, n_frames_cur),
-                                   'b t d -> b t cams d', cams=n_cams)
-        embed_target_time = repeat(self._interp_time_embed(self.t_target_embed, target_time, n_frames_cur),
-                                   'b t d -> b t cams d', cams=n_cams)
+        # Time embeddings (shared, not per-camera -> computed at (b,t,d) then broadcast over cams).
+        embed_gap = None
+        if self.time_embed_mode == 'learned':
+            # Resize the learned time tables to the actual clip length so n_frames can differ
+            # from training (no-op when it matches).
+            n_frames_cur = preprocessed_views[0].shape[1]
+            embed_query_time  = repeat(self._interp_time_embed(self.t_query_embed, query_time, n_frames_cur),
+                                       'b t d -> b t cams d', cams=n_cams)
+            embed_target_time = repeat(self._interp_time_embed(self.t_target_embed, target_time, n_frames_cur),
+                                       'b t d -> b t cams d', cams=n_cams)
+        else:  # 'fourier_rel': absolute query + absolute target + relative gap (extra term)
+            embed_query_time  = repeat(self._fourier_time(query_time, self.linear_query_time),
+                                       'b t d -> b t cams d', cams=n_cams)
+            embed_target_time = repeat(self._fourier_time(target_time, self.linear_target_time),
+                                       'b t d -> b t cams d', cams=n_cams)
+            embed_gap = repeat(self._fourier_time(target_time - query_time, self.linear_gap),
+                               'b t d -> b t cams d', cams=n_cams)
 
         # Depth, visibility, volume: computed for 3D; missing tokens for 2D
         if coord_dim == 3:
@@ -430,8 +468,11 @@ class QueryEncoder(nn.Module):
                 embed_volume = repeat(self.missing_volume, 'd -> b t c d', b=B, t=T_query, c=n_cams)
 
         # Gated fusion (shared)
-        embed_terms = [embed_patch, embed_query_time, embed_target_time,
-                       embed_pos, embed_depth, embed_vis]
+        embed_terms = [embed_patch, embed_query_time, embed_target_time]
+        if embed_gap is not None:
+            # fourier_rel: dedicated relative-gap fusion term (kept adjacent to the time terms).
+            embed_terms.append(embed_gap)
+        embed_terms += [embed_pos, embed_depth, embed_vis]
         if self.principal_point_embedding:
             embed_terms.append(embed_pp)
         if self.intrinsic_embedding:
@@ -504,11 +545,16 @@ class SceneRepresentation(nn.Module):
         #               -- length-agnostic, no parameter, no interpolation.
         #   'none'    : ablation -- no added positional signal; rely solely on the backbone.
         # Only 'learned' registers a parameter; the rest of the module is identical.
-        assert pos_embed_mode in ('learned', 'sincos', 'none'), \
-            f"pos_embed_mode must be 'learned' | 'sincos' | 'none', got {pos_embed_mode!r}"
+        #   'spatial' : learned SPATIAL-ONLY table (gH*gW), shared across all frames --
+        #               pairs with decoder temporal RoPE (see TrackerEncoder 'ropepos'):
+        #               spatial position is additive/absolute, temporal is relative RoPE.
+        assert pos_embed_mode in ('learned', 'sincos', 'none', 'spatial'), \
+            f"pos_embed_mode must be 'learned' | 'sincos' | 'none' | 'spatial', got {pos_embed_mode!r}"
         self.pos_embed_mode = pos_embed_mode
         # Encoder-dim positional width (self.embed_dim is reassigned to decoder_dim below).
         self.pos_embed_dim = self.embed_dim
+        self._pe_grid = None
+        self._pe_grid_spatial = None
         if self.pos_embed_mode == 'learned':
             n_tokens = (n_frames // self.tubelet_size) * (image_size // self.patch_size) * (image_size // self.patch_size)
             self.pos_embed = nn.Parameter(
@@ -523,9 +569,16 @@ class SceneRepresentation(nn.Module):
             self._pe_grid = (n_frames // self.tubelet_size,
                              image_size // self.patch_size,
                              image_size // self.patch_size)
+        elif self.pos_embed_mode == 'spatial':
+            # Spatial-only learned table (gH*gW, D), broadcast across all frames. No time
+            # axis: temporal position is supplied by the decoder's cross-attention RoPE.
+            gH0 = image_size // self.patch_size
+            gW0 = image_size // self.patch_size
+            self.pos_embed = nn.Parameter(torch.zeros(1, gH0 * gW0, self.embed_dim))
+            nn.init.trunc_normal_(self.pos_embed, mean=0.0, std=0.02, a=-2 * 0.02, b=2 * 0.02)
+            self._pe_grid_spatial = (gH0, gW0)
         else:
             self.pos_embed = None
-            self._pe_grid = None
         # Per-(grid,device,dtype) cache for the fixed sincos table (recomputing the
         # ~N*D tensor every forward would be wasteful; the grid is constant in practice).
         self._sincos_cache = {}
@@ -607,6 +660,23 @@ class SceneRepresentation(nn.Module):
         pe = F.interpolate(pe, size=(gT, gH, gW), mode='trilinear', align_corners=False)
         return pe.permute(0, 2, 3, 4, 1).reshape(1, gT * gH * gW, D)
 
+    def _spatial_pos_embed_for(self, gT, gH, gW):
+        """Spatial-only learned pos_embed for grid (gH,gW), tiled across gT frames.
+        Bilinearly interpolates the stored (gH0,gW0) table when the requested spatial grid
+        differs (identity otherwise), then repeats it t-major -> (1, gT*gH*gW, D). The same
+        spatial code is shared by every frame; time is handled by the decoder RoPE."""
+        sH, sW = self._pe_grid_spatial
+        D = self.pos_embed.shape[-1]
+        if (gH, gW) == (sH, sW):
+            spatial = self.pos_embed                                   # (1, gH*gW, D)
+        else:
+            pe = self.pos_embed.reshape(1, sH, sW, D).permute(0, 3, 1, 2)
+            pe = F.interpolate(pe, size=(gH, gW), mode='bilinear', align_corners=False)
+            spatial = pe.permute(0, 2, 3, 1).reshape(1, gH * gW, D)
+        # Tokens are ordered t-major, so tiling the spatial block gT times gives each frame
+        # the identical spatial code.
+        return spatial.repeat(1, gT, 1)                               # (1, gT*gH*gW, D)
+
     def _sincos_pos_embed_for(self, gT, gH, gW, device, dtype):
         """Fixed factorized 3-D sin/cos table for grid (gT,gH,gW), cached per
         (grid, device, dtype) since the grid is constant across a run."""
@@ -636,6 +706,8 @@ class SceneRepresentation(nn.Module):
                 gW = view.shape[4] // self.patch_size
                 if self.pos_embed_mode == 'learned':
                     feat = feat + self._pos_embed_for(gT, gH, gW)
+                elif self.pos_embed_mode == 'spatial':
+                    feat = feat + self._spatial_pos_embed_for(gT, gH, gW)
                 else:  # 'sincos'
                     feat = feat + self._sincos_pos_embed_for(gT, gH, gW, feat.device, feat.dtype)
             if self.kv_proj is not None:
@@ -695,21 +767,27 @@ class RoPECrossAttention(nn.Module):
     Unlike TemporalSelfAttention, out_proj is NOT zero-initialised: cross-attention is the main
     information pathway (not an added residual block), so it must contribute from step 0."""
 
-    def __init__(self, embed_dim, num_heads, kv_dim, dropout=0.0, rope_base=10000.0):
+    def __init__(self, embed_dim, num_heads, kv_dim, cross_attn_dim=None,
+                 dropout=0.0, rope_base=10000.0):
         super().__init__()
-        assert embed_dim % num_heads == 0
+        # Attention (q/k/v) width, decoupled from the decoder residual stream (embed_dim),
+        # exactly like DecoupledCrossAttention. Defaults to embed_dim, which keeps the
+        # projections at their original shapes so existing rope checkpoints load unchanged.
+        attn_dim = cross_attn_dim if cross_attn_dim is not None else embed_dim
+        assert attn_dim % num_heads == 0, (
+            f'cross_attn_dim ({attn_dim}) must be divisible by num_heads ({num_heads})')
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.head_dim = attn_dim // num_heads
         assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
         self.dropout = dropout
         # RoPE frequency base. The 10000 default is tuned for thousand-token contexts; over
         # short clips (~16-24 frames) most dim-pairs barely rotate, so a smaller base (~100-1000)
         # spreads angular resolution across the few positions actually present.
         self.rope_base = rope_base
-        self.q_proj = nn.Linear(embed_dim, embed_dim)
-        self.k_proj = nn.Linear(kv_dim, embed_dim)
-        self.v_proj = nn.Linear(kv_dim, embed_dim)
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.q_proj = nn.Linear(embed_dim, attn_dim)
+        self.k_proj = nn.Linear(kv_dim, attn_dim)
+        self.v_proj = nn.Linear(kv_dim, attn_dim)
+        self.out_proj = nn.Linear(attn_dim, embed_dim)
 
     def forward(self, query, kv, q_pos, k_pos):
         """query: (Bc, Lq, embed_dim); kv: (Bc, Lk, kv_dim);
@@ -809,7 +887,15 @@ class Decoder(nn.Module):
                  f_eff_scale=False,
                  soft_argmax_temperature=0.5,
                  soft_argmax_threshold=20,
-                 soft_argmax_temperature_learnable=False):
+                 soft_argmax_temperature_learnable=False,
+                 enable_subpixel_refinement=False,
+                 subpixel_scale=0.05,
+                 subpixel_temperature=10.0,
+                 grid_decode_space="head",
+                 learnable_scale=False,
+                 learnable_scale_depth=False,
+                 scale_init=1.0,
+                 scale_delta=2.0):
         super().__init__()
 
         self.embed_dim = embed_dim
@@ -840,14 +926,64 @@ class Decoder(nn.Module):
         self.log_3d_output = log_3d_output
         self.log_3d_eps = log_3d_eps
         self.log_3d_c_range = float(math.log1p(head_3d_grid_radius / log_3d_eps))
+        # Soft-argmax averaging space for the 3D decode (only meaningful with log_3d_output):
+        #   "head"   = average the head-unit bin centres directly (out_3d = Σ p_k * grid_1d_k).
+        #              The centres are convex-spaced (signed_expm1), so a broad distribution
+        #              OVERSHOOTS through the warp (Jensen bias at large motion). DEFAULT — the
+        #              original behaviour, bit-for-bit when "head".
+        #   "warped" = average in the uniform WARPED space first, then expm1
+        #              (out_3d = signed_expm1(Σ p_k * w_k)); overshoot-free. Adds no params/buffers
+        #              (the warped centres are signed_log1p(grid_1d), recovered exactly), so it is
+        #              load-compatible with any checkpoint. Enable for a future retrain.
+        assert grid_decode_space in ("head", "warped"), grid_decode_space
+        self.grid_decode_space = grid_decode_space
+        # Optional sub-pixel/sub-bin 3D refinement (supervised by the EXISTING coords regression
+        # loss, no new term). Zero-init offset head -> starts as an exact no-op; disabled by default
+        # (no head at all). When enabled, the decode is a SHARPENED ARGMAX: a learnable high
+        # temperature (subpixel_temperature) peaks the per-bin weights toward one-hot at the argmax
+        # bin, so the decode approaches centre[argmax] + scale * bin_width * o_{argmax} (~one position
+        # + one offset) while staying fully differentiable. See forward().
+        #
+        # subpixel_scale is measured in BINS: the offset is multiplied by subpixel_bin_width (the
+        # adjacent-centre spacing in the space the offset is applied in), so subpixel_scale=0.5 means
+        # up to half a bin of correction. Under log_3d_output the offset is applied in WARPED space
+        # (uniform bins), else in head space; subpixel_bin_width below matches that space.
+        self.enable_subpixel_refinement = enable_subpixel_refinement
+        self.subpixel_scale = float(subpixel_scale)
+        # Warped (log_3d) or head bin spacing between adjacent centres, so subpixel_scale -> bins.
+        if log_3d_output:
+            _bin_width = 2.0 * self.log_3d_c_range / max(head_3d_grid_size - 1, 1)   # warped units/bin
+        else:
+            _bin_width = 2.0 * head_3d_grid_radius / max(head_3d_grid_size - 1, 1)   # head units/bin
+        self.subpixel_bin_width = float(_bin_width)
 
         # Grid (classification) output modes, mirroring TrackerTapNext:
         #   "grid"      = absolute ray-local position via per-axis marginal soft-argmax.
         #   "gridresid" = the grid head emits a motion residual offset (added to the
         #                 per-track query anchor); depth stays the absolute log grid.
         # Both supervise the bins with cross-entropy (losses.py grid_softmax_loss).
-        self.is_grid = output_mode in ('grid', 'gridresid')
+        self.is_grid = output_mode in ('grid', 'gridresid', 'gridnorm')
         self.is_resid = output_mode in ('residual', 'resdirect', 'gridresid')
+        # gridnorm: the grid works in a gauge-free frame; a per-camera (scale, offset)
+        # is solved from the query correspondences downstream (tracker_encoder), so the
+        # decoder emits raw soft-argmax values (no cube_scale/f_eff, linear depth gauge).
+        self.is_gridnorm = output_mode == 'gridnorm'
+
+        # learnable_scale: decode a positive per-token scale from the latent and multiply
+        # the metric 3D output (and depth) by it (a bounded, adaptive correction on the
+        # mode's base scale). s = scale_init * exp(clamp(head(x), ±scale_delta)); head init
+        # 0 -> s = scale_init (no-op at scale_init=1). Composes with any mode; redundant for
+        # gridnorm (which already SOLVES the gauge), so it is asserted off there upstream.
+        self.learnable_scale = bool(learnable_scale)
+        self.learnable_scale_depth = bool(learnable_scale_depth)
+        self.scale_init = float(scale_init)
+        self.scale_delta = float(scale_delta)
+        # scale = scale_init * exp(clamp(head, ±delta)); the head is zero-init so the scale
+        # STARTS at scale_init (a no-op multiply when scale_init=1), and exp(clamp) floors it
+        # at scale_init*exp(-delta) > 0 forever. scale_init MUST be > 0: it also divides the
+        # grid CE target, so scale_init=0 would zero the residual and blow up the target.
+        if self.learnable_scale or self.learnable_scale_depth:
+            assert self.scale_init > 0, f'scale_init must be > 0, got {self.scale_init}'
 
         if self.is_grid:
             G = head_3d_grid_size
@@ -861,15 +997,23 @@ class Decoder(nn.Module):
             else:
                 grid_1d = torch.linspace(-head_3d_grid_radius, head_3d_grid_radius, G)
             self.register_buffer("grid_1d", grid_1d)
-            # Depth grid is ALWAYS linear-in-log over [depth_log_min, depth_log_max]
-            # (its own representation; never touched by log_3d_output).
-            self.register_buffer("depth_grid", torch.linspace(depth_log_min, depth_log_max, G))
+            if self.is_gridnorm:
+                # gridnorm: LINEAR depth gauge over the same fixed box as the 3D grid; a
+                # per-camera affine (scale_d, offset_d) solved from query depths maps it to
+                # metric downstream (no exp/log, no cube_scale/f_eff).
+                self.register_buffer("depth_grid",
+                                     torch.linspace(-head_3d_grid_radius, head_3d_grid_radius, G))
+                self.gd_lo, self.gd_hi = -head_3d_grid_radius, head_3d_grid_radius
+            else:
+                # Depth grid is linear-in-log over [depth_log_min, depth_log_max]
+                # (its own representation; never touched by log_3d_output).
+                self.register_buffer("depth_grid", torch.linspace(depth_log_min, depth_log_max, G))
+                self.gd_lo, self.gd_hi = depth_log_min, depth_log_max
             # 2D pixel bin centres at i+0.5 to match coordinate_softmax_loss's
             # round(target-0.5) quantization (losses.py:25-30).
             P = image_size
             self.register_buffer("pix_grid", torch.arange(P, dtype=torch.float32) + 0.5)
             self.g3d_lo, self.g3d_hi = -head_3d_grid_radius, head_3d_grid_radius
-            self.gd_lo, self.gd_hi = depth_log_min, depth_log_max
 
         if self.use_camera_self_attention:
             self.camera_attns = nn.ModuleList([
@@ -887,19 +1031,18 @@ class Decoder(nn.Module):
         if self.cross_attn_rope:
             self.cross_attns = nn.ModuleList([
                 RoPECrossAttention(embed_dim=embed_dim, num_heads=num_heads,
-                                   kv_dim=encoder_dim, dropout=dropout,
-                                   rope_base=cross_attn_rope_base)
+                                   kv_dim=encoder_dim, cross_attn_dim=self.cross_attn_dim,
+                                   dropout=dropout, rope_base=cross_attn_rope_base)
                 for _ in range(num_layers)
             ])
         else:
             self.cross_attns = nn.ModuleList([
-                nn.MultiheadAttention(
-                    embed_dim=embed_dim,
+                DecoupledCrossAttention(
+                    latent_dim=embed_dim,
+                    kv_dim=encoder_dim,
+                    cross_attn_dim=self.cross_attn_dim,
                     num_heads=num_heads,
-                    kdim=encoder_dim,
-                    vdim=encoder_dim,
                     dropout=dropout,
-                    batch_first=True
                 ) for _ in range(num_layers)
             ])
 
@@ -959,6 +1102,45 @@ class Decoder(nn.Module):
         self.heads_conf    = _make_heads(1)
         self.heads_depth   = _make_heads(head_depth_out)
         self.heads_conf_3d = _make_heads(1)
+
+        # Decoded per-token scale head(s). Zero-init (weight & bias) -> head output 0 ->
+        # scale = scale_init at start (no-op when scale_init=1), so learnable_scale is a
+        # clean superset of the base mode. The metric regression loss learns the scale
+        # through the product; the grid CE (with the scale detached in its target) shapes
+        # the normalized grid — jointly identifiable (see plan / Toy J).
+        if self.learnable_scale:
+            self.scale_3d_head = _make_heads(1)
+            for m in range(2):
+                nn.init.zeros_(self.scale_3d_head[m][1].weight)
+                nn.init.zeros_(self.scale_3d_head[m][1].bias)
+        else:
+            self.scale_3d_head = None
+        if self.learnable_scale_depth:
+            self.scale_depth_head = _make_heads(1)
+            for m in range(2):
+                nn.init.zeros_(self.scale_depth_head[m][1].weight)
+                nn.init.zeros_(self.scale_depth_head[m][1].bias)
+        else:
+            self.scale_depth_head = None
+
+        if self.enable_subpixel_refinement and self.is_grid:
+            # Per-bin (3*G) sub-bin offset map: one learned offset per grid value per axis,
+            # soft-argmax-weighted at decode so the correction is conditioned on the predicted
+            # bin (motion location), not just the features. See the decode in forward().
+            self.heads_subpixel_3d = _make_heads(3 * head_3d_grid_size)
+            for m in range(2):                             # zero-init -> whole offset map = 0 -> no-op at start
+                nn.init.zeros_(self.heads_subpixel_3d[m][1].weight)
+                nn.init.zeros_(self.heads_subpixel_3d[m][1].bias)
+        else:
+            self.heads_subpixel_3d = None
+
+        if self.enable_subpixel_refinement and self.is_grid:
+            # Learnable sharpening temperature (beta) for the subpixel selection. High init ->
+            # weights peak at the argmax bin (~one position + one offset). Loaded fresh under
+            # strict=False; absent unless refinement is on, so it never perturbs old checkpoints.
+            self.log_subpixel_temp = nn.Parameter(torch.tensor(math.log(float(subpixel_temperature))))
+        else:
+            self.log_subpixel_temp = None
 
         # Variance-matched, dimension-invariant head init.
         # The LayerNorm gives each head a unit-variance input (Sum_i x_i^2 = embed_dim), so for
@@ -1024,20 +1206,36 @@ class Decoder(nn.Module):
 
         self.scale_depth = nn.Parameter(torch.tensor([abs_scale]))
 
-    def _grid_decode(self, logits, grid_values):
-        """Per-axis masked soft-argmax over a fixed grid of bin centres (threshold 20
-        bins, temperature 0.5), mirroring tracker_tapnext.py:379-392. ``logits``
-        (..., K), ``grid_values`` (K,) -> decoded value (...)."""
+    def _grid_softmax(self, logits, temp=None):
+        """Per-axis masked soft-argmax WEIGHTS over the bin grid (threshold 20 bins,
+        temperature 0.5), mirroring tracker_tapnext.py:379-392. ``logits`` (..., K) ->
+        normalized probs (..., K). Shared by the decode and the per-bin offset head.
+        ``temp`` overrides the softmax temperature (used by the sharpened subpixel path)."""
         soft_argmax_threshold = self.soft_argmax_threshold
-        softmax_temperature = (torch.exp(self.log_soft_argmax_temp)
+        softmax_temperature = temp if temp is not None else (
+                               torch.exp(self.log_soft_argmax_temp)
                                if self.log_soft_argmax_temp is not None
                                else self._soft_argmax_temp_fixed)
+        # Bound the (learnable) softmax sharpness. exp(log_temp) is unclamped, so an upward
+        # drift makes softmax(logits * T) near one-hot and its gradient at a near-tied argmax
+        # explodes (isolated grad-norm spikes with normal loss). Clamp the effective temp of
+        # BOTH the soft-argmax path and the subpixel path (passed in via `temp`). T_MAX is a
+        # few x the subpixel init (10.0) so intentional sharpness is preserved; the min is
+        # cheap insurance against collapse to a near-uniform softmax. Differentiable clamp
+        # keeps the parameter learnable inside the range.
+        if torch.is_tensor(softmax_temperature):
+            softmax_temperature = softmax_temperature.clamp(min=1e-2, max=30.0)
         K = logits.shape[-1]
         argmax = logits.argmax(dim=-1, keepdim=True)
         index = torch.arange(K, device=logits.device)
         mask = (torch.abs(argmax - index) <= soft_argmax_threshold).float()
         probs = F.softmax(logits * softmax_temperature, dim=-1) * mask
-        probs = probs / probs.sum(dim=-1, keepdim=True)
+        return probs / probs.sum(dim=-1, keepdim=True)
+
+    def _grid_decode(self, logits, grid_values):
+        """Soft-argmax decode: weighted sum of bin centres. ``logits`` (..., K),
+        ``grid_values`` (K,) -> decoded value (...)."""
+        probs = self._grid_softmax(logits)
         return (probs * grid_values.to(probs.dtype)).sum(dim=-1)
 
     def forward(self, scene_features, query_embeds, rays, mode_idx, prev_latent=None,
@@ -1056,10 +1254,10 @@ class Decoder(nn.Module):
                 token, required when cross_attn_rope is on (the key positions for temporal
                 RoPE). Ignored otherwise.
         Returns:
-            outputs: [B, T, K, N_cams, out_dim]
-            grid_logits: dict or None
-            latent: [B, T, K, N_cams, embed_dim] — this window's final decoder latent,
-                to carry into the next window.
+            dict with per-head tensors [B, T, K, N_cams, ·]: 'out_3d','out_2d','out_vis',
+            'out_conf','out_depth','out_conf_3d'; 'grid_logits' (dict or None); 'latent'
+            [B,T,K,N_cams,embed_dim] (carried into the next window); and 'scale_3d'/
+            'scale_depth' [B,T,K,N_cams,1] when learnable_scale[_depth].
         """
         B, T, K, N_cams, embed_dim = query_embeds.shape
         assert embed_dim == self.embed_dim
@@ -1104,9 +1302,7 @@ class Decoder(nn.Module):
             if self.cross_attn_rope:
                 attn_out = self.cross_attns[layer_idx](x_normed, kv, q_pos, k_pos)
             else:
-                attn_out, _ = self.cross_attns[layer_idx](
-                    query=x_normed, key=kv, value=kv, need_weights=False
-                )
+                attn_out = self.cross_attns[layer_idx](x_normed, kv)
             x = x + attn_out
 
             x = x + self.mlps[layer_idx](self.norm2s[layer_idx](x, mode_idx))
@@ -1121,12 +1317,42 @@ class Decoder(nn.Module):
             G = self.head_3d_grid_size
             raw_3d = self.heads_3d[m](x)                                    # (..., 3G)
             logits_3d = rearrange(raw_3d, '... (d k) -> ... d k', d=3, k=G)  # (..., 3, G)
-            out_3d = self._grid_decode(logits_3d, self.grid_1d)            # (..., 3)
+
+            if self.heads_subpixel_3d is not None:
+                # SHARPENED ARGMAX refinement: a learnable high temperature peaks the per-bin weights
+                # toward one-hot at the argmax bin, so the decode approaches centre[argmax] +
+                # offset[argmax] (~one position + one offset) while staying fully differentiable. Both
+                # the base position and the offset use these sharp weights.
+                w = self._grid_softmax(logits_3d, temp=torch.exp(self.log_subpixel_temp))  # (..., 3, G) sharp
+                offsets = rearrange(self.heads_subpixel_3d[m](x), '... (d k) -> ... d k', d=3, k=G)
+                offset_sel = (w * offsets).sum(-1) * self.subpixel_scale * self.subpixel_bin_width  # bins
+                if self.log_3d_output:
+                    # Select centre + add offset in WARPED (uniform-bin) space; clamp bounds expm1.
+                    cr = self.log_3d_c_range
+                    warped_centre = signed_log1p(self.grid_1d.to(w.dtype), self.log_3d_eps)
+                    warped_sel = (w * warped_centre).sum(-1)                # (..., 3) ~ warped centre[argmax]
+                    out_3d = signed_expm1((warped_sel + offset_sel).clamp(-cr, cr), self.log_3d_eps).to(w.dtype)
+                else:
+                    out_3d = (w * self.grid_1d.to(w.dtype)).sum(-1) + offset_sel  # (..., 3) head-space
+            else:
+                p3d = self._grid_softmax(logits_3d)                        # (..., 3, G) soft-argmax weights
+                if self.log_3d_output and self.grid_decode_space == "warped":
+                    # Average in the uniform WARPED space, then expm1 — overshoot-free (see __init__).
+                    # grid_1d == signed_expm1(linspace(-cr,cr,G)), so signed_log1p recovers the warped
+                    # centres exactly; no extra buffer, load-compatible with "head" checkpoints.
+                    cr = self.log_3d_c_range
+                    warped_centres = signed_log1p(self.grid_1d.to(p3d.dtype), self.log_3d_eps)
+                    warped_mean = (p3d * warped_centres).sum(-1).clamp(-cr, cr)  # (..., 3) warped units
+                    out_3d = signed_expm1(warped_mean, self.log_3d_eps).to(p3d.dtype)
+                else:
+                    out_3d = (p3d * self.grid_1d.to(p3d.dtype)).sum(-1)    # (..., 3) head-space decode (default)
 
             logits_depth = self.heads_depth[m](x)                          # (..., G)
-            # decode log-depth then exp -> normalized depth (>0); tracker_encoder
-            # multiplies by cube_scale [* f_eff] and must NOT softplus this.
-            out_depth = torch.exp(self._grid_decode(logits_depth, self.depth_grid))[..., None]
+            # grid/gridresid: decode log-depth then exp -> normalized depth (>0);
+            # tracker_encoder multiplies by cube_scale [* f_eff] and must NOT softplus this.
+            # gridnorm: decode a LINEAR gauge value (affine-solved to metric downstream).
+            _depth_dec = self._grid_decode(logits_depth, self.depth_grid)
+            out_depth = (_depth_dec if self.is_gridnorm else torch.exp(_depth_dec))[..., None]
 
             raw_2d = self.heads_2d[m](x)                                    # (..., 2P) [x|y]
             logits_2d_da = rearrange(raw_2d, '... (a p) -> ... a p', a=2, p=self.image_size)
@@ -1157,10 +1383,96 @@ class Decoder(nn.Module):
         out_vis     = self.heads_vis[m](x)
         out_conf    = self.heads_conf[m](x)
         out_conf_3d = self.heads_conf_3d[m](x)
-        output = torch.cat([out_3d, out_2d, out_vis, out_conf, out_depth, out_conf_3d], dim=-1)
 
-        output = rearrange(output, '(cams b) (t k) dim -> b t k cams dim',
-                           cams=N_cams, b=B, t=T, k=K)
-        latent = rearrange(x, '(cams b) (t k) dim -> b t k cams dim',
-                           cams=N_cams, b=B, t=T, k=K)
-        return output, grid_logits, latent
+        def _to_btkc(t):
+            return rearrange(t, '(cams b) (t k) d -> b t k cams d',
+                             cams=N_cams, b=B, t=T, k=K)
+
+        # Return a dict of named per-head tensors (b,t,k,cams,·) instead of a packed cat +
+        # positional split. `grid_logits` is None for non-grid modes; scale heads present
+        # only when learnable_scale[_depth].
+        dec = {
+            'out_3d': _to_btkc(out_3d),          # (b,t,k,cams,3)
+            'out_2d': _to_btkc(out_2d),          # (b,t,k,cams,2)
+            'out_vis': _to_btkc(out_vis),        # (b,t,k,cams,1)
+            'out_conf': _to_btkc(out_conf),      # (b,t,k,cams,1)
+            'out_depth': _to_btkc(out_depth),    # (b,t,k,cams,1)
+            'out_conf_3d': _to_btkc(out_conf_3d),  # (b,t,k,cams,1)
+            'grid_logits': grid_logits,
+            'latent': _to_btkc(x),               # (b,t,k,cams,embed_dim)
+        }
+        if self.learnable_scale:
+            s3d = self.scale_init * torch.exp(
+                self.scale_3d_head[m](x).clamp(-self.scale_delta, self.scale_delta))
+            dec['scale_3d'] = _to_btkc(s3d)      # (b,t,k,cams,1)
+        if self.learnable_scale_depth:
+            sdep = self.scale_init * torch.exp(
+                self.scale_depth_head[m](x).clamp(-self.scale_delta, self.scale_delta))
+            dec['scale_depth'] = _to_btkc(sdep)  # (b,t,k,cams,1)
+        return dec
+
+
+class AttentionPooling(nn.Module):
+    """Multihead attention-pooling (MAP) head over the (time, camera) set of a point.
+
+    Pools the per-(t, cam) decoder latents of each tracked point into ONE latent per
+    point: a learned seed query cross-attends over the flattened (t * cams) tokens
+    (Set-Transformer PMA, Lee et al. 2019). Permutation-invariant over cameras (a
+    variable 1..N_cams are present, no camera embedding) but order-aware over time via
+    an optional learned per-frame embedding, linearly resampled to the actual T (mirrors
+    QueryEncoder's t-embed resize / train_utils._interp_res_params).
+
+        x: [b, t, k, cams, dim]  ->  [b, k, dim]
+    """
+
+    def __init__(self, dim, num_heads=8, n_frames=16, use_time_embedding=True,
+                 mlp_ratio=4.0):
+        super().__init__()
+        self.dim = dim
+        self.n_frames = n_frames
+        self.use_time_embedding = use_time_embedding
+
+        # learned seed query (the single "pooled" token that reads out the set)
+        self.query = nn.Parameter(torch.zeros(1, 1, dim))
+        nn.init.trunc_normal_(self.query, std=0.02)
+
+        if use_time_embedding:
+            self.time_embed = nn.Parameter(torch.zeros(n_frames, dim))
+            nn.init.trunc_normal_(self.time_embed, std=0.02)
+
+        self.norm_kv = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        # post-attention feed-forward (rFF in PMA), residual on the pooled token
+        self.norm_out = nn.LayerNorm(dim)
+        hidden = int(dim * mlp_ratio)
+        self.ff = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim))
+
+    def _resize_time_embed(self, T, device, dtype):
+        """[n_frames, dim] -> [T, dim] by linear resampling of the frame axis."""
+        te = self.time_embed.to(dtype)
+        if T == self.n_frames:
+            return te
+        w = te.t().unsqueeze(0)                                   # [1, dim, n_frames]
+        w = F.interpolate(w, size=T, mode='linear', align_corners=False)
+        return w.squeeze(0).t()                                   # [T, dim]
+
+    def forward(self, x, key_padding_mask=None):
+        """x: [b, t, k, cams, dim]; key_padding_mask: [b, k, t, cams] bool (True = drop).
+        Returns [b, k, dim]."""
+        b, T, k, cams, dim = x.shape
+
+        if self.use_time_embedding:
+            te = self._resize_time_embed(T, x.device, x.dtype)   # [T, dim]
+            x = x + te[None, :, None, None, :]
+
+        kv = rearrange(x, 'b t k cams d -> (b k) (t cams) d')
+        kv = self.norm_kv(kv)
+
+        kpm = None
+        if key_padding_mask is not None:
+            kpm = rearrange(key_padding_mask, 'b k t cams -> (b k) (t cams)')
+
+        q = self.query.expand(kv.shape[0], -1, -1)               # [(b k), 1, dim]
+        pooled, _ = self.attn(q, kv, kv, key_padding_mask=kpm, need_weights=False)
+        pooled = pooled + self.ff(self.norm_out(pooled))         # [(b k), 1, dim]
+        return rearrange(pooled[:, 0], '(b k) d -> b k d', b=b, k=k)

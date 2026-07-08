@@ -9,7 +9,7 @@ from einops import rearrange, einsum, reduce, repeat
 
 from posetail.posetail.cube import get_camera_scale, from_homogeneous, to_homogeneous
 from posetail.posetail.cube import undistort_points, triangulate_simple_batch, triangulate_simple_batch_reg, project_points_torch
-from posetail.posetail.cube import points_to_rays, _invert_SE3
+from posetail.posetail.cube import points_to_rays, _invert_SE3, solve_scale_offset
 from posetail.posetail.cube import noisy_or_logit
 from posetail.posetail.utils import PadToMultiple, PadToSize, count_parameters
 from posetail.posetail.encoder_decoder import SceneRepresentation, QueryEncoder, Decoder
@@ -17,7 +17,22 @@ from posetail.posetail.encoder_decoder import SceneRepresentation, QueryEncoder,
 from torchvision import transforms
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
-class TrackerEncoder(nn.Module): 
+# Time axis of each time-indexed window output, used both to stitch windows in
+# _forward_windows and (as t_axis + 1 = the point axis, since layout is always
+# (...,t,n,...)) to concatenate keypoint chunks in _forward_window.
+_T_AXIS = {
+    'coords_pred': 1, '3d_pred_direct': 1, '3d_pred_rays': 1,
+    '3d_pred_triangulate': 1, 'vis_pred': 1, 'conf_pred': 1,
+    '3d_pred_cams_direct': 2, '3d_pred_cams_rays': 2, 'conf_3d': 2,
+    '2d_pred': 2, 'vis_pred_2d': 2, 'conf_pred_2d': 2, 'depth_pred': 2,
+    '2d_logits': 2,
+}
+_GRID_T_AXIS = {'logits_3d': 2, 'logits_depth': 2, 'anchor_local': 2}
+# Point (n) axis for keypoint-chunk concatenation = t_axis + 1 (layout is (...,t,n,...)).
+_N_AXIS = {k: v + 1 for k, v in _T_AXIS.items()}
+
+
+class TrackerEncoder(nn.Module):
 
     def __init__(self, image_size = 256,
                  stride_length = 16, stride_overlap = None,
@@ -27,7 +42,8 @@ class TrackerEncoder(nn.Module):
                  video_encoder_hierarchical = True,
                  video_encoder_finetune_last_n_layers = None,
                  scene_pos_embed_mode = 'learned',
-                 rope_base = 10000.0,
+                 rope_base = 100.0,
+                 time_embed_mode = 'learned',
                  corr_radius = 3, 
                  max_freq = 10, n_iters = 4, embedding_dim = 256,
                  query_patch_size = 9,
@@ -56,7 +72,15 @@ class TrackerEncoder(nn.Module):
                  f_eff_scale = False,
                  soft_argmax_temperature = 0.5,
                  soft_argmax_threshold = 20,
-                 soft_argmax_temperature_learnable = False):
+                 soft_argmax_temperature_learnable = False,
+                 enable_subpixel_refinement = False,
+                 subpixel_scale = 0.05,
+                 subpixel_temperature = 10.0,
+                 grid_decode_space = 'head',
+                 learnable_scale = False,
+                 learnable_scale_depth = False,
+                 scale_init = 1.0,
+                 scale_delta = 2.0):
         super().__init__()
 
         self.mode_3d = mode_3d
@@ -98,13 +122,23 @@ class TrackerEncoder(nn.Module):
         # 'rope' is a decoder-level positional scheme, not an additive scene term: it means
         # "no additive scene pos_embed + 1-D temporal RoPE in the decoder cross-attention".
         # So map it to scene pos_embed_mode='none' and flip the decoder rope flag.
-        assert scene_pos_embed_mode in ('learned', 'sincos', 'none', 'rope'), \
-            f"scene_pos_embed_mode must be 'learned'|'sincos'|'none'|'rope', got {scene_pos_embed_mode!r}"
+        # 'ropepos' is the same temporal RoPE but WITH a learned spatial-only additive scene
+        # pos_embed (scene mode 'spatial'): restores absolute spatial position (the RoPE video
+        # backbone is translation-equivariant) while keeping time relative via RoPE.
+        assert scene_pos_embed_mode in ('learned', 'sincos', 'none', 'rope', 'ropepos'), \
+            f"scene_pos_embed_mode must be 'learned'|'sincos'|'none'|'rope'|'ropepos', got {scene_pos_embed_mode!r}"
         self.scene_pos_embed_mode = scene_pos_embed_mode
-        self.cross_attn_rope = (scene_pos_embed_mode == 'rope')
-        scene_pos_embed_mode_resolved = 'none' if self.cross_attn_rope else scene_pos_embed_mode
+        self.cross_attn_rope = scene_pos_embed_mode in ('rope', 'ropepos')
+        if scene_pos_embed_mode == 'rope':
+            scene_pos_embed_mode_resolved = 'none'
+        elif scene_pos_embed_mode == 'ropepos':
+            scene_pos_embed_mode_resolved = 'spatial'
+        else:
+            scene_pos_embed_mode_resolved = scene_pos_embed_mode
         # RoPE frequency base for the cross-attention rope (only used when mode == 'rope').
         self.rope_base = rope_base
+        # Query/target time encoding scheme for the QueryEncoder ('learned' | 'fourier_rel').
+        self.time_embed_mode = time_embed_mode
 
 
         # query encoder params
@@ -136,11 +170,23 @@ class TrackerEncoder(nn.Module):
         self.scene_proj_mlp = scene_proj_mlp
         self.f_eff_scale = f_eff_scale
 
-        assert output_mode in ['direct', 'residual', 'grid', 'gridresid', 'resdirect'], 'output_mode should be "direct", "residual", "grid", "gridresid", or "resdirect"'
+        assert output_mode in ['direct', 'residual', 'grid', 'gridresid', 'resdirect', 'gridnorm'], 'output_mode should be "direct", "residual", "grid", "gridresid", "resdirect", or "gridnorm"'
         # Grid (classification) modes: per-axis marginal soft-argmax + cross-entropy,
         # mirroring TrackerTapNext. "gridresid" predicts a motion residual offset.
-        self.is_grid = output_mode in ('grid', 'gridresid')
-        
+        # "gridnorm" predicts a gauge-free grid; a per-camera (scale, offset) is SOLVED
+        # from the query correspondences (cube_scale/query_local -> solved s_c/t_c), and
+        # the depth head is a linear gauge with its own solved affine (scale_d, offset_d).
+        self.is_grid = output_mode in ('grid', 'gridresid', 'gridnorm')
+        self.is_gridnorm = output_mode == 'gridnorm'
+
+        # learnable_scale: decode a bounded per-track scale from the latent and multiply the
+        # (residual) 3D output [and depth] by it — a cross-mode, adaptive correction on the
+        # base scale. Redundant with gridnorm (which SOLVES the gauge), so disallow the combo.
+        self.learnable_scale = bool(learnable_scale)
+        self.learnable_scale_depth = bool(learnable_scale_depth)
+        assert not (self.is_gridnorm and (self.learnable_scale or self.learnable_scale_depth)), \
+            'learnable_scale is redundant with gridnorm (it already solves the per-camera gauge)'
+
         # self.transform_norm = transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)
         self.transform_norm = transforms.Compose([
             PadToSize(self.image_size),
@@ -171,6 +217,7 @@ class TrackerEncoder(nn.Module):
             use_volume_embedding=use_volume_embedding,
             principal_point_embedding=principal_point_embedding,
             intrinsic_embedding=intrinsic_embedding,
+            time_embed_mode=time_embed_mode,
         )
         self.decoder = Decoder(
             embed_dim=latent_dim,
@@ -195,6 +242,14 @@ class TrackerEncoder(nn.Module):
             soft_argmax_temperature=soft_argmax_temperature,
             soft_argmax_threshold=soft_argmax_threshold,
             soft_argmax_temperature_learnable=soft_argmax_temperature_learnable,
+            enable_subpixel_refinement=enable_subpixel_refinement,
+            subpixel_scale=subpixel_scale,
+            subpixel_temperature=subpixel_temperature,
+            grid_decode_space=grid_decode_space,
+            learnable_scale=learnable_scale,
+            learnable_scale_depth=learnable_scale_depth,
+            scale_init=scale_init,
+            scale_delta=scale_delta,
         )
 
     def unfreeze_video_encoder(self, iteration):
@@ -223,7 +278,8 @@ class TrackerEncoder(nn.Module):
         print("  scene representation params: {:,d}".format(count_parameters(self.scene_encoder)))
         print("  decoder params: {:,d}".format(count_parameters(self.decoder)))
         
-    def forward(self, views, coords, camera_group, query_times=None, init_latent=None):
+    def forward(self, views, coords, camera_group, query_times=None, init_latent=None,
+                kpt_chunk=None):
         '''
         B: batch size
         T: number of frames in video
@@ -310,11 +366,11 @@ class TrackerEncoder(nn.Module):
         return self._forward_windows(
             views_norm, coords, query_times, camera_group,
             cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
-            init_latent=init_latent)
+            init_latent=init_latent, kpt_chunk=kpt_chunk)
 
     def _forward_windows(self, views_norm, coords, query_times, camera_group,
                          cube_scale, cube_scale_shared, f_eff,
-                         scene_center, scene_radius, init_latent=None):
+                         scene_center, scene_radius, init_latent=None, kpt_chunk=None):
         """Run the encoder/decoder over the clip, optionally as a sliding window.
 
         When self.S >= T (window covers the whole clip) this is a single pass,
@@ -348,7 +404,7 @@ class TrackerEncoder(nn.Module):
             result, latent = self._forward_window(
                 views_norm, coords, query_times, camera_group,
                 cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
-                prev_latent=init_latent)
+                prev_latent=init_latent, kpt_chunk=kpt_chunk)
             # Expose the latent so a caller can thread it into a following chunk
             # (cross-chunk carry); harmless for the non-windowed model whose
             # latent_carry is untrained (a no-op).
@@ -370,15 +426,10 @@ class TrackerEncoder(nn.Module):
                 for v in views_norm
             ]
 
-        # Frame (t) axis of every time-indexed output, used to stitch windows.
-        t_axis = {
-            'coords_pred': 1, '3d_pred_direct': 1, '3d_pred_rays': 1,
-            '3d_pred_triangulate': 1, 'vis_pred': 1, 'conf_pred': 1,
-            '3d_pred_cams_direct': 2, '3d_pred_cams_rays': 2, 'conf_3d': 2,
-            '2d_pred': 2, 'vis_pred_2d': 2, 'conf_pred_2d': 2, 'depth_pred': 2,
-            '2d_logits': 2,
-        }
-        grid_t_axis = {'logits_3d': 2, 'logits_depth': 2, 'anchor_local': 2}
+        # Frame (t) axis of every time-indexed output, used to stitch windows (module-level
+        # so keypoint-chunk concat in _forward_window can reuse it as t_axis + 1).
+        t_axis = _T_AXIS
+        grid_t_axis = _GRID_T_AXIS
 
         def _put(store, key, src, axis, start, full):
             # Write a window's output slice into the full-length accumulator across
@@ -434,7 +485,7 @@ class TrackerEncoder(nn.Module):
             res, latent = self._forward_window(
                 views_w, coords_w, times_w, camera_group,
                 cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
-                prev_latent=carry_w)
+                prev_latent=carry_w, kpt_chunk=kpt_chunk)
 
             for key, ax in t_axis.items():
                 if key in res:
@@ -498,7 +549,7 @@ class TrackerEncoder(nn.Module):
 
     def _forward_window(self, views_norm, coords, query_times, camera_group,
                         cube_scale, cube_scale_shared, f_eff,
-                        scene_center, scene_radius, prev_latent=None):
+                        scene_center, scene_radius, prev_latent=None, kpt_chunk=None):
         """Single encoder/decoder pass over one window (or the whole clip).
 
         views_norm frames are already normalized/padded ('b t c h w'); coords are the
@@ -507,15 +558,63 @@ class TrackerEncoder(nn.Module):
         precomputed once in forward() and passed through unchanged. prev_latent is the
         previous window's final decoder latent (frame-aligned, B,T,N,cams,D) or None.
 
+        kpt_chunk: if set (>0) and N > kpt_chunk, encode the scene ONCE then run the
+        per-point query/decoder work in point-slices reusing scene_features (mirrors
+        ScorerEncoder.score). Numerically identical to the single pass because the decoder
+        has no cross-point attention and the scene scalars are computed over all N in
+        forward(). Disabled for gridnorm, whose per-camera gauge solve couples points.
+
         Returns (result_dict, latent) where latent is this window's final decoder
         latent, to be carried into the next window.
         """
+        scene_features = self.scene_encoder(views_norm)
+        N = coords.shape[1]
+        if kpt_chunk and N > kpt_chunk and not self.is_gridnorm:
+            results, latents = [], []
+            for k0 in range(0, N, kpt_chunk):
+                k1 = min(k0 + kpt_chunk, N)
+                pl = prev_latent[:, :, k0:k1] if prev_latent is not None else None
+                r, lat = self._decode_from_scene(
+                    scene_features, views_norm, coords[:, k0:k1], query_times[:, k0:k1],
+                    camera_group, cube_scale, cube_scale_shared, f_eff,
+                    scene_center, scene_radius, prev_latent=pl)
+                results.append(r); latents.append(lat)
+            return self._concat_point_chunks(results), torch.cat(latents, dim=2)
+        return self._decode_from_scene(
+            scene_features, views_norm, coords, query_times, camera_group,
+            cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
+            prev_latent=prev_latent)
+
+    # Loss-only, per-point grid logits: huge (they carry the P/K grid dim) and unused at
+    # inference. kpt_chunk is inference-only, so we DON'T reassemble them to full-N -- that
+    # would defeat the memory saving. Dropped from the concatenated result.
+    _CHUNK_SKIP = {'2d_logits', 'grid'}
+
+    @staticmethod
+    def _concat_point_chunks(results):
+        """Concatenate per-keypoint-chunk _decode_from_scene outputs along the point axis.
+        Point tensors use _N_AXIS; None passes through; the loss-only grid logits (_CHUNK_SKIP)
+        are dropped (inference doesn't use them and full-N reassembly would OOM)."""
+        base = results[0]
+        out = {}
+        for key, val in base.items():
+            if key in TrackerEncoder._CHUNK_SKIP:
+                continue
+            if val is None:
+                out[key] = None
+                continue
+            out[key] = torch.cat([r[key] for r in results], dim=_N_AXIS[key])
+        return out
+
+    def _decode_from_scene(self, scene_features, views_norm, coords, query_times, camera_group,
+                           cube_scale, cube_scale_shared, f_eff,
+                           scene_center, scene_radius, prev_latent=None):
+        """Per-point decode from precomputed scene_features (the body of one window's forward
+        after scene encoding). Returns (result_dict, latent). See _forward_window."""
         device = coords.device
         B, N, R = coords.shape
         T = views_norm[0].shape[1]
         n_cams = len(views_norm)
-
-        scene_features = self.scene_encoder(views_norm)
 
         # Hey, coords start at 0
         query_coords = repeat(coords, 'b n r -> b (t n) r', t=T).to(torch.float32)
@@ -555,7 +654,6 @@ class TrackerEncoder(nn.Module):
         query_rays = rearrange(query_rays_flat, 'cams b (t n) d e -> b t n cams d e', t=T, n=N)
 
         mode_idx = torch.tensor([1 if R == 3 else 0], dtype=torch.long, device=query_embeds.device)
-
         # Temporal-RoPE cross-attention: frame index (in query-frame units) of each scene
         # token. Tokens are ordered (t,h,w) row-major, so token idx -> temporal slot
         # idx // (gH*gW); converting to frame units (slot * tubelet, centred in the tubelet)
@@ -568,14 +666,36 @@ class TrackerEncoder(nn.Module):
             slot = torch.arange(gT * gH * gW, device=query_embeds.device) // (gH * gW)
             scene_frame_pos = slot.float() * tub + (tub - 1) / 2.0   # (N_tokens,)
 
-        outputs, grid_logits, latent = self.decoder(
+        dec = self.decoder(
             scene_features, query_embeds, query_rays, mode_idx, prev_latent=prev_latent,
             scene_frame_pos=scene_frame_pos)
-        outputs = rearrange(outputs, 'b t n cams outdim -> cams b t n outdim')
+        grid_logits = dec['grid_logits']
+        latent = dec['latent']
 
-        points_3d_raw, points_pred, vis_pred_2d_logits, conf_pred_2d_logits, depth_pred, conf_3d_logits = torch.split(
-            outputs, [3, 2, 1, 1, 1, 1], dim=-1
-        )
+        def _to_cams(t):
+            return rearrange(t, 'b t n cams d -> cams b t n d')
+
+        points_3d_raw       = _to_cams(dec['out_3d'])         # (cams,b,t,n,3)
+        points_pred         = _to_cams(dec['out_2d'])         # (cams,b,t,n,2)
+        vis_pred_2d_logits  = _to_cams(dec['out_vis'])        # (cams,b,t,n,1)
+        conf_pred_2d_logits = _to_cams(dec['out_conf'])       # (cams,b,t,n,1)
+        depth_pred          = _to_cams(dec['out_depth'])      # (cams,b,t,n,1)
+        conf_3d_logits      = _to_cams(dec['out_conf_3d'])    # (cams,b,t,n,1)
+
+        # Decoded per-token scales -> per-TRACK (gather at each track's query frame),
+        # broadcast over time; matches the anchored residual (one scale per track). None
+        # unless learnable_scale[_depth]. Detached copies for the CE target go in grid dict.
+        s3d = s3d_track = sdep = sdep_track = None
+        if 'scale_3d' in dec:
+            s3d_raw = _to_cams(dec['scale_3d'])[..., 0]       # (cams,b,t,n)
+            tq_s = repeat(query_times, 'b n -> cams b 1 n', cams=n_cams)
+            s3d_track = torch.gather(s3d_raw, 2, tq_s)[:, :, 0]           # (cams,b,n)
+            s3d = s3d_track[:, :, None, :].expand(-1, -1, T, -1)         # (cams,b,t,n)
+        if 'scale_depth' in dec:
+            sdep_raw = _to_cams(dec['scale_depth'])[..., 0]   # (cams,b,t,n)
+            tq_s = repeat(query_times, 'b n -> cams b 1 n', cams=n_cams)
+            sdep_track = torch.gather(sdep_raw, 2, tq_s)[:, :, 0]         # (cams,b,n)
+            sdep = sdep_track[:, :, None, :].expand(-1, -1, T, -1)       # (cams,b,t,n)
 
 
         vis_pred_2d = F.sigmoid(vis_pred_2d_logits)
@@ -590,16 +710,39 @@ class TrackerEncoder(nn.Module):
         # depths_query_shaped = rearrange(depths_query, 'b t n cams -> cams b t n')
         # depth_pred_scaled = depths_query_shaped + depth_pred[..., 0] * cube_scale * self.depth_scale
 
-        # Normalized depth -> metric. In grid mode the decoder already decoded
-        # depth_norm = exp(soft-argmax(log-depth bins)) (>0), so skip the softplus.
-        if self.is_grid:
-            depth_norm = depth_pred[..., 0]
+        # Normalized depth -> metric.
+        depth_solve = None
+        if self.is_gridnorm and R == 3:
+            # gridnorm: the depth head decodes a LINEAR gauge value d_g; solve a per-camera
+            # 1D affine (scale_d, offset_d) from the KNOWN query depths (||q - center||) and
+            # map to metric -> replaces cube_scale [* f_eff] (self-calibrating, ortho-safe).
+            d_g = depth_pred[..., 0].float()                               # (cams,b,t,n)
+            centers_d = torch.stack([cam['center'] for cam in camera_group]).float()  # (cams,3)
+            qw_d = repeat(coords.float(), 'b n r -> cams b n r', cams=n_cams)          # (cams,b,n,3)
+            depth_known = torch.linalg.norm(
+                qw_d - rearrange(centers_d, 'cams r -> cams 1 1 r'), dim=-1)           # (cams,b,n)
+            tq_d = repeat(query_times, 'b n -> cams b 1 n', cams=n_cams)               # (cams,b,1,n)
+            d_g_query = torch.gather(d_g, 2, tq_d)[:, :, 0]                            # (cams,b,n)
+            scale_d, offset_d = solve_scale_offset(
+                d_g_query[..., None], depth_known[..., None])              # (cams,b),(cams,b,1)
+            offset_d = offset_d[..., 0]                                    # (cams,b)
+            depth_pred_scaled = (scale_d[..., None, None] * d_g
+                                 + offset_d[..., None, None]).clamp_min(1e-3)          # (cams,b,t,n)
+            depth_solve = (scale_d, offset_d)
         else:
-            depth_norm = F.softplus(depth_pred[..., 0])
-        depth_pred_scaled = depth_norm * rearrange(cube_scale, 'cams b -> cams b 1 1')
-        if self.f_eff_scale:
-            # depth is absolute in every output mode -> always f_eff-scaled
-            depth_pred_scaled = depth_pred_scaled * rearrange(f_eff, 'cams -> cams 1 1 1').to(depth_pred_scaled.dtype)
+            # In grid mode the decoder already decoded depth_norm = exp(soft-argmax(
+            # log-depth bins)) (>0), so skip the softplus.
+            if self.is_grid:
+                depth_norm = depth_pred[..., 0]
+            else:
+                depth_norm = F.softplus(depth_pred[..., 0])
+            depth_pred_scaled = depth_norm * rearrange(cube_scale, 'cams b -> cams b 1 1')
+            if self.f_eff_scale:
+                # depth is absolute in every output mode -> always f_eff-scaled
+                depth_pred_scaled = depth_pred_scaled * rearrange(f_eff, 'cams -> cams 1 1 1').to(depth_pred_scaled.dtype)
+            if sdep is not None:
+                # decoded depth scale: bounded correction on the base depth scale.
+                depth_pred_scaled = depth_pred_scaled * sdep
 
 
         if self.is_grid:
@@ -661,34 +804,58 @@ class TrackerEncoder(nn.Module):
                        (self.output_mode == 'resdirect' and R == 3)
 
         query_local = None
-        p3d_cams = points_3d_raw * rearrange(cube_scale, 'cams b -> cams b 1 1 1')
-        if self.output_mode == 'gridresid':
-            # gridresid bins encode motion / (cube * image_size) (~pixels, NO f_eff ->
-            # ortho-safe); map back to metric motion by * image_size (mirror
-            # tracker_tapnext.py:597-600).
-            p3d_cams = p3d_cams * self.image_size
-        if self.f_eff_scale and not add_residual:
-            # direct 3D output is an absolute ray-local position -> f_eff-scaled.
-            # The residual branch (motion offset) is NOT scaled (handled by scale_3d only).
-            p3d_cams = p3d_cams * rearrange(f_eff, 'cams -> cams 1 1 1 1').to(p3d_cams.dtype)
+        grid_solve = None
+        if self.is_gridnorm and R == 3:
+            # gridnorm: points_3d_raw is a gauge-free ray-local grid output. Solve a
+            # per-camera (scalar scale s_c, 3D offset t_c) from the query correspondences
+            # (predicted grid @ each track's query time  <->  known ray-local query
+            # position) and apply. Replaces cube_scale (-> s_c) and query_local (-> t_c);
+            # no f_eff. Solve in float32 for stability, then let the world transform run.
+            g3 = points_3d_raw.float()                                     # (cams,b,t,n,3)
+            qw3 = repeat(coords.float(), 'b n r -> cams b n r', cams=n_cams)   # (cams,b,n,3)
+            q_known = from_homogeneous(
+                einsum(rays_c.float(), to_homogeneous(qw3),
+                       'cams x r, cams b n r -> cams b n x'))              # (cams,b,n,3)
+            tq3 = repeat(query_times, 'b n -> cams b 1 n r', cams=n_cams, r=3)  # (cams,b,1,n,3)
+            g_query = torch.gather(g3, 2, tq3)[:, :, 0]                    # (cams,b,n,3)
+            s_c, t_c = solve_scale_offset(g_query, q_known)               # (cams,b),(cams,b,3)
+            p3d_cams = s_c[..., None, None, None] * g3 + t_c[:, :, None, None, :]  # (cams,b,t,n,3)
+            grid_solve = (s_c, t_c)
+        else:
+            p3d_cams = points_3d_raw * rearrange(cube_scale, 'cams b -> cams b 1 1 1')
+            if self.output_mode == 'gridresid':
+                # gridresid bins encode motion / (cube * image_size) (~pixels, NO f_eff ->
+                # ortho-safe); map back to metric motion by * image_size (mirror
+                # tracker_tapnext.py:597-600).
+                p3d_cams = p3d_cams * self.image_size
+            if self.f_eff_scale and not add_residual:
+                # direct 3D output is an absolute ray-local position -> f_eff-scaled.
+                # The residual branch (motion offset) is NOT scaled (handled by scale_3d only).
+                p3d_cams = p3d_cams * rearrange(f_eff, 'cams -> cams 1 1 1 1').to(p3d_cams.dtype)
 
-        if add_residual:
-            if R == 3:
-                query_world = repeat(
-                    rearrange(query_coords, 'b (t n) r -> b t n r', t=T, n=N),
-                    'b t n r -> cams b t n r', cams=n_cams)
-            elif R == 2:
-                # only reachable for output_mode == 'residual'
-                t_idx = repeat(query_times, 'b n -> b 1 n r', r=3)
-                query_3d = torch.gather(points_3d_rays, dim=1, index=t_idx)  # (b, 1, n, 3)
-                query_world = repeat(query_3d, 'b 1 n r -> cams b t n r', t=T, cams=n_cams)
+            if s3d is not None:
+                # decoded per-track scale: a bounded correction on the base metric scale.
+                # Applied BEFORE the anchor add, so for residual modes it scales the MOTION
+                # (not the anchor); for absolute modes it scales the whole output.
+                p3d_cams = p3d_cams * s3d[..., None]
 
-            # convert query from world → ray-local space, then add as residual before world transform
-            query_local = from_homogeneous(
-                einsum(rays_c, to_homogeneous(query_world),
-                       'cams x r, cams b t n r -> cams b t n x')
-            )
-            p3d_cams = p3d_cams + query_local
+            if add_residual:
+                if R == 3:
+                    query_world = repeat(
+                        rearrange(query_coords, 'b (t n) r -> b t n r', t=T, n=N),
+                        'b t n r -> cams b t n r', cams=n_cams)
+                elif R == 2:
+                    # only reachable for output_mode == 'residual'
+                    t_idx = repeat(query_times, 'b n -> b 1 n r', r=3)
+                    query_3d = torch.gather(points_3d_rays, dim=1, index=t_idx)  # (b, 1, n, 3)
+                    query_world = repeat(query_3d, 'b 1 n r -> cams b t n r', t=T, cams=n_cams)
+
+                # convert query from world → ray-local space, then add as residual before world transform
+                query_local = from_homogeneous(
+                    einsum(rays_c, to_homogeneous(query_world),
+                           'cams x r, cams b t n r -> cams b t n x')
+                )
+                p3d_cams = p3d_cams + query_local
 
         points_3d_all_direct = from_homogeneous(
             einsum(rays_c_inv, to_homogeneous(p3d_cams),
@@ -748,6 +915,29 @@ class TrackerEncoder(nn.Module):
                 'is_resid': (self.output_mode == 'gridresid'),
                 'anchor_local': query_local.detach() if query_local is not None else None,
                 'image_size': self.image_size,
+                # learnable_scale: the forward multiplied the (residual) output by the decoded
+                # per-track scale s3d [and depth by sdep]. The loss divides the grid CE target
+                # by the DETACHED scale so CE shapes the normalized grid while the metric
+                # regression loss learns the scale (identifiability, Toy J).
+                'learnable_scale': self.learnable_scale,
+                's3d': s3d.detach() if s3d is not None else None,      # (cams,b,t,n)
+                'sdep': sdep.detach() if sdep is not None else None,   # (cams,b,t,n)
+                # gridnorm: 3D bins live in a gauge-free frame mapped to ray-local metric by
+                # the SOLVED per-camera (s_c, t_c); depth bins by the SOLVED (scale_d, offset_d).
+                # The loss builds its CE targets from these (detached).
+                # gridnorm mode flag. The SOLVED gauge (s_c/t_c/scale_d/offset_d) is present
+                # only for 3D-input batches (solve needs the 3D query). For 2D-input (fake 2D:
+                # 3D GT but network sees R==2) it is None; the loss then ESTIMATES the gauge
+                # itself from the raw grid + the 3D GT (g_raw / depth_g / query_times below).
+                'is_gridnorm': self.is_gridnorm,
+                's_c': grid_solve[0].detach() if grid_solve is not None else None,   # (cams,B)
+                't_c': grid_solve[1].detach() if grid_solve is not None else None,   # (cams,B,3)
+                'scale_d': depth_solve[0].detach() if depth_solve is not None else None,   # (cams,B)
+                'offset_d': depth_solve[1].detach() if depth_solve is not None else None,  # (cams,B)
+                # raw decoded grid + query times so the loss can solve the gauge for fake 2D.
+                'g_raw': points_3d_raw.detach() if self.is_gridnorm else None,       # (cams,B,t,n,3)
+                'depth_g': depth_pred[..., 0].detach() if self.is_gridnorm else None,  # (cams,B,t,n)
+                'query_times': query_times if self.is_gridnorm else None,            # (B,n)
                 # log_3d_output: the loss quantizes the 3D bin target in the same
                 # signed-log warped space as the (warped) bin centres.
                 'log_warp': self.decoder.log_3d_output,

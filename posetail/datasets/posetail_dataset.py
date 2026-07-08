@@ -103,6 +103,74 @@ def rotate_points_image_plane(cam, coords, angle_deg):
     return cam_rot, coords_rot, (M_2x3, (cw_i, ch_i))
 
 
+def rotate_camera_image_plane_3d(cam, angle_deg):
+    """In-plane image rotation for the 3D path: warp the image AND apply the matching extrinsic
+    Z-roll so the 3D->2D projection stays consistent (unlike rotate_points_image_plane, which
+    moves 2D pixel coords directly). The 3D world coords are left untouched by the caller.
+
+    Rotates around the cropped principal point, expands the canvas to avoid black borders, then
+    crops to the largest inscribed border-free rectangle. Updates ext/ext_inv/center (Z-roll),
+    principal point (mat), and size; offset unchanged.
+
+    Returns (cam_rot, (M_2x3, (cw_i, ch_i))). Shared by augment_image_rotation (base-load, gated)
+    and rotate_anchor_3d (scorer loop, forced angle).
+    """
+    angle_rad = np.radians(angle_deg)
+    cos_a = np.cos(angle_rad)
+    sin_a = np.sin(angle_rad)
+    w, h = cam['size'].tolist()
+    cx = float(cam['mat'][0, 2].item())
+    cy = float(cam['mat'][1, 2].item())
+    off_x = float(cam['offset'][0].item())
+    off_y = float(cam['offset'][1].item())
+
+    # rotate around the cropped principal point so the image rotation matches the extrinsic
+    # Z-roll. equals (cx, cy) when offset is 0.
+    center_x = cx - off_x
+    center_y = cy - off_y
+    M_2x3 = cv2.getRotationMatrix2D((center_x, center_y), angle_deg, 1.0)
+
+    corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float64)
+    corners_rot = corners @ M_2x3[:, :2].T + M_2x3[:, 2]
+    min_x, min_y = corners_rot.min(axis=0)
+    tx, ty = -min_x, -min_y
+    M_2x3[0, 2] += tx
+    M_2x3[1, 2] += ty
+
+    # Crop to the largest axis-aligned rectangle with no black borders, centered on the rotated
+    # image center in the expanded canvas.
+    cw, ch = _rotated_rect_max_inscribed(w, h, angle_rad)
+    cw_i, ch_i = int(np.floor(cw)), int(np.floor(ch))
+    img_ctr = M_2x3[:, :2] @ np.array([w / 2, h / 2]) + M_2x3[:, 2]
+    x1 = img_ctr[0] - cw_i / 2
+    y1 = img_ctr[1] - ch_i / 2
+    M_2x3[0, 2] -= x1
+    M_2x3[1, 2] -= y1
+
+    cam_rot = dict(cam)
+
+    # OpenCV y-down sign convention: R_roll[:2,:2] = [[c, s], [-s, c]]
+    R_roll = torch.eye(4, dtype=cam['ext'].dtype, device=cam['ext'].device)
+    R_roll[0, 0] = cos_a
+    R_roll[0, 1] = sin_a
+    R_roll[1, 0] = -sin_a
+    R_roll[1, 1] = cos_a
+    cam_rot['ext'] = R_roll @ cam['ext']
+    cam_rot['ext_inv'] = torch.linalg.inv(cam_rot['ext'])
+    cam_rot['center'] = -cam_rot['ext'][:3, :3].T @ cam_rot['ext'][:3, 3]
+
+    # mat[:2,:2] is unchanged (stays diagonal); principal point tracks the canvas expansion
+    # (tx, ty) and the crop offset (x1, y1). offset unchanged.
+    cam_rot['mat'] = cam['mat'].clone()
+    cam_rot['mat'][0, 2] = cam['mat'][0, 2] + tx - x1
+    cam_rot['mat'][1, 2] = cam['mat'][1, 2] + ty - y1
+    cam_rot['offset'] = cam['offset'].clone()
+    cam_rot['size'] = torch.tensor([cw_i, ch_i], dtype=torch.int32,
+                                   device=cam['size'].device)
+
+    return cam_rot, (M_2x3, (cw_i, ch_i))
+
+
 def load_image(cam_img_path, crop_coords=None, target_size=None, rotation=None):
     img = cv2.imread(cam_img_path)
     if img is None:
@@ -401,6 +469,10 @@ class PosetailDataset(Dataset):
         # keeps TrackerEncoder behavior identical.
         self.causal_masking = config.dataset[split].get('causal_masking', False)
         self.no_nan_coords = config.dataset[split].get('no_nan_coords', True)
+        # When no_nan_coords is off, keep partially-missing tracks but drop points
+        # observed in fewer than min_valid_frames frames (avoids all-/mostly-missing
+        # points the scorer can't meaningfully evaluate).
+        self.min_valid_frames = config.dataset[split].get('min_valid_frames', 1)
 
         # 3D sphere subvolume crop augmentation
         self.crop_3d_enabled = config.dataset[split].get('crop_3d_enabled', False)
@@ -426,22 +498,22 @@ class PosetailDataset(Dataset):
         
         # per-camera augmentations: same parameters applied to all frames of one camera
         self.aug_per_camera = iaa.Sequential([
-            iaa.Sometimes(self.aug_prob, iaa.imgcorruptlike.DefocusBlur(severity=(1,2))),
+            iaa.Sometimes(self.aug_prob, iaa.imgcorruptlike.DefocusBlur(severity=(1,1))),
             # iaa.Sometimes(self.aug_prob, iaa.imgcorruptlike.Contrast(severity=(1,2))),
-            iaa.Sometimes(self.aug_prob, iaa.GammaContrast((0.5, 1.8))),
+            iaa.Sometimes(self.aug_prob, iaa.GammaContrast((0.6, 1.8))),
             iaa.Sometimes(self.aug_prob, iaa.AddToSaturation((-50, 30))),
             iaa.Sometimes(self.aug_prob, iaa.AddToHue((-10, 10))),
             # iaa.Sometimes(self.aug_prob, iaa.UniformColorQuantizationToNBits(nb_bits=(3,7))),
-            iaa.Sometimes(self.aug_prob, iaa.JpegCompression(compression=(30, 70))),
+            # iaa.Sometimes(self.aug_prob, iaa.JpegCompression(compression=(30, 70))),
             # iaa.Sometimes(self.aug_prob, iaa.imgcorruptlike.Pixelate(severity=(1,2))),
         ])
 
         # per-image augmentations: independently resampled for each frame
         self.aug_per_image = iaa.Sequential([
             iaa.Sometimes(self.per_image_aug_prob, iaa.MotionBlur(k=(3,5))),
-            iaa.Sometimes(self.per_image_aug_prob, iaa.AdditiveGaussianNoise(scale=(0, 0.07*255))),
+            iaa.Sometimes(self.per_image_aug_prob, iaa.AdditiveGaussianNoise(scale=(0, 0.04*255))),
             iaa.Sometimes(self.per_image_aug_prob, iaa.Multiply((0.9, 1.1))),
-            iaa.Sometimes(self.per_image_aug_prob, iaa.SaltAndPepper(0.01)),
+            iaa.Sometimes(self.per_image_aug_prob, iaa.SaltAndPepper(0.004)),
         ])
         
         # generate metadata for the provided data path (requires a specific format)
@@ -610,6 +682,9 @@ class PosetailDataset(Dataset):
             if self.no_nan_coords:
                 mask = torch.all(torch.isfinite(coords), dim=(0, 2))
                 coords = coords[:, mask]
+            elif self.min_valid_frames > 1:
+                finite_frames = torch.isfinite(coords).all(dim=2).sum(dim=0)
+                coords = coords[:, finite_frames >= self.min_valid_frames]
 
             if coords.shape[1] < 2:
                 return None
@@ -750,6 +825,12 @@ class PosetailDataset(Dataset):
 
             if self.no_nan_coords:
                 mask = torch.all(torch.isfinite(coords), dim=(0, 2))
+                coords = coords[:, mask]
+                if vis is not None:
+                    vis = vis[:, mask]
+                    vis_2d = vis_2d[:, mask]
+            elif self.min_valid_frames > 1:
+                mask = torch.isfinite(coords).all(dim=2).sum(dim=0) >= self.min_valid_frames
                 coords = coords[:, mask]
                 if vis is not None:
                     vis = vis[:, mask]
@@ -1252,64 +1333,9 @@ class PosetailDataset(Dataset):
                 continue
 
             angle = float(np.random.uniform(-45, 45))
-            angle_rad = np.radians(angle)
-            cos_a = np.cos(angle_rad)
-            sin_a = np.sin(angle_rad)
-            w, h = cam['size'].tolist()
-            cx = float(cam['mat'][0, 2].item())
-            cy = float(cam['mat'][1, 2].item())
-            off_x = float(cam['offset'][0].item())
-            off_y = float(cam['offset'][1].item())
-
-            # rotate around the cropped principal point so the image rotation
-            # matches the extrinsic Z-roll. equals (cx, cy) when offset is 0.
-            center_x = cx - off_x
-            center_y = cy - off_y
-            M_2x3 = cv2.getRotationMatrix2D((center_x, center_y), angle, 1.0)
-
-            corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float64)
-            corners_rot = corners @ M_2x3[:, :2].T + M_2x3[:, 2]
-            min_x, min_y = corners_rot.min(axis=0)
-            max_x, max_y = corners_rot.max(axis=0)
-            tx, ty = -min_x, -min_y
-            M_2x3[0, 2] += tx
-            M_2x3[1, 2] += ty
-
-            # Crop to the largest axis-aligned rectangle with no black borders.
-            # The crop is centered on the rotated image center in the expanded canvas.
-            cw, ch = _rotated_rect_max_inscribed(w, h, angle_rad)
-            cw_i, ch_i = int(np.floor(cw)), int(np.floor(ch))
-            img_ctr = M_2x3[:, :2] @ np.array([w / 2, h / 2]) + M_2x3[:, 2]
-            x1 = img_ctr[0] - cw_i / 2
-            y1 = img_ctr[1] - ch_i / 2
-            M_2x3[0, 2] -= x1
-            M_2x3[1, 2] -= y1
-
-            cam_rot = dict(cam)
-
-            # OpenCV y-down sign convention: R_roll[:2,:2] = [[c, s], [-s, c]]
-            R_roll = torch.eye(4, dtype=cam['ext'].dtype, device=cam['ext'].device)
-            R_roll[0, 0] = cos_a
-            R_roll[0, 1] = sin_a
-            R_roll[1, 0] = -sin_a
-            R_roll[1, 1] = cos_a
-            cam_rot['ext'] = R_roll @ cam['ext']
-            cam_rot['ext_inv'] = torch.linalg.inv(cam_rot['ext'])
-            cam_rot['center'] = -cam_rot['ext'][:3, :3].T @ cam_rot['ext'][:3, 3]
-
-            # mat[:2,:2] is unchanged (stays diagonal); principal point tracks the
-            # canvas expansion (tx, ty) and the crop offset (x1, y1). offset unchanged.
-            cam_rot['mat'] = cam['mat'].clone()
-            cam_rot['mat'][0, 2] = cam['mat'][0, 2] + tx - x1
-            cam_rot['mat'][1, 2] = cam['mat'][1, 2] + ty - y1
-
-            cam_rot['offset'] = cam['offset'].clone()
-
-            cam_rot['size'] = torch.tensor([cw_i, ch_i], dtype=torch.int32,
-                                           device=cam['size'].device)
-
+            cam_rot, rot = rotate_camera_image_plane_3d(cam, angle)
             cgroup_rotated.append(cam_rot)
-            rotation_info.append((M_2x3, (cw_i, ch_i)))
+            rotation_info.append(rot)
 
         return cgroup_rotated, rotation_info
 

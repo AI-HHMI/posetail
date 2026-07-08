@@ -186,3 +186,11 @@ pixi-py/*
 pixi.lock
 
 .aider*
+
+# local scratch / working dirs
+logs/
+parity_check/
+scripts/
+notebooks/
+reports/
+setup_env_vars.sh

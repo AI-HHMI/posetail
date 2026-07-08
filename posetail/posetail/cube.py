@@ -543,6 +543,30 @@ class CameraSelfAttention(nn.Module):
         out = self.out_proj(out)
         return out
 
+
+def solve_scale_offset(g, q, eps=1e-8):
+    """Fixed-rotation least-squares gauge solve for `gridnorm`.
+
+    Find the scalar scale ``s`` and offset ``t`` (per leading dim) that minimise
+    ``|| s*g + t - q ||^2`` over the K correspondences:
+
+        g, q : (..., K, D)   ->   s : (...,)   t : (..., D)
+
+    The scale is a single (isotropic) scalar shared across D; D=3 for the 3D grid
+    (rotation already known via the ray-local frame), D=1 for the depth head. The
+    closed form (centre, then 1D slope) is exactly the toy-verified solve. ``eps``
+    guards a collapsed constellation (``Σ||g-ḡ||²→0``)."""
+    gbar = g.mean(dim=-2, keepdim=True)                      # (...,1,D)
+    qbar = q.mean(dim=-2, keepdim=True)
+    gc = g - gbar
+    qc = q - qbar
+    num = (gc * qc).sum(dim=(-1, -2))                        # (...,)
+    den = (gc * gc).sum(dim=(-1, -2)).clamp_min(eps)
+    s = num / den                                           # (...,)
+    t = qbar.squeeze(-2) - s.unsqueeze(-1) * gbar.squeeze(-2)  # (..., D)
+    return s, t
+
+
 def _invert_SE3(transforms: torch.Tensor) -> torch.Tensor:
     """Invert a 4x4 SE(3) matrix."""
     assert transforms.shape[-2:] == (4, 4)

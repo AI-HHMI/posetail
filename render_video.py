@@ -261,8 +261,9 @@ def main():
     # Override with trial path if provided (recompute video paths from the trial)
     if args.trial_path is not None:
         from inference_video import load_trial
-        _mode, metadata_path, _cam_names, video_paths, *_ = load_trial(
-            args.trial_path, start_frame=start_frame)
+        trial = load_trial(args.trial_path, start_frame=start_frame)
+        metadata_path = trial['metadata_path']
+        video_paths = trial['video_paths']
     else:
         metadata_path = data['metadata_path'].item() if 'metadata_path' in data else ''
 

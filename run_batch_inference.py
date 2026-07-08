@@ -125,6 +125,12 @@ def main():
     ap.add_argument('--checkpoint', type=int, default=None,
                     help='checkpoint step; default = latest in the run')
     ap.add_argument('--device', type=str, default=None)
+    ap.add_argument('--datasets', nargs='+', default=None,
+                    help='restrict to these dataset names (default: all under prefix)')
+    ap.add_argument('--no-query-first', dest='query_first', action='store_false', default=True,
+                    help='disable query-first (default ON): anchor each point at its first '
+                         'valid+visible frame (mvtracker/training convention). With this flag, '
+                         'all points are anchored at start_frame instead (legacy 3D behavior).')
     args = ap.parse_args()
 
     out_root = os.path.expanduser(args.out_root)
@@ -147,6 +153,8 @@ def main():
         d for d in os.listdir(args.prefix)
         if os.path.isdir(os.path.join(args.prefix, d))
     )
+    if args.datasets:
+        datasets = [d for d in datasets if d in set(args.datasets)]
     print(f'Found {len(datasets)} datasets: {datasets}')
 
     renders = []     # (dataset, Popen)
@@ -188,6 +196,7 @@ def main():
                 device=device,
                 outpath=tracks_path,
                 pred_key_3d=pred_key_3d,
+                query_first=args.query_first,
             )
 
             # Render: background subprocess, overlaps the next dataset's inference.

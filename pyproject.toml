@@ -50,6 +50,13 @@ libc = { family = "glibc", version = "2.34" }
 [project.urls]
 Repository = "https://github.com/AllenNeuralDynamics/posetail"
 
+[tool.setuptools]
+# `posetail` (now a real package via posetail/__init__.py) plus its subpackages are picked
+# up by setup.py's find_packages(). These are the top-level helper modules that live at the
+# repo root (outside the package) but are imported bare (e.g. `from train_utils import ...`,
+# `from inference_video import ...`); list them so an install exposes them too.
+py-modules = ["train_utils", "inference_video", "inference_utils"]
+
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
@@ -65,7 +72,7 @@ vjepa2 = { path = "/groups/karashchuk/home/karashchukl/builds/vjepa2", editable 
 [tool.pixi.environments]
 default = { solve-group = "default" }
 # gpu = { features = ["gpu"], solve-group = "default" }
-# dev = {features = ["dev"], solve-group = "default"}
+dev = {features = ["dev"], solve-group = "default"}
 
 [tool.pixi.tasks]
 
@@ -73,12 +80,14 @@ default = { solve-group = "default" }
 python = "3.11.*"
 cuda-toolkit = "12.8.*"
 numpy = "==1.26"
+scipy = "<1.17"
 setuptools = "<81"
 pip = "*"
 
-# [tool.pixi.feature.dev.dependencies]
+[tool.pixi.feature.dev.dependencies]
 matplotlib = "*"
 ipython = "*"
 notebook = "*"
 ipympl = "*"
 av = "*"
+hdf5storage = "*"

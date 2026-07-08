@@ -12,7 +12,8 @@ def _sigmoid(x):
 def get_eval_metrics(vis_pred, vis_true, coords_pred,
                      coords_true, thresholds = None,
                      survival_threshold = 50, prefix = 'eval/',
-                     cube_scale = None, delta_x_multiplier = 1.0):
+                     cube_scale = None, delta_x_multiplier = 1.0,
+                     query_times = None):
 
     # cube_scale: optional (B,) world-units-per-pixel (median over cameras). When given, the
     # delta_x thresholds become k * cube_scale * delta_x_multiplier world units, i.e. delta_x_k
@@ -33,21 +34,36 @@ def get_eval_metrics(vis_pred, vis_true, coords_pred,
     coords_pred = coords_pred.detach().cpu().to(torch.float32).numpy()
     coords_true = coords_true.detach().cpu().to(torch.float32).numpy()
 
-    mte = get_mte(coords_pred, coords_true, vis_true)
+    # Effective visibility for the position metrics (MTE/MPJPE/delta_x/survival/jaccard):
+    # a frame counts only if the GT is finite AND (query_first) at/after the point's query
+    # time. This drops invalid GT (e.g. cleaned (0,0,-1)->NaN placeholders) and pre-query
+    # frames, matching the mvtracker convention. occlusion_acc keeps the raw vis_true.
+    finite = np.isfinite(coords_true).all(axis=-1, keepdims=True)     # B,T,N,1
+    vis_eff = vis_true & finite
+    if query_times is not None:
+        if isinstance(query_times, torch.Tensor):
+            query_times = query_times.detach().cpu().numpy()
+        qt = np.asarray(query_times)                                  # (N,) or (B,N)
+        B, T, N = vis_eff.shape[0], vis_eff.shape[1], vis_eff.shape[2]
+        qt = np.broadcast_to(qt.reshape(-1, N) if qt.ndim > 1 else qt.reshape(1, N), (B, N))
+        at_or_after = np.arange(T)[None, :, None] >= qt[:, None, :]    # B,T,N
+        vis_eff = vis_eff & at_or_after[..., None]
+
+    mte = get_mte(coords_pred, coords_true, vis_eff)
 
     occlusion_acc = get_occlusion_accuracy(vis_pred, vis_true)
 
-    mpjpe = get_mpjpe(coords_pred, coords_true, vis_pred, vis_true)
+    mpjpe = get_mpjpe(coords_pred, coords_true, vis_pred, vis_eff)
 
     delta_x_avg, delta_x_dict = get_delta_x_avg(coords_pred,
-        coords_true, vis_true, thresholds = thresholds,
+        coords_true, vis_eff, thresholds = thresholds,
         cube_scale = cube_scale, multiplier = delta_x_multiplier)
-    
-    survival_rate = get_survival_rate(coords_pred, 
-        coords_true, vis_true, threshold = survival_threshold)
-    
+
+    survival_rate = get_survival_rate(coords_pred,
+        coords_true, vis_eff, threshold = survival_threshold)
+
     avg_jaccard, avg_jaccard_dict = get_average_jaccard(coords_pred,
-        coords_true, vis_pred, vis_true, thresholds=thresholds,
+        coords_true, vis_pred, vis_eff, thresholds=thresholds,
         cube_scale=cube_scale, multiplier=delta_x_multiplier)
 
     metrics = {f'{prefix}mte': mte, 

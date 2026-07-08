@@ -1,9 +1,11 @@
 import os
 import json
+import math
 import time
 import toml
 import torch
 import yaml
+import random
 
 import numpy as np
 
@@ -30,7 +32,23 @@ from schedulefree import AdamWScheduleFree
 from einops import rearrange
 
 
+def resolve_seed(seed):
+    """0 or None => draw a fresh seed from OS entropy; otherwise pass through.
+
+    Range [1, 2**32-1] so the result is a valid numpy seed and never re-triggers
+    the sentinel. Use this when you want ``seed = 0`` in a config to mean "random".
+    """
+    if not seed:  # covers 0 and None
+        seed = int.from_bytes(os.urandom(4), 'little') % (2**32 - 1) + 1
+    return seed
+
+
 def set_seeds(seed = 3, set_backends = True):
+
+    # a falsy seed (0 / None) means "random run" -- the user doesn't care about
+    # reproducibility, so don't pay for deterministic backends either.
+    random_mode = not seed
+    seed = resolve_seed(seed)
 
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -40,11 +58,35 @@ def set_seeds(seed = 3, set_backends = True):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-    # seeds for nondeterministic operations - note that this
-    # could make the code less efficient
-    if set_backends:
-        torch.backends.cudnn.deterministic = True 
+    # deterministic backends only for a fixed seed; in random mode let cudnn
+    # benchmark for speed. note deterministic ops can be less efficient.
+    if set_backends and not random_mode:
+        torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+    return seed
+
+
+def make_worker_init_fn(base_seed, rank):
+    """Build a DataLoader `worker_init_fn` that decorrelates RNG per (rank, worker).
+
+    On `fork` (Linux default) every dataloader worker inherits the parent process's
+    numpy RNG state verbatim; PyTorch auto-reseeds torch/`random` per worker but NOT
+    numpy. Since PosetailDataset drives ~all of its sampling/augmentation through
+    `np.random.*`, workers would otherwise emit correlated draws. Worse under DDP:
+    every rank runs `set_seeds` with the same broadcast seed, and torch's per-worker
+    seed (`torch.initial_seed()+worker_id`) is rank-independent, so even torch draws
+    correlate rank-to-rank. Folding `rank` into the seed decorrelates both axes.
+
+    Model init still uses the shared broadcast seed (untouched), so DDP parameter
+    init stays identical across ranks -- only the dataloader streams are decorrelated.
+    """
+    def _init(worker_id):
+        s = (int(base_seed) + int(rank) * 100003 + int(worker_id)) % 2**32
+        np.random.seed(s)
+        torch.manual_seed(s)
+        random.seed(s)
+    return _init
 
 
 def load_config(config_path, easy = True): 
@@ -630,7 +672,17 @@ def train_iteration(config, model, fabric, batch,
             grad_norm += p.grad.detach().data.norm(2).item() ** 2
     grad_norm = grad_norm ** 0.5
 
-    # torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm, 
+    # Track the learnable soft-argmax temperatures (exp of unclamped log-params). An upward
+    # drift is the suspected driver of isolated grad-norm spikes; log so it can be confirmed
+    # (and confirmed pinned once _grid_softmax clamps the effective temperature).
+    temp_dict = {}
+    for name, p in model.named_parameters():
+        if name.endswith('log_soft_argmax_temp'):
+            temp_dict[f'{prefix}soft_argmax_temp'] = float(torch.exp(p.detach()).item())
+        elif name.endswith('log_subpixel_temp'):
+            temp_dict[f'{prefix}subpixel_temp'] = float(torch.exp(p.detach()).item())
+
+    # torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm,
     #                                error_if_nonfinite = False)
 
     try:
@@ -684,6 +736,7 @@ def train_iteration(config, model, fabric, batch,
                   f'{prefix}elapsed_time_hms': elapsed_time_hms,
                   f'{prefix}learning_rate': learning_rate,
                   f'{prefix}grad_norm': grad_norm}
+    train_dict.update(temp_dict)
     train_dict.update(loss_dict)
 
     # average evaluation metrics if we evaluated
@@ -847,6 +900,20 @@ def train_epoch(config, model, fabric, dataloader,
         train_dict.update(avg_metrics_dict)
 
     return train_dict
+
+
+def drop_nan_motion_metrics(metrics):
+    ''' Return a copy of the metrics dict with NaN-valued mte_mo_* entries removed.
+    Empty motion bins produce NaN mte_mo_* values; logging them clutters the wandb
+    visualizer, so drop those keys for this step. Other NaN metrics are kept, since
+    a NaN there is meaningful. '''
+    def _is_nan(v):
+        try:
+            return math.isnan(float(v))
+        except (TypeError, ValueError):
+            return False
+    return {k: v for k, v in metrics.items()
+            if not ('mte_mo' in k and _is_nan(v))}
 
 
 def average_metrics(dicts, prefix, name = None, nan_safe = False):

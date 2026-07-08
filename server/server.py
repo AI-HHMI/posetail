@@ -24,11 +24,49 @@ from fastapi.responses import Response
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from inference_video import load_model_from_base_folder, resize_camera_group
+from inference_video import (load_model_from_base_folder,
+                             resize_camera_group, resolve_config_and_checkpoint)
+from posetail.posetail.scorer_encoder import ScorerEncoder
 from posetail.posetail.tracker_encoder import TrackerEncoder
 from train_utils import load_checkpoint, load_config
 
 _gpu_lock = asyncio.Lock()
+
+
+def load_scorer_model(*, wandb=None, config=None, checkpoint=None,
+                      checkpoint_number=None, device=None):
+    """Build a ScorerEncoder from config.scorer + config.model and load its checkpoint.
+
+    The scorer can't go through load_checkpoint's auto-instantiation (that only builds
+    tracker variants), so we construct it manually — mirroring scripts/score_ratcity_tracklets.py.
+    """
+    if wandb:
+        config_path, checkpoint_path = resolve_config_and_checkpoint(
+            wandb, checkpoint=checkpoint_number)
+    else:
+        config_path, checkpoint_path = config, checkpoint
+
+    cfg = load_config(config_path)
+    if device is None:
+        device = cfg.devices.device if torch.cuda.is_available() else 'cpu'
+
+    if 'scorer' not in cfg:
+        raise RuntimeError(
+            f'Scorer config {config_path} has no [scorer] table — is this a tracker config?'
+        )
+    sk = dict(cfg.scorer)
+    model = ScorerEncoder(
+        pool_num_heads=sk.get('pool_num_heads', 8),
+        score_hidden=sk.get('score_hidden', 64),
+        use_precision=sk.get('use_precision', True),
+        **cfg.model,
+    )
+    model.to(device)
+    model = load_checkpoint(config_path, checkpoint_path, model=model, device=device)['model']
+    if not isinstance(model, ScorerEncoder):
+        raise RuntimeError(f'Scorer must be a ScorerEncoder, got {type(model).__name__}')
+    model.eval()
+    return model, config_path, checkpoint_path
 
 
 @asynccontextmanager
@@ -76,6 +114,23 @@ async def lifespan(app: FastAPI):
     print(
         f'Model loaded | n_frames={model.n_frames} | image_size={model.image_size} | device={device}'
     )
+
+    # Optional scorer model — enables /score when scorer args are provided.
+    app.state.scorer = None
+    app.state.scorer_config_path = None
+    app.state.scorer_checkpoint_path = None
+    if args.scorer_wandb or args.scorer_config:
+        scorer, scorer_cfg, scorer_ckpt = load_scorer_model(
+            wandb=args.scorer_wandb, config=args.scorer_config,
+            checkpoint=args.scorer_checkpoint,
+            checkpoint_number=args.scorer_checkpoint_number,
+            device=str(device),  # pin to the tracker's device
+        )
+        app.state.scorer = scorer
+        app.state.scorer_config_path = str(scorer_cfg)
+        app.state.scorer_checkpoint_path = str(scorer_ckpt)
+        print(f'Scorer loaded | device={next(scorer.parameters()).device}')
+
     yield
 
 
@@ -91,40 +146,18 @@ async def info():
         'config_path': app.state.config_path,
         'checkpoint_path': app.state.checkpoint_path,
         'mode_3d': app.state.mode_3d,
+        'scorer_loaded': app.state.scorer is not None,
+        'scorer_config_path': app.state.scorer_config_path,
+        'scorer_checkpoint_path': app.state.scorer_checkpoint_path,
     }
 
 
-@app.post('/predict')
-async def predict(
-    metadata: str = Form(...),
-    images: list[UploadFile] = File(...),
-):
-    try:
-        meta = json.loads(metadata)
-    except json.JSONDecodeError as e:
-        raise HTTPException(400, detail=f'Invalid metadata JSON: {e}')
-
-    if 'cameras' not in meta:
-        raise HTTPException(400, detail='metadata must include "cameras"')
-    if 'coords' not in meta:
-        raise HTTPException(400, detail='metadata must include "coords"')
-
+async def _parse_scene_request(meta, images, device, n_frames, image_size):
+    """Decode uploaded images, build+resize the camera_group, and build per-camera view
+    tensors. Shared by /predict and /score (coords parsing differs, so it stays in the
+    handlers). Returns (camera_group, views, scales) where scales are the per-camera
+    resize factors (only /predict uses them, to un-scale 2d_pred)."""
     cameras_meta = meta['cameras']
-    coords_list = meta['coords']
-    query_times_list = meta.get('query_times', None)
-
-    model = app.state.model
-    device = app.state.device
-    n_frames = app.state.n_frames
-
-    if query_times_list is not None and len(query_times_list) != len(coords_list):
-        raise HTTPException(
-            400,
-            detail=(
-                f'query_times length {len(query_times_list)} != '
-                f'coords length {len(coords_list)}'
-            ),
-        )
 
     # Decode and group images by camera name
     cam_frames: dict[str, dict[int, np.ndarray]] = {}
@@ -185,7 +218,6 @@ async def predict(
         })
 
     # Record per-camera scale factors before resize so we can un-scale 2d_pred later
-    image_size = app.state.image_size
     scales = [float(image_size) / max(cam['size'].tolist()) for cam in camera_group]
 
     # Scale so max(H,W) == image_size, matching PosetailDataset / inference_video
@@ -209,6 +241,56 @@ async def predict(
             torch.from_numpy(frames).unsqueeze(0).to(device=device, dtype=torch.float32) / 255.0
         )
         views.append(view_tensor)
+
+    return camera_group, views, scales
+
+
+def _npz_response(result: dict, filename: str) -> Response:
+    """Serialize a dict of numpy arrays to an .npz download response."""
+    buf = io.BytesIO()
+    np.savez(buf, **result)
+    buf.seek(0)
+    return Response(
+        content=buf.read(),
+        media_type='application/octet-stream',
+        headers={'Content-Disposition': f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post('/predict')
+async def predict(
+    metadata: str = Form(...),
+    images: list[UploadFile] = File(...),
+):
+    try:
+        meta = json.loads(metadata)
+    except json.JSONDecodeError as e:
+        raise HTTPException(400, detail=f'Invalid metadata JSON: {e}')
+
+    if 'cameras' not in meta:
+        raise HTTPException(400, detail='metadata must include "cameras"')
+    if 'coords' not in meta:
+        raise HTTPException(400, detail='metadata must include "coords"')
+
+    coords_list = meta['coords']
+    query_times_list = meta.get('query_times', None)
+
+    model = app.state.model
+    device = app.state.device
+    n_frames = app.state.n_frames
+    image_size = app.state.image_size
+
+    if query_times_list is not None and len(query_times_list) != len(coords_list):
+        raise HTTPException(
+            400,
+            detail=(
+                f'query_times length {len(query_times_list)} != '
+                f'coords length {len(coords_list)}'
+            ),
+        )
+
+    camera_group, views, scales = await _parse_scene_request(
+        meta, images, device, n_frames, image_size)
 
     coords = torch.tensor(coords_list, dtype=torch.float32, device=device).unsqueeze(0)
     query_times = None
@@ -238,15 +320,66 @@ async def predict(
             continue
         result[key] = val.cpu().numpy() if isinstance(val, torch.Tensor) else np.asarray(val)
 
-    buf = io.BytesIO()
-    np.savez(buf, **result)
-    buf.seek(0)
+    return _npz_response(result, 'predictions.npz')
 
-    return Response(
-        content=buf.read(),
-        media_type='application/octet-stream',
-        headers={'Content-Disposition': 'attachment; filename="predictions.npz"'},
-    )
+
+@app.post('/score')
+async def score(
+    metadata: str = Form(...),
+    images: list[UploadFile] = File(...),
+):
+    if app.state.scorer is None:
+        raise HTTPException(
+            404,
+            detail='No scorer model loaded (start the server with --scorer-wandb or --scorer-config)',
+        )
+
+    try:
+        meta = json.loads(metadata)
+    except json.JSONDecodeError as e:
+        raise HTTPException(400, detail=f'Invalid metadata JSON: {e}')
+
+    if 'cameras' not in meta:
+        raise HTTPException(400, detail='metadata must include "cameras"')
+    if 'coords' not in meta:
+        raise HTTPException(400, detail='metadata must include "coords"')
+
+    scorer = app.state.scorer
+    device = app.state.device
+    n_frames = app.state.n_frames
+    image_size = app.state.image_size
+
+    # Scorer coords are a FULL-SEQUENCE trajectory [T, K, 3] (not query points [N, 3]).
+    coords_arr = np.asarray(meta['coords'], dtype=np.float32)
+    if coords_arr.ndim != 3 or coords_arr.shape[-1] != 3:
+        raise HTTPException(
+            400,
+            detail=f'/score coords must be a full-sequence trajectory [T, K, 3], got shape {list(coords_arr.shape)}',
+        )
+    if coords_arr.shape[0] != n_frames:
+        raise HTTPException(
+            400,
+            detail=f'/score expects T={n_frames} frames, got {coords_arr.shape[0]}',
+        )
+
+    camera_group, views, _scales = await _parse_scene_request(
+        meta, images, device, n_frames, image_size)
+
+    coords_full = torch.from_numpy(coords_arr).to(device).unsqueeze(0)  # [1, T, K, 3]
+
+    async with _gpu_lock:
+        with torch.no_grad():
+            scores, precision = scorer(
+                views=views,
+                coords=coords_full,
+                camera_group=camera_group,
+            )
+
+    result = {
+        'scores': scores.cpu().numpy(),
+        'precision': precision.cpu().numpy(),
+    }
+    return _npz_response(result, 'scores.npz')
 
 
 def parse_args():
@@ -272,6 +405,21 @@ def parse_args():
         '--device', type=str, default=None,
         help='Device string, e.g. cuda:0 (default: from config, or cpu if CUDA unavailable)',
     )
+    # Optional scorer model — enables the /score endpoint.
+    parser.add_argument(
+        '--scorer-wandb', type=str, default=None,
+        help='wandb run dir for a ScorerEncoder (enables /score)',
+    )
+    parser.add_argument(
+        '--scorer-config', type=str, default=None,
+        help='config.toml for the scorer (requires --scorer-checkpoint)',
+    )
+    parser.add_argument('--scorer-checkpoint', type=str, default=None,
+                        help='Scorer checkpoint .pth (required with --scorer-config)')
+    parser.add_argument(
+        '--scorer-checkpoint-number', type=int, default=None,
+        help='Scorer checkpoint number to load (only with --scorer-wandb; default: latest)',
+    )
     args = parser.parse_args()
     if args.config and not args.checkpoint:
         parser.error('--checkpoint is required when using --config')
@@ -279,6 +427,14 @@ def parse_args():
         parser.error('--config is required when using --checkpoint')
     if args.checkpoint_number is not None and not args.wandb:
         parser.error('--checkpoint-number is only valid with --wandb')
+    if args.scorer_config and not args.scorer_checkpoint:
+        parser.error('--scorer-checkpoint is required when using --scorer-config')
+    if args.scorer_checkpoint and not args.scorer_config:
+        parser.error('--scorer-config is required when using --scorer-checkpoint')
+    if args.scorer_wandb and args.scorer_config:
+        parser.error('use either --scorer-wandb or --scorer-config, not both')
+    if args.scorer_checkpoint_number is not None and not args.scorer_wandb:
+        parser.error('--scorer-checkpoint-number is only valid with --scorer-wandb')
     return args
 
 

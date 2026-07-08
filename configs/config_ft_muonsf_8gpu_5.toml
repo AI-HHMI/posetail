@@ -80,7 +80,7 @@ mode_3d = "encoder"
 
 video_encoder_version = 'large'
 # VJEPA backbone trainable from step 0 (vs delayed unfreeze when pretraining from scratch).
-video_encoder_requires_grad = 25000
+video_encoder_requires_grad = true
 video_encoder_hierarchical = true
 # Finetune the WHOLE encoder (omit video_encoder_finetune_last_n_layers -> default None = all)
 # so the backbone can specialize for dense correspondence, not just semantics.
@@ -114,8 +114,6 @@ f_eff_scale = true
 # Projecting encoder features to the decoder dim trains notably better than false.
 scene_encoder_proj = true
 
-scene_proj_dim = 2048
-
 # "gridresid" = per-axis soft-argmax bin grid (CE-supervised): 3D head emits a motion residual
 # from a query anchor, depth is a log grid, plus a 2D pixel-bin position head.
 output_mode = "gridresid"
@@ -125,12 +123,16 @@ head_3d_grid_radius = 1.5
 # Signed-log warp: tight eps spreads the sharply-peaked motion residual (p50~0.02) across bins.
 log_3d_output = true
 log_3d_eps = 0.01
+
+enable_subpixel_refinement = false
+# subpixel_scale = 0.08
+
 # Depth log-grid range = log(depth/(cube*f_eff)); covers every dataset's reach with margin.
 depth_log_min = -2.5
 depth_log_max = 2.0
 
 [training]
-seed = 27
+seed = 97
 finetune = true
 
 # previous finetuning v3
@@ -141,10 +143,11 @@ finetune = true
 # checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260621_211130-268oz1ua/files/checkpoints/checkpoint_00010240.pth'
 
 # continue
-# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260621_220241-ufwyxvnv/files/checkpoints/checkpoint_00245760.pth'
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260622_164809-j5y2ff92/files/checkpoints/checkpoint_01761280.pth'
 
-# from _4
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260622_164809-j5y2ff92/files/checkpoints/checkpoint_00286720.pth'
+# finetuned with enable_subpixel_refinement
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260627_135613-iuttiiqz/files/checkpoints/checkpoint_00030720.pth'
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260627_194655-nuqutgsb/files/checkpoints/checkpoint_00040960.pth'
 
 n_iterations = 8000000
 scheduler_type = 'muon'  # SF-Muon: beats AdamW/schedulefree by ~0.05 kubric at every matched iter
@@ -171,7 +174,7 @@ beta1 = 0.9
 beta2 = 0.95
 # Whole encoder trainable but at 0.1x base LR: 1.0 blew up grad_norm to ~3485 and collapsed the
 # V-JEPA features. 0.1 -> two-group split, encoder ~5.7e-5. Kill-switch: grad_norm>100 -> 0.05.
-encoder_lr_scale = 0.1
+encoder_lr_scale = 0.07
 
 [training.scheduler]
 

@@ -8,6 +8,7 @@ mode = 'online' # 'online', 'offline', 'disabled'
 batch_size = 1
 num_workers = 12
 prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3'
+# prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v3'
 
 [dataset.train]
 split_dir = 'train'
@@ -26,11 +27,17 @@ speed_thresh = 3.0
 query_anytime = true
 query_edge_bias = 200.0
 prop_dynamic_kpts_to_sample = 0.95
+# gridnorm's solve runs only in 3D (needs 3D query targets); 2D batches skip the solve
+# and emit the raw grid output (no forward normalization — the 2D loss normalizes by mean
+# depth, as for the other modes). Both are supported.
 prob_2d_only = 0.25
 crop_3d_enabled = true
 crop_3d_fraction = [0.05, 0.75]
 crop_3d_prob = 0.4
 # No causal_masking: the encoder's temporal self-attention is bidirectional (TapNext-only).
+
+# [dataset.train.dataset_weights]
+# kubric-multiview = 3.0
 
 [dataset.train.curriculum]
 enabled = false
@@ -98,7 +105,8 @@ n_time_space_blocks = 6
 embedding_factor = 4
 use_camera_self_attention = true
 use_temporal_self_attention = true
-f_eff_scale = true
+# gridnorm is self-calibrating (solves its own per-camera scale/offset) -> f_eff unused.
+f_eff_scale = false
 # Projecting encoder features to the decoder dim trains notably better than false.
 scene_encoder_proj = true
 
@@ -108,27 +116,18 @@ scene_proj_dim = 512
 scene_proj_prenorm = false
 scene_proj_mlp = false
 
-# 'ropepos' = temporal RoPE in the decoder cross-attention + a learned spatial-only scene
-# pos_embed (restores absolute spatial position that the RoPE video backbone lacks).
-scene_pos_embed_mode = 'ropepos'
-rope_base = 100.0
-# 'fourier_rel' = Fourier encodings of absolute query, absolute target, and the relative
-# (target-query) gap as a dedicated fusion term (length-agnostic, gap-consistent).
-time_embed_mode = 'fourier_rel'
 
-
-# "gridresid" = per-axis soft-argmax bin grid (CE-supervised): 3D head emits a motion residual
-# from a query anchor, depth is a log grid, plus a 2D pixel-bin position head.
-#
-
-# without subpixel
-output_mode = "gridresid"
+# "gridnorm" = gauge-free per-axis soft-argmax bin grid. The 3D grid and the (linear) depth
+# grid each carry an arbitrary scale/offset that is SOLVED per-camera from the query points
+# (replacing cube_scale/query_local and cube_scale*f_eff respectively) -> self-calibrating,
+# ortho-safe, no coverage parameter. log_3d_output=false (linear 3D grid + linear depth grid).
+output_mode = "gridnorm"
 head_3d_grid_size = 1024
-head_3d_grid_radius = 1.8
-log_3d_output = true
-log_3d_eps = 0.1
-soft_argmax_threshold = 60
-grid_decode_space = "warped"
+head_3d_grid_radius = 2.0          # fixed gauge box (the network self-scales into it); not tuned
+log_3d_output = false              # linear 3D grid; the depth grid is linear too (see Decoder)
+log_3d_eps = 0.1                   # unused when log_3d_output=false
+soft_argmax_threshold = 60         # re-derive in gauge units if needed (gridresid value borrowed)
+grid_decode_space = "head"         # (decode-space knob is a no-op without log_3d_output)
 enable_subpixel_refinement = false
 
 # gridresid with subpixel refinement
@@ -147,14 +146,14 @@ depth_log_max = 2.5
 
 
 [training]
-seed = 3
-n_iterations = 800000
+seed = 27
+n_iterations = 8000000
 scheduler_type = 'muon'
-max_grad_norm = 50.0
+max_grad_norm = 10.0
 checkpoint_freq = 10240 # in iterations
-eval_metric_freq = 16 # in iterations
-val_freq = 64 # in iterations
-print_freq = 128 # in iterations
+eval_metric_freq = 24 # in iterations
+val_freq = 48 # in iterations
+print_freq = 96 # in iterations
 debug_ix = -1 # only works for val
 
 [training.optimizer]
@@ -162,20 +161,20 @@ debug_ix = -1 # only works for val
 # moot (encoder frozen).
 learning_rate = 5e-4
 muon_schedulefree = true
-weight_decay = 0.002
+weight_decay = 0.001
 warmup_steps = 2000
 muon_warmup_steps = 2000
 beta1 = 0.9
 beta2 = 0.95
 
-encoder_lr_scale = 1.0
+encoder_lr_scale = 1.0 # not used
 
 [training.scheduler]
 
 [training.losses]
 gamma = 0.8
 pixel_thresh = 3
-delta = 4
+delta = 6
 use_huber_loss = true
 
 # weights for calculating total loss (use 0 to not compute a specific loss)
@@ -187,7 +186,8 @@ conf_2d_loss_weight = 0.0
 occluded_coords_loss_weight = 0.1
 feature_loss_weight = 0.0
 
-# Reweight
+# Reweight. gridnorm: coords_loss_direct pins the 3D solve, coords_loss_rays pins the depth
+# solve (metric-through-solve terms that stop CE's gauge from collapsing) -> both must be > 0.
 coords_loss_weight = 0.1
 coords_loss_direct_weight = 0.1
 coords_loss_rays_weight = 0.0

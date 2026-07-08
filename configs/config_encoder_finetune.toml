@@ -1,6 +1,6 @@
 [wandb]
-project_name = 'posetail-pretraining-v3'
-path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3'
+project_name = 'posetail-finetuning-v3'
+path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3'
 mode = 'online' # 'online', 'offline', 'disabled'
 
 [dataset]
@@ -8,6 +8,7 @@ mode = 'online' # 'online', 'offline', 'disabled'
 batch_size = 1
 num_workers = 12
 prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3'
+# prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v3'
 
 [dataset.train]
 split_dir = 'train'
@@ -31,6 +32,9 @@ crop_3d_enabled = true
 crop_3d_fraction = [0.05, 0.75]
 crop_3d_prob = 0.4
 # No causal_masking: the encoder's temporal self-attention is bidirectional (TapNext-only).
+
+[dataset.train.dataset_weights]
+kubric-multiview = 3.0
 
 [dataset.train.curriculum]
 enabled = false
@@ -66,7 +70,7 @@ mode_3d = "encoder"
 
 video_encoder_version = 'large'
 # VJEPA backbone frozen for all of pretraining; finetuning unlocks the whole encoder.
-video_encoder_requires_grad = false
+video_encoder_requires_grad = true
 video_encoder_hierarchical = true
 
 # Inert while the encoder is frozen.
@@ -108,14 +112,6 @@ scene_proj_dim = 512
 scene_proj_prenorm = false
 scene_proj_mlp = false
 
-# 'ropepos' = temporal RoPE in the decoder cross-attention + a learned spatial-only scene
-# pos_embed (restores absolute spatial position that the RoPE video backbone lacks).
-scene_pos_embed_mode = 'ropepos'
-rope_base = 100.0
-# 'fourier_rel' = Fourier encodings of absolute query, absolute target, and the relative
-# (target-query) gap as a dedicated fusion term (length-agnostic, gap-consistent).
-time_embed_mode = 'fourier_rel'
-
 
 # "gridresid" = per-axis soft-argmax bin grid (CE-supervised): 3D head emits a motion residual
 # from a query anchor, depth is a log grid, plus a 2D pixel-bin position head.
@@ -147,20 +143,28 @@ depth_log_max = 2.5
 
 
 [training]
-seed = 3
-n_iterations = 800000
+seed = 0
+
+finetune = true
+# pretraining
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260630_195317-pi2fpadz/files/checkpoints/checkpoint_00799996.pth'
+
+# finetuned 1
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260703_110311-8e2g5hfu/files/checkpoints/checkpoint_00860328.pth'
+
+n_iterations = 8000000
 scheduler_type = 'muon'
-max_grad_norm = 50.0
+max_grad_norm = 10.0
 checkpoint_freq = 10240 # in iterations
-eval_metric_freq = 16 # in iterations
-val_freq = 64 # in iterations
-print_freq = 128 # in iterations
+eval_metric_freq = 24 # in iterations
+val_freq = 48 # in iterations
+print_freq = 96 # in iterations
 debug_ix = -1 # only works for val
 
 [training.optimizer]
 # Decoder trains from scratch on the frozen backbone -> 5e-4 base LR (6i8ryveg). encoder_lr_scale
 # moot (encoder frozen).
-learning_rate = 5e-4
+learning_rate = 9e-5
 muon_schedulefree = true
 weight_decay = 0.002
 warmup_steps = 2000
@@ -168,14 +172,14 @@ muon_warmup_steps = 2000
 beta1 = 0.9
 beta2 = 0.95
 
-encoder_lr_scale = 1.0
+encoder_lr_scale = 0.25
 
 [training.scheduler]
 
 [training.losses]
 gamma = 0.8
 pixel_thresh = 3
-delta = 4
+delta = 6
 use_huber_loss = true
 
 # weights for calculating total loss (use 0 to not compute a specific loss)

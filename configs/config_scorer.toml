@@ -1,0 +1,183 @@
+# Track-quality scorer (triplet loss). Backbone frozen; query-encoder + decoder +
+# pooling/score heads warm-started from posetail-finetuning-v3 run 39yczenk.
+#
+# Two kinds of parameters live in this file:
+#   * SCORER       -- knobs specific to the scoring task; tune these.
+#   * TRACKER ENC  -- inherited from the tracker checkpoint's config; they define the
+#                     reused encoder/decoder architecture and MUST match the checkpoint
+#                     (changing them breaks the warm-start). Left here verbatim.
+# Each section/line is tagged below.
+
+[wandb]                       # infra
+project_name = "posetail-scorer-2"
+path = "/groups/karashchuk/home/karashchukl/results/posetail-scorer-2"
+mode = "online"
+
+[dataset]                     # infra / data location
+batch_size = 1
+num_workers = 12
+prefix = "/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v3"
+# datasets_to_exclude = [ "johnson-fly", "cmupanoptic", "rat7m", "rat-city", "branson-fly",]
+datasets_to_exclude = []
+
+[devices]                     # infra
+device = "cuda"
+
+# ======================================================================================
+# [model] -- TRACKER ENC: copied verbatim from run 39yczenk so every submodule shape
+# matches the checkpoint. DO NOT CHANGE these (they are TrackerEncoder constructor args,
+# not scorer knobs). The ONE scorer-relevant override is video_encoder_requires_grad.
+# ======================================================================================
+[model]
+mode_3d = "encoder"
+video_encoder_version = "large"
+video_encoder_requires_grad = false   # <-- SCORER: freeze the V-JEPA backbone (run had true)
+video_encoder_hierarchical = true
+soft_argmax_temperature_learnable = true
+stride_length = 16
+image_size = 256
+query_patch_size = 9
+per_camera_cube_scale = true
+max_freq = 10
+embedding_dim = 256
+use_volume_embedding = false
+corr_radius = 2
+principal_point_embedding = true
+intrinsic_embedding = true
+metric_ray_translation = true
+latent_dim = 512
+n_heads = 8
+n_time_space_blocks = 6
+embedding_factor = 4
+use_camera_self_attention = true
+use_temporal_self_attention = true
+f_eff_scale = true
+scene_encoder_proj = true
+output_mode = "gridresid"
+head_3d_grid_size = 512
+head_3d_grid_radius = 1.5
+log_3d_output = true
+log_3d_eps = 0.01
+enable_subpixel_refinement = false
+depth_log_min = -2.5
+depth_log_max = 2.0
+
+# ======================================================================================
+# [scorer] -- SCORER: the new pooling/score head + triplet loss knobs. Tune these.
+# ======================================================================================
+[scorer]
+pool_num_heads = 8            # attention-pooling heads (pools over time & cameras)
+score_hidden = 64            # width of the score-feature MLP
+use_precision = true         # precision (uncertainty) head + precision-weighted loss
+triplet_margin = 0.25         # ranking margin between clean and corrupt
+precision_reg_weight = 0.15  # anti-collapse reg on log-precision
+score_reg_weight = 0.001     # L2 on raw scores: anchors level, stops magnitude drift
+
+# SCORER: synthetic corruption that builds the "bad" sample (every point corrupted).
+[scorer.corruption]
+# per-type probability that a given point gets this corruption (every point gets >=1)
+const_offset_prob = 0.5
+frame_noise_prob = 0.5
+gradual_drift_prob = 0.5
+sinusoid_prob = 0.5
+# anchor augmentation (the triplet's invariance target); rotate range shared by 2D & 3D anchors.
+# appearance aug is gated by should_augment_prob (in [dataset.*]); rotation is always applied.
+anchor_rotate_2d_deg = 45.0
+
+# SCORER: point-drop augmentation. Randomly NaN out (point, frame) slots on BOTH good and
+# bad (SHARED mask, so corruption stays the only quality signal) so the scorer learns that
+# missing points are orthogonal to quality and must not lower the score. Per point, drops
+# use a contiguous window OR per-frame random (50/50). Only currently-valid frames are
+# dropped, and every point keeps >= the dataset's min_valid_frames valid frames.
+point_drop_prob = 0.3             # per-point chance of getting any drop
+point_drop_max_frac = 0.4         # contiguous-window length up to this fraction of T frames
+point_drop_bernoulli_rate = 0.2   # per-frame drop prob for the per-frame-random pattern
+
+# SCORER: 3D corruption magnitudes, in cube_scale units (~ pixel-equivalent: a world
+# shift = mag * cube_scale, where cube_scale = world-units/pixel, so it projects to
+# ~0.5*mag px of 2D motion). Kept on the same pixel scale as mag_2d so 3D "bad" tracks
+# are visibly corrupted (sub-pixel values like 0.1 were effectively no corruption).
+[scorer.corruption.mag_3d]
+const_offset = 15.0
+frame_noise = 10.0
+gradual_drift = 24.0
+sinusoid = 16.0
+
+# SCORER: 2D corruption magnitudes, in pixels (image_size = 256)
+[scorer.corruption.mag_2d]
+const_offset = 10.0
+frame_noise = 8.0
+gradual_drift = 12.0
+sinusoid = 10.0
+
+# ======================================================================================
+# [training] -- mostly inherited training infra; checkpoint_path is the scorer's warm-start.
+# ======================================================================================
+[training]
+seed = 100
+checkpoint_path = "/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260628_134003-39yczenk/files/checkpoints/checkpoint_01024000.pth"  # SCORER: tracker to warm-start from
+n_iterations = 8000000
+scheduler_type = "muon"      # TRACKER ENC: reuse the run's SF-Muon setup
+max_grad_norm = 20.0
+checkpoint_freq = 10240
+val_freq = 200               # SCORER: how often to run the triplet val loop
+val_batches = 20             # SCORER: triplets per val pass
+print_freq = 20
+
+# TRACKER ENC: SF-Muon optimizer settings reused from the run (no scorer-specific tuning).
+[training.optimizer]
+learning_rate = 2e-4
+muon_schedulefree = true
+weight_decay = 0.001
+warmup_steps = 200
+muon_warmup_steps = 200
+beta1 = 0.9
+beta2 = 0.95
+
+# ======================================================================================
+# [dataset.train] / [dataset.val] -- tracker dataset/loader config. The tagged lines are
+# deliberate SCORER deviations; the rest are inherited tracker defaults.
+# ======================================================================================
+[dataset.train]
+split_dir = "train"
+n_frames = 16
+min_res = 256
+max_res = 256
+cams_to_sample = [ 1, 8,]
+kpts_to_sample = [ 128, 128,]    # SCORER: triplets per step = batch_size * kpts
+aug_prob = 0.4                   # SCORER: strength of the in-loop appearance aug (per-camera Sometimes)
+per_image_aug_prob = 0.3         # SCORER: strength of the in-loop per-image appearance aug
+should_augment_prob = 0.75       # SCORER: per-view appearance-aug prob in the loop (base forced to 0)
+enable_kpt_filtering = false
+cam_thresh_for_vis = 1
+balance_datasets = true
+n_samples_per_dataset = -1
+crop_to_points = true
+speed_thresh = 1.0
+query_anytime = false            # SCORER: full trajectory (query=target every frame)
+prop_dynamic_kpts_to_sample = 0.95
+prob_2d_only = 0.25
+no_nan_coords = false            # SCORER: allow partially-occluded tracks (missing-point token)
+min_valid_frames = 6             # SCORER: drop points seen in <6 frames (no_nan_coords off)
+crop_3d_enabled = true
+crop_3d_fraction = [0.3, 0.75]
+crop_3d_prob = 0.25
+
+[dataset.val]
+split_dir = "val"
+n_frames = 16
+max_res = 256
+cams_to_sample = 5
+kpts_to_sample = 128
+aug_prob = 0.4                   # SCORER: same in-loop appearance aug as train
+per_image_aug_prob = 0.4
+should_augment_prob = 0.75       # SCORER: per-view appearance-aug prob in the loop (base forced to 0)
+crop_to_points = true
+speed_thresh = 1.0
+prop_dynamic_kpts_to_sample = 0.7
+query_anytime = false            # SCORER: full trajectory
+no_nan_coords = false            # SCORER: allow partially-occluded tracks (missing-point token)
+min_valid_frames = 6             # SCORER: drop points seen in <6 frames (no_nan_coords off)
+
+# [dataset.train.dataset_weights]  # tracker dataset balancing
+# kubric-multiview = 5.0
