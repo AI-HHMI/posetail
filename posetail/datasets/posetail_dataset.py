@@ -222,12 +222,15 @@ def get_rows_trial(trial_path, n_frames, split, context):
     coords = torch.as_tensor(data['pose'])
 
     coords = rearrange(coords, 's t n r -> t (s n) r') # (time, n_kpts, r)
+    # total frames available in this trial; lets get_item_actual reject a sampled
+    # clip length that would overrun the trial (start_ix built at the min length).
+    n_total_frames = int(coords.shape[0])
     start_ixs, intervals = get_start_ixs(coords, n_frames, split)
 
     rows = []
     for start_ix, interval in zip(start_ixs, intervals):
         row = [dataset, session, trial, metadata_path,
-               pose_path, img_path, start_ix, interval, mode]
+               pose_path, img_path, start_ix, interval, mode, n_total_frames]
         rows.append(row)
 
     return rows
@@ -404,7 +407,43 @@ class PosetailDataset(Dataset):
                                                          
         self.data_path = config.dataset[split].get('prefix') or config.dataset.get('prefix')                      
         self.datasets_to_exclude = config.dataset.get('datasets_to_exclude', [])
-        self.n_frames = config.dataset[split].get('n_frames', 16)
+        # Clip length can be specified three ways (all must be multiples of
+        # n_frames_step, default = VJEPA tubelet_size = 2):
+        #   n_frames = 16            -> fixed length (original behavior)
+        #   n_frames = [8, 48]       -> range; candidates = step-spaced lo..hi
+        #   n_frames_choices = [8,16,24,36,48] -> explicit (need not be evenly spaced)
+        # Each __getitem__ draws one candidate, log-linear-tilt-weighted by
+        # n_frames_tilt over the candidate RANK (0 = uniform, <0 favors short, >0
+        # favors long; the longest candidate is exp(tilt)x as likely as the shortest).
+        # Start indices/metadata are built at the MIN candidate (self.n_frames) so
+        # every row is usable for the smallest window; longer draws that would overrun
+        # a row are filtered per-call in _sample_n_frames. Keep val/test as a scalar so
+        # eval metrics stay at a fixed, comparable length.
+        self.n_frames_step = config.dataset[split].get('n_frames_step', 2)
+        n_frames_choices = config.dataset[split].get('n_frames_choices', None)
+        if n_frames_choices is not None:
+            cands = sorted({int(v) for v in n_frames_choices})
+            self.n_frames_candidates = np.array(cands)
+            self.n_frames_lo, self.n_frames_hi = cands[0], cands[-1]
+        else:
+            n_frames_cfg = config.dataset[split].get('n_frames', 16)
+            if isinstance(n_frames_cfg, (list, tuple)):
+                self.n_frames_lo, self.n_frames_hi = int(n_frames_cfg[0]), int(n_frames_cfg[1])
+            else:
+                self.n_frames_lo = self.n_frames_hi = int(n_frames_cfg)
+            self.n_frames_candidates = np.arange(
+                self.n_frames_lo, self.n_frames_hi + 1, self.n_frames_step)
+        assert 0 < self.n_frames_lo <= self.n_frames_hi, \
+            f'n_frames must satisfy 0 < lo <= hi, got [{self.n_frames_lo}, {self.n_frames_hi}]'
+        assert all(int(v) % self.n_frames_step == 0 for v in self.n_frames_candidates), \
+            f'all candidate n_frames must be multiples of n_frames_step={self.n_frames_step}'
+        self.variable_n_frames = len(self.n_frames_candidates) > 1
+        # scalar used by metadata build (start-ix coverage) and the fixed-length path
+        self.n_frames = self.n_frames_lo
+        # normalized candidate rank in [0, 1]; tilt is applied as exp(tilt * rank)
+        n_cand = len(self.n_frames_candidates)
+        self._n_frames_idx = np.arange(n_cand) / max(n_cand - 1, 1)
+        self.n_frames_tilt = float(config.dataset[split].get('n_frames_tilt', 0.0))
         self.max_res = config.dataset[split].get('max_res', -1) # -1 means no resizing
         self.min_res = config.dataset[split].get('min_res', self.max_res) # only used when max_res != -1
         self.aug_prob = config.dataset[split].get('aug_prob', 0.25)
@@ -543,11 +582,37 @@ class PosetailDataset(Dataset):
         return None
 
         
+    def _current_tilt(self):
+        """Log-linear length tilt currently in effect. Static for now; step 2
+        (curriculum ramp) makes this a function of self.progress.value so the
+        clip-length distribution can shift/widen over training."""
+        return self.n_frames_tilt
+
+    def _sample_n_frames(self, n_total, start_ix, interval):
+        """Draw an even clip length from [n_frames_lo, n_frames_hi], log-linear-tilt
+        weighted, restricted to lengths that fit this row
+        (start_ix + length*interval <= n_total). Returns the fixed length unchanged
+        when variable sampling is off. `lo` always fits (start indices were built at
+        lo), so the feasible set is non-empty in variable mode."""
+        if not self.variable_n_frames:
+            return self.n_frames_lo
+        cands = self.n_frames_candidates
+        feasible = (start_ix + cands * interval) <= n_total
+        if not feasible.any():
+            return None
+        logw = self._current_tilt() * self._n_frames_idx[feasible]
+        w = np.exp(logw - logw.max())
+        w = w / w.sum()
+        return int(np.random.choice(cands[feasible], p=w))
+
     def get_item_actual(self, idx):
         row = self.metadata.loc[idx].to_dict()
         start_ix = row['start_ix']
         interval = row['interval']
-        end_ix = start_ix + self.n_frames * interval
+        n_frames = self._sample_n_frames(row['n_total_frames'], start_ix, interval)
+        if n_frames is None:
+            return None
+        end_ix = start_ix + n_frames * interval
         fnums = torch.arange(start_ix, end_ix, interval)
 
         is_true_2d = (row['mode'] == '2d')
@@ -663,7 +728,7 @@ class PosetailDataset(Dataset):
                 query_times_list = []
                 for kpt_idx in range(coords.shape[1]):
                     valid_t = torch.where(torch.isfinite(coords[:, kpt_idx, 0]))[0]
-                    query_time = self.sample_query_time(valid_t)
+                    query_time = self.sample_query_time(valid_t, n_frames)
                     query_times_list.append(query_time.item())
                 query_times = torch.tensor(query_times_list, dtype=torch.int32, device='cpu')
             else:
@@ -815,7 +880,7 @@ class PosetailDataset(Dataset):
                     if vis is not None:
                         good = good & vis[:, kpt_idx]
                     valid_times = torch.where(good)[0]
-                    query_time = self.sample_query_time(valid_times)
+                    query_time = self.sample_query_time(valid_times, n_frames)
                     query_times.append(query_time.item())
                 query_times = torch.tensor(query_times, dtype=torch.int32, device='cpu')
             else:
@@ -1215,19 +1280,19 @@ class PosetailDataset(Dataset):
         return coords, vis, vis_2d
 
 
-    def sample_query_time(self, valid_times):
+    def sample_query_time(self, valid_times, n_frames):
         valid_times = valid_times.to(torch.long)
 
         if len(valid_times) == 1:
             return valid_times[0].to(torch.int32)
 
         dist_to_start = valid_times
-        dist_to_end = (self.n_frames - 1) - valid_times
+        dist_to_end = (n_frames - 1) - valid_times
         dist_to_edge = torch.minimum(dist_to_start, dist_to_end).to(torch.float32)
 
         weights = 1.0 / (dist_to_edge + 1.0)
         weights[valid_times == 0] *= self.query_edge_bias
-        weights[valid_times == (self.n_frames - 1)] *= self.query_edge_bias
+        weights[valid_times == (n_frames - 1)] *= self.query_edge_bias
 
         probs = weights / weights.sum()
         sample_ix = torch.multinomial(probs, 1)
@@ -1369,7 +1434,8 @@ class PosetailDataset(Dataset):
                     print(f'WARNING: skipping trial due to error: {e}')
 
         columns = ['dataset', 'session', 'trial', 'camera_metadata_path',
-                   'pose_path', 'img_path', 'start_ix', 'interval', 'mode']
+                   'pose_path', 'img_path', 'start_ix', 'interval', 'mode',
+                   'n_total_frames']
 
         df = pd.DataFrame(rows, columns=columns)
 
