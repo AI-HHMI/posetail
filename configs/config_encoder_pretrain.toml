@@ -117,7 +117,7 @@ scene_proj_mlp = false
 
 # 'ropepos' = temporal RoPE in the decoder cross-attention + a learned spatial-only scene
 # pos_embed (restores absolute spatial position that the RoPE video backbone lacks).
-scene_pos_embed_mode = 'learned'
+scene_pos_embed_mode = 'ropepos'
 rope_base = 100.0
 # 'fourier_rel' = Fourier encodings of absolute query, absolute target, and the relative
 # (target-query) gap as a dedicated fusion term (length-agnostic, gap-consistent).
