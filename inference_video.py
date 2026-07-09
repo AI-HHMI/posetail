@@ -368,6 +368,7 @@ def run_tracker_encoder_on_videos(
     device=None,
     pred_key_3d='coords_pred',
     clip_len=None,
+    occlusion_gt=None,
 ):
 
     # Dimensionality of the queries: R==3 -> 3D world coords (multi-view), R==2 ->
@@ -386,6 +387,7 @@ def run_tracker_encoder_on_videos(
             chunk_queries = (query_points_3d[start_k:end_k]
                              if query_points_3d.ndim == 2
                              else query_points_3d[:, start_k:end_k])
+            chunk_occ = occlusion_gt[start_k:end_k] if occlusion_gt is not None else None
             print(f'  keypoint chunk {start_k}:{end_k} of {n_kpts}')
             chunk_out = run_tracker_encoder_on_videos(
                 model=model,
@@ -399,6 +401,7 @@ def run_tracker_encoder_on_videos(
                 device=device,
                 pred_key_3d=pred_key_3d,
                 clip_len=clip_len,
+                occlusion_gt=chunk_occ,
             )
             chunk_outputs.append(chunk_out)
         return {
@@ -453,6 +456,14 @@ def run_tracker_encoder_on_videos(
     # windowing + latent carry actually engage within each chunk.
     init_latent = None
     clip_len = clip_len if clip_len is not None else model.n_frames
+
+    # Occlusion carried across chunks (occlusion_embedding). First chunk uses the GT
+    # occlusion at the query frame ({0,1,-1}); subsequent chunks re-anchor their queries
+    # on the previous chunk's prediction, so we feed the model's PREDICTED per-camera
+    # visibility ({0,1}) as their occlusion. None -> the model treats it as all-unknown.
+    occ_next = None
+    if occlusion_gt is not None:
+        occ_next = occlusion_gt.to(device=device).unsqueeze(0)  # (1, N, cams)
 
     with torch.no_grad():
         pbar = tqdm(total=end_frame - start_frame, desc='Tracking', unit='frames')
@@ -530,6 +541,7 @@ def run_tracker_encoder_on_videos(
                 query_times=query_times,
                 camera_group=camera_group_chunk,
                 init_latent=init_latent,
+                occlusion=occ_next,
             )
 
             if is_2d:
@@ -557,6 +569,18 @@ def run_tracker_encoder_on_videos(
             frame_numbers_all.append(torch.arange(current_frame + discard, current_frame + keep_len, dtype=torch.int64))
 
             current_queries = coords_pred[:, -1]
+
+            # Predicted per-camera occlusion for the re-anchored queries of the NEXT chunk:
+            # threshold the model's vis_pred_2d at the last kept frame (same frame the
+            # re-anchor query comes from). visible(sigmoid>=0.5)->1, occluded->0 (no -1 from
+            # a prediction). Only fed forward when the model uses the occlusion term.
+            if getattr(model, 'occlusion_embedding', False) and 'vis_pred_2d' in outputs:
+                vp2d = outputs['vis_pred_2d']                    # (cams, b, t, n) logits
+                vp2d_last = vp2d[:, :, keep_len - 1]             # (cams, b, n)
+                occ_pred = (torch.sigmoid(vp2d_last) >= 0.5).to(torch.int64)
+                occ_next = occ_pred.permute(1, 2, 0).contiguous()   # (cams,b,n) -> (b,n,cams)
+            else:
+                occ_next = None
 
             # Thread the decoder latent into the next chunk so the carry spans the whole
             # video (not just within a chunk). None for non-windowed models / single-pass.
@@ -653,7 +677,7 @@ def resolve_video_paths(video_paths):
 
 def run_query_first_on_videos(model, video_paths, camera_group, query_points_3d, query_times,
                               start_frame=0, n_frames=128, max_kpts=None, device=None,
-                              pred_key_3d='coords_pred'):
+                              pred_key_3d='coords_pred', occlusion_gt=None):
     """Single-forward tracking with per-point query times (mvtracker query_first).
 
     Unlike run_tracker_encoder_on_videos (which anchors all points at the chunk start and
@@ -699,8 +723,14 @@ def run_query_first_on_videos(model, video_paths, camera_group, query_points_3d,
                 views[i] = torch.cat([views[i], pad], dim=0)
         views = [v.unsqueeze(0).to(device=device, dtype=torch.float32) / 255.0 for v in views]
 
+        # per-camera GT occlusion at each point's query frame ({0,1,-1}); None -> all-unknown.
+        occ = None
+        if occlusion_gt is not None:
+            occ = occlusion_gt.to(device=device).unsqueeze(0)  # (1, N, cams)
+
         outputs = model(views=views, coords=q, query_times=qt,
-                        camera_group=camera_group_chunk, init_latent=None, kpt_chunk=max_kpts)
+                        camera_group=camera_group_chunk, init_latent=None, kpt_chunk=max_kpts,
+                        occlusion=occ)
         coords_pred = outputs[pred_key_3d][:, :T]
         vis_pred = outputs['vis_pred'][:, :T]
         conf_pred = outputs['conf_pred'][:, :T]
@@ -740,6 +770,32 @@ def compute_query_first(coords, vis_gt, start_frame, n_frames):
     query_time = np.argmax(good, axis=0).astype(np.int32)   # first True frame (0 if none)
     query_coord = c[query_time, np.arange(c.shape[1])]      # (N, R)
     return query_time, query_coord, valid
+
+
+def occlusion_at_query(vis_used_s, query_time_valid, valid_mask, start_frame):
+    """Per-camera GT occlusion at each valid point's query frame, for the
+    occlusion_embedding query term.
+
+    vis_used_s: (T_full, n_kpts, cams) GT visibility for one subject (NaN=unknown), on
+        the cameras ACTUALLY USED (already camera-subsampled), or None.
+    query_time_valid: (N_valid,) window-relative query frame per VALID point (0 ==
+        start_frame), in the same order as valid_mask's selected keypoints (this is what
+        load_trial stores in per_subject_query_times).
+    valid_mask: (n_kpts,) bool selecting the tracked points (its nonzero indices give the
+        original keypoint columns, aligned with query_time_valid).
+    start_frame: absolute offset added to the window-relative query time.
+
+    Returns an int64 tensor (N_valid, cams) with values {0=occluded, 1=visible,
+    -1=unknown}, or None when no GT visibility is available.
+    """
+    if vis_used_s is None:
+        return None
+    kpt_idx = np.nonzero(valid_mask)[0]                            # (N_valid,) original columns
+    frames = np.clip(start_frame + np.asarray(query_time_valid),
+                     0, vis_used_s.shape[0] - 1)                   # (N_valid,) absolute frames
+    v = vis_used_s[frames, kpt_idx]                               # (N_valid, cams), NaN-bearing
+    occ = np.where(np.isnan(v), -1.0, (v > 0.5).astype(np.float32))  # NaN->-1, else 0/1
+    return torch.as_tensor(occ, dtype=torch.int64)
 
 
 def load_trial(trial_path, start_frame=0, n_frames=None, query_first=True):
@@ -979,6 +1035,16 @@ def run_inference(
     # Record the cameras actually used, after any subsampling above.
     cam_names_used = [cam_names[i] for i in cam_indices_used]
 
+    # GT visibility restricted to the cameras actually used, for the occlusion query term.
+    # vis_gt_raw is (subjects, time, kpts, n_cams_total); index the camera axis so the
+    # occlusion cams dim matches the model input. None when the trial has no visibility.
+    vis_gt_used = vis_gt_raw[..., cam_indices_used] if vis_gt_raw is not None else None
+
+    def _subject_occlusion(s):
+        vis_used_s = vis_gt_used[s] if vis_gt_used is not None else None
+        return occlusion_at_query(vis_used_s, per_subject_query_times[s],
+                                  per_subject_valid_masks[s], start_frame)
+
     if per_subject:
         all_subject_outputs = []
         for subj_idx, subj_queries in enumerate(per_subject_queries):
@@ -986,12 +1052,13 @@ def run_inference(
                 print(f'Skipping subject {subj_idx}: no valid query points')
                 continue
             print(f'Tracking subject {subj_idx} ({subj_queries.shape[0]} keypoints)')
+            subj_occlusion = _subject_occlusion(subj_idx)
             if use_query_first:
                 subj_out = run_query_first_on_videos(
                     model=model, video_paths=video_paths, camera_group=camera_group,
                     query_points_3d=subj_queries, query_times=per_subject_query_times[subj_idx],
                     start_frame=start_frame, n_frames=n_frames, max_kpts=max_kpts,
-                    device=device, pred_key_3d=pred_key_3d)
+                    device=device, pred_key_3d=pred_key_3d, occlusion_gt=subj_occlusion)
             else:
                 subj_out = run_tracker_encoder_on_videos(
                     model=model,
@@ -1005,6 +1072,7 @@ def run_inference(
                     device=device,
                     pred_key_3d=pred_key_3d,
                     clip_len=clip_len,
+                    occlusion_gt=subj_occlusion,
                 )
             subj_out['subject_idx'] = subj_idx
             all_subject_outputs.append(subj_out)
@@ -1046,26 +1114,37 @@ def run_inference(
             subject_indices = [so['subject_idx'] for so in all_subject_outputs]
             outputs['subject_kpt_counts'] = np.array(subject_kpt_counts, dtype=np.int32)
             outputs['subject_indices'] = np.array(subject_indices, dtype=np.int32)
-    elif use_query_first:
-        outputs = run_query_first_on_videos(
-            model=model, video_paths=video_paths, camera_group=camera_group,
-            query_points_3d=query_points_3d, query_times=query_times_flat,
-            start_frame=start_frame, n_frames=n_frames, max_kpts=max_kpts,
-            device=device, pred_key_3d=pred_key_3d)
     else:
-        outputs = run_tracker_encoder_on_videos(
-            model=model,
-            video_paths=video_paths,
-            camera_group=camera_group,
-            query_points_3d=query_points_3d,
-            start_frame=start_frame,
-            n_frames=n_frames,
-            n_overlap=n_overlap,
-            max_kpts=max_kpts,
-            device=device,
-            pred_key_3d=pred_key_3d,
-            clip_len=clip_len,
-        )
+        # Flat (all subjects concatenated, s-major): build occlusion in the same order as
+        # query_points (torch.cat of per_subject_queries). None if the trial has no vis.
+        if vis_gt_used is not None:
+            occ_parts = [_subject_occlusion(s) for s in range(len(per_subject_queries))]
+            occlusion_flat = (torch.cat(occ_parts, dim=0)
+                              if len(occ_parts) > 0 else None)
+        else:
+            occlusion_flat = None
+
+        if use_query_first:
+            outputs = run_query_first_on_videos(
+                model=model, video_paths=video_paths, camera_group=camera_group,
+                query_points_3d=query_points_3d, query_times=query_times_flat,
+                start_frame=start_frame, n_frames=n_frames, max_kpts=max_kpts,
+                device=device, pred_key_3d=pred_key_3d, occlusion_gt=occlusion_flat)
+        else:
+            outputs = run_tracker_encoder_on_videos(
+                model=model,
+                video_paths=video_paths,
+                camera_group=camera_group,
+                query_points_3d=query_points_3d,
+                start_frame=start_frame,
+                n_frames=n_frames,
+                n_overlap=n_overlap,
+                max_kpts=max_kpts,
+                device=device,
+                pred_key_3d=pred_key_3d,
+                clip_len=clip_len,
+                occlusion_gt=occlusion_flat,
+            )
 
     # --- Ground-truth extraction ---
     frame_nums = (outputs['frame_numbers'].numpy()

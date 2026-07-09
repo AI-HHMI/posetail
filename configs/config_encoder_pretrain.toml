@@ -25,6 +25,9 @@ crop_to_points = true
 speed_thresh = 3.0
 query_anytime = true
 query_edge_bias = 200.0
+# occlusion_embedding: prob of dropping a sample's per-camera occlusion to -1 (unknown)
+# so the network learns to cope when occlusion is unknown at inference.
+occlusion_dropout_prob = 0.5
 prop_dynamic_kpts_to_sample = 0.95
 prob_2d_only = 0.25
 crop_3d_enabled = true
@@ -89,6 +92,10 @@ use_volume_embedding = false
 corr_radius = 2
 principal_point_embedding = true
 intrinsic_embedding = true
+# Per-camera 3-valued occlusion query term {occluded=0, visible=1, unknown=-1}: a new gated
+# fusion term (nn.Embedding(3)) fed GT occlusion at the query frame (occlusion_dropout_prob
+# of samples see -1), and predicted occlusion carried across windows at inference.
+occlusion_embedding = true
 metric_ray_translation = true
 
 # decoder

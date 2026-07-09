@@ -225,6 +225,7 @@ class QueryEncoder(nn.Module):
                  patch_size=9, use_volume_embedding=True,
                  principal_point_embedding=False,
                  intrinsic_embedding=False,
+                 occlusion_embedding=False,
                  time_embed_mode='learned'):
         super().__init__()
         self.embed_dim = embed_dim
@@ -236,6 +237,7 @@ class QueryEncoder(nn.Module):
         self.use_volume_embedding = use_volume_embedding
         self.principal_point_embedding = principal_point_embedding
         self.intrinsic_embedding = intrinsic_embedding
+        self.occlusion_embedding = occlusion_embedding
 
         # Query/target time encoding. 'learned' (default) = the original learned frame
         # tables + length-interpolation (backward-compatible, bit-identical). 'fourier_rel'
@@ -256,6 +258,13 @@ class QueryEncoder(nn.Module):
             self.linear_gap = nn.Linear(2 * max_freq + 1, embed_dim)
 
         self.vis_embed = nn.Embedding(2, embed_dim)
+
+        # Occlusion query term: a 3-valued per-camera state {occluded=0, visible=1,
+        # unknown=-1} indexed as value+1 (-1->0, 0->1, 1->2). Complements (does not
+        # replace) the geometric vis_embed: is_point_visible is True for both an on-ray
+        # foreground and background point, so occlusion carries the bit that separates them.
+        if self.occlusion_embedding:
+            self.occ_embed = nn.Embedding(3, embed_dim)
 
         if self.use_volume_embedding:
             vdim = 8
@@ -292,6 +301,7 @@ class QueryEncoder(nn.Module):
         self.n_fusion_terms = (6 + int(self.use_volume_embedding)
                                + int(self.principal_point_embedding)
                                + int(self.intrinsic_embedding)
+                               + int(self.occlusion_embedding)
                                # fourier_rel adds a dedicated relative-gap fusion term
                                + int(self.time_embed_mode == 'fourier_rel'))
         self.gate = nn.Sequential(
@@ -331,7 +341,7 @@ class QueryEncoder(nn.Module):
 
     def forward(self, preprocessed_views, camera_group,
                 query_coords, query_time, target_time,
-                cube_scale):
+                cube_scale, occlusion=None):
         """
         Args:
             preprocessed_views: list of [B, T, C, H, W] tensors
@@ -340,6 +350,9 @@ class QueryEncoder(nn.Module):
             query_time: [B, T_query] time indices
             target_time: [B, T_query] time indices
             cube_scale: float for cube sampling (ignored in 2D mode)
+            occlusion: [B, T_query, N_cams] per-camera occlusion state {0,1,-1} for the
+                occlusion_embedding term, or None (treated as all-unknown). Only used
+                when self.occlusion_embedding is set.
 
         Returns:
             [B, T_query, N_cams, decoder_dim]
@@ -467,6 +480,17 @@ class QueryEncoder(nn.Module):
             if self.use_volume_embedding:
                 embed_volume = repeat(self.missing_volume, 'd -> b t c d', b=B, t=T_query, c=n_cams)
 
+        # Occlusion (optional): per-camera 3-valued state {occluded=0, visible=1,
+        # unknown=-1}, indexed as value+1 (-1->0, 0->1, 1->2). None -> all-unknown (index 0),
+        # matching occlusion-dropout during training and no-info queries at inference.
+        if self.occlusion_embedding:
+            if occlusion is None:
+                occ_idx = torch.zeros((B, T_query, n_cams), dtype=torch.long,
+                                      device=query_coords.device)
+            else:
+                occ_idx = (occlusion.to(torch.long) + 1).clamp_(0, 2)
+            embed_occ = self.occ_embed(occ_idx)  # [B, T_query, n_cams, embed_dim]
+
         # Gated fusion (shared)
         embed_terms = [embed_patch, embed_query_time, embed_target_time]
         if embed_gap is not None:
@@ -477,6 +501,8 @@ class QueryEncoder(nn.Module):
             embed_terms.append(embed_pp)
         if self.intrinsic_embedding:
             embed_terms.append(embed_intrinsic)
+        if self.occlusion_embedding:
+            embed_terms.append(embed_occ)
         if self.use_volume_embedding:
             embed_terms.append(embed_volume)
 

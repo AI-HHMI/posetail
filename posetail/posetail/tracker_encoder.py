@@ -51,6 +51,7 @@ class TrackerEncoder(nn.Module):
                  per_camera_cube_scale = False,
                  principal_point_embedding = False,
                  intrinsic_embedding = False,
+                 occlusion_embedding = False,
                  metric_ray_translation = False,
                  latent_dim = 1024, n_heads = 8,
                  cross_attn_dim = None,
@@ -150,6 +151,7 @@ class TrackerEncoder(nn.Module):
         self.per_camera_cube_scale = per_camera_cube_scale
         self.principal_point_embedding = principal_point_embedding
         self.intrinsic_embedding = intrinsic_embedding
+        self.occlusion_embedding = occlusion_embedding
         self.metric_ray_translation = metric_ray_translation
 
         # decoder params
@@ -217,6 +219,7 @@ class TrackerEncoder(nn.Module):
             use_volume_embedding=use_volume_embedding,
             principal_point_embedding=principal_point_embedding,
             intrinsic_embedding=intrinsic_embedding,
+            occlusion_embedding=occlusion_embedding,
             time_embed_mode=time_embed_mode,
         )
         self.decoder = Decoder(
@@ -279,7 +282,7 @@ class TrackerEncoder(nn.Module):
         print("  decoder params: {:,d}".format(count_parameters(self.decoder)))
         
     def forward(self, views, coords, camera_group, query_times=None, init_latent=None,
-                kpt_chunk=None):
+                kpt_chunk=None, occlusion=None):
         '''
         B: batch size
         T: number of frames in video
@@ -297,7 +300,14 @@ class TrackerEncoder(nn.Module):
         n_cams = len(views)
 
         assert len(views) == len(camera_group), "views should match number of cameras"
-        
+
+        # Per-camera occlusion state {0,1,-1} for the occlusion_embedding query term.
+        # (B, N, n_cams); a query-anchored property fed unchanged to every internal window.
+        if occlusion is not None:
+            assert occlusion.shape == (B, N, n_cams), \
+                f"occlusion should be (B, N, n_cams)={(B, N, n_cams)}, got {tuple(occlusion.shape)}"
+            occlusion = occlusion.to(device)
+
         if R == 2:
             assert len(views) == 1, "should only have 1 view for 2d input"
         
@@ -366,11 +376,12 @@ class TrackerEncoder(nn.Module):
         return self._forward_windows(
             views_norm, coords, query_times, camera_group,
             cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
-            init_latent=init_latent, kpt_chunk=kpt_chunk)
+            init_latent=init_latent, kpt_chunk=kpt_chunk, occlusion=occlusion)
 
     def _forward_windows(self, views_norm, coords, query_times, camera_group,
                          cube_scale, cube_scale_shared, f_eff,
-                         scene_center, scene_radius, init_latent=None, kpt_chunk=None):
+                         scene_center, scene_radius, init_latent=None, kpt_chunk=None,
+                         occlusion=None):
         """Run the encoder/decoder over the clip, optionally as a sliding window.
 
         When self.S >= T (window covers the whole clip) this is a single pass,
@@ -404,7 +415,7 @@ class TrackerEncoder(nn.Module):
             result, latent = self._forward_window(
                 views_norm, coords, query_times, camera_group,
                 cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
-                prev_latent=init_latent, kpt_chunk=kpt_chunk)
+                prev_latent=init_latent, kpt_chunk=kpt_chunk, occlusion=occlusion)
             # Expose the latent so a caller can thread it into a following chunk
             # (cross-chunk carry); harmless for the non-windowed model whose
             # latent_carry is untrained (a no-op).
@@ -485,7 +496,7 @@ class TrackerEncoder(nn.Module):
             res, latent = self._forward_window(
                 views_w, coords_w, times_w, camera_group,
                 cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
-                prev_latent=carry_w, kpt_chunk=kpt_chunk)
+                prev_latent=carry_w, kpt_chunk=kpt_chunk, occlusion=occlusion)
 
             for key, ax in t_axis.items():
                 if key in res:
@@ -549,7 +560,8 @@ class TrackerEncoder(nn.Module):
 
     def _forward_window(self, views_norm, coords, query_times, camera_group,
                         cube_scale, cube_scale_shared, f_eff,
-                        scene_center, scene_radius, prev_latent=None, kpt_chunk=None):
+                        scene_center, scene_radius, prev_latent=None, kpt_chunk=None,
+                        occlusion=None):
         """Single encoder/decoder pass over one window (or the whole clip).
 
         views_norm frames are already normalized/padded ('b t c h w'); coords are the
@@ -574,16 +586,17 @@ class TrackerEncoder(nn.Module):
             for k0 in range(0, N, kpt_chunk):
                 k1 = min(k0 + kpt_chunk, N)
                 pl = prev_latent[:, :, k0:k1] if prev_latent is not None else None
+                occ = occlusion[:, k0:k1] if occlusion is not None else None
                 r, lat = self._decode_from_scene(
                     scene_features, views_norm, coords[:, k0:k1], query_times[:, k0:k1],
                     camera_group, cube_scale, cube_scale_shared, f_eff,
-                    scene_center, scene_radius, prev_latent=pl)
+                    scene_center, scene_radius, prev_latent=pl, occlusion=occ)
                 results.append(r); latents.append(lat)
             return self._concat_point_chunks(results), torch.cat(latents, dim=2)
         return self._decode_from_scene(
             scene_features, views_norm, coords, query_times, camera_group,
             cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
-            prev_latent=prev_latent)
+            prev_latent=prev_latent, occlusion=occlusion)
 
     # Loss-only, per-point grid logits: huge (they carry the P/K grid dim) and unused at
     # inference. kpt_chunk is inference-only, so we DON'T reassemble them to full-N -- that
@@ -608,7 +621,7 @@ class TrackerEncoder(nn.Module):
 
     def _decode_from_scene(self, scene_features, views_norm, coords, query_times, camera_group,
                            cube_scale, cube_scale_shared, f_eff,
-                           scene_center, scene_radius, prev_latent=None):
+                           scene_center, scene_radius, prev_latent=None, occlusion=None):
         """Per-point decode from precomputed scene_features (the body of one window's forward
         after scene encoding). Returns (result_dict, latent). See _forward_window."""
         device = coords.device
@@ -621,13 +634,20 @@ class TrackerEncoder(nn.Module):
         # query_time = torch.zeros((B, T * N), dtype=torch.int32, device=device)
         query_times_rep = repeat(query_times, 'b n -> b (t n)', t=T)
         target_time = repeat(torch.arange(T, device=device), 't -> b (t n)', b=B, t=T, n=N)
-        
+
+        # Occlusion is a query-anchored per-camera state; repeat over target frames to
+        # match the flattened (t n) query layout above.
+        occlusion_rep = None
+        if occlusion is not None:
+            occlusion_rep = repeat(occlusion, 'b n c -> b (t n) c', t=T)
+
         query_embeds = self.query_encoder(
             views_norm, camera_group,
             query_coords = query_coords,
             query_time = query_times_rep,
             target_time = target_time,
-            cube_scale = cube_scale
+            cube_scale = cube_scale,
+            occlusion = occlusion_rep
         )
         # Reshape from flat (b, t*n, cams, d) → explicit (b, t, n, cams, d) for Decoder
         query_embeds = rearrange(query_embeds, 'b (t n) cams d -> b t n cams d', t=T, n=N)
