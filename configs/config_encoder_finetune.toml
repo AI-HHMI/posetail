@@ -74,7 +74,7 @@ video_encoder_requires_grad = true
 video_encoder_hierarchical = true
 
 # Inert while the encoder is frozen.
-video_encoder_finetune_last_n_layers = 12
+# video_encoder_finetune_last_n_layers = 12
 
 soft_argmax_temperature_learnable = true
 
@@ -150,7 +150,10 @@ finetune = true
 # checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260630_195317-pi2fpadz/files/checkpoints/checkpoint_00799996.pth'
 
 # finetuned 1
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260703_110311-8e2g5hfu/files/checkpoints/checkpoint_00860328.pth'
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260703_110311-8e2g5hfu/files/checkpoints/checkpoint_00860328.pth'
+
+# finetuned 2
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260705_134039-1d1r24ff/files/checkpoints/checkpoint_02058240.pth'
 
 n_iterations = 8000000
 scheduler_type = 'muon'

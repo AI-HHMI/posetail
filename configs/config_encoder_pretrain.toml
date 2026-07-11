@@ -11,7 +11,8 @@ prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pr
 
 [dataset.train]
 split_dir = 'train'
-n_frames = 16
+n_frames = [6, 24]
+n_frames_tilt = 1.0
 min_res = 256
 max_res = 256
 cams_to_sample = [1, 8]
@@ -78,7 +79,7 @@ video_encoder_finetune_last_n_layers = 12
 soft_argmax_temperature_learnable = true
 
 # processing
-stride_length = 16
+stride_length = 24
 stride_overlap = 4
 unroll_windows = false
 image_size = 256
