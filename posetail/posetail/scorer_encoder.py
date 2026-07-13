@@ -128,8 +128,13 @@ class ScorerEncoder(TrackerEncoder):
     # ----------------------------------------------------------------------------------
     # Score one sample from precomputed scene features. query = target.
     # ----------------------------------------------------------------------------------
-    def score(self, views_norm, scene_features, coords_full, camera_group, kpt_chunk=None):
+    def score(self, views_norm, scene_features, coords_full, camera_group, kpt_chunk=None,
+              occlusion=None):
         """coords_full: [B, T, K, R] full trajectory. Returns scores, precision: [B, K].
+
+        occlusion: [B, K, n_cams] per-camera query-anchored occlusion state {-1,0,1} for the
+        occlusion_embedding query term, or None (all-unknown). Only used when the wrapped
+        query encoder has occlusion_embedding enabled.
 
         Scene scalars (scale/centroid) are computed ONCE over all K, so setting ``kpt_chunk``
         (run the per-point query/decoder/pool work in K-slices) is numerically identical to the
@@ -158,7 +163,7 @@ class ScorerEncoder(TrackerEncoder):
         coords_full = torch.nan_to_num(coords_full, nan=0.0)            # guard all-missing points
         # Per-point work over a K-slice. Everything above (valid, scene scalars, fill) is over
         # the FULL K, so slicing here is exact. Runs in chunks to bound peak memory.
-        def _score_slice(cf, valid):
+        def _score_slice(cf, valid, occ):
             Kc = cf.shape[2]
             coords_flat = rearrange(cf, 'b t k r -> b (t k) r')
 
@@ -167,10 +172,17 @@ class ScorerEncoder(TrackerEncoder):
             query_time = repeat(torch.arange(T, device=device), 't -> b (t k)', b=B, k=Kc)
             target_time = query_time
 
+            # Occlusion is a per-point per-camera query state; repeat over target frames to
+            # match the flattened (t k) query layout (mirrors tracker _decode_from_scene).
+            occlusion_rep = None
+            if occ is not None:
+                occlusion_rep = repeat(occ, 'b k c -> b (t k) c', t=T)   # [B, T*Kc, n_cams]
+
             query_embeds = self.query_encoder(
                 views_norm, camera_group,
                 query_coords=query_coords, query_time=query_time,
-                target_time=target_time, cube_scale=cube_scale)
+                target_time=target_time, cube_scale=cube_scale,
+                occlusion=occlusion_rep)
             query_embeds = rearrange(query_embeds, 'b (t k) cams d -> b t k cams d', t=T, k=Kc)
 
             # Replace embeddings of missing (NaN) slots with the learnable missing-point token
@@ -227,17 +239,21 @@ class ScorerEncoder(TrackerEncoder):
             s_parts, p_parts = [], []
             for k0 in range(0, K, kpt_chunk):
                 k1 = min(k0 + kpt_chunk, K)
-                s, p = _score_slice(coords_full[:, :, k0:k1], valid[:, :, k0:k1])
+                occ_slice = None if occlusion is None else occlusion[:, k0:k1]
+                s, p = _score_slice(coords_full[:, :, k0:k1], valid[:, :, k0:k1], occ_slice)
                 s_parts.append(s)
                 p_parts.append(p)
             return torch.cat(s_parts, dim=1), torch.cat(p_parts, dim=1)   # [b, k]
-        return _score_slice(coords_full, valid)
+        return _score_slice(coords_full, valid, occlusion)
 
-    def forward(self, views, coords, camera_group, query_times=None, kpt_chunk=None):
+    def forward(self, views, coords, camera_group, query_times=None, kpt_chunk=None,
+                occlusion=None):
         """Single-sample inference path. views: list of [b,t,h,w,c];
-        coords: full trajectory [b,t,k,R]. Returns scores, precision: [b, k]."""
+        coords: full trajectory [b,t,k,R]; occlusion: [b,k,n_cams] or None.
+        Returns scores, precision: [b, k]."""
         views_norm, scene_features = self.encode_scene(views)
-        return self.score(views_norm, scene_features, coords, camera_group, kpt_chunk=kpt_chunk)
+        return self.score(views_norm, scene_features, coords, camera_group,
+                          kpt_chunk=kpt_chunk, occlusion=occlusion)
 
     def score_triplet(self, trip):
         """Score a (good, bad, anchor) triplet in ONE forward pass (DDP-safe: a single
@@ -249,15 +265,16 @@ class ScorerEncoder(TrackerEncoder):
         gv, gc, gcg = trip['good']
         _, bc, bcg = trip['bad']                       # bad shares good's pixels
         av, ac, acg = trip['anchor']
+        occ = trip.get('occlusion')                    # [b,k,n_cams], shared by all 3 members
 
         vn, sf = self.encode_scene(gv)
-        good_s, good_p = self.score(vn, sf, gc, gcg)
-        bad_s, bad_p = self.score(vn, sf, bc, bcg)
+        good_s, good_p = self.score(vn, sf, gc, gcg, occlusion=occ)
+        bad_s, bad_p = self.score(vn, sf, bc, bcg, occlusion=occ)
         if trip['reuse_scene_for_anchor']:
             avn, asf = vn, sf
         else:
             avn, asf = self.encode_scene(av)
-        anc_s, anc_p = self.score(avn, asf, ac, acg)
+        anc_s, anc_p = self.score(avn, asf, ac, acg, occlusion=occ)
 
         scores = torch.stack([good_s, bad_s, anc_s], dim=-1).reshape(-1, 3)
         precision = torch.stack([good_p, bad_p, anc_p], dim=-1).reshape(-1, 3)

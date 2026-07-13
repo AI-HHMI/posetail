@@ -45,6 +45,7 @@ corr_radius = 2
 principal_point_embedding = true
 intrinsic_embedding = true
 metric_ray_translation = true
+occlusion_embedding = true            # <-- SCORER: per-camera occlusion query term (occ_embed fresh via strict=False)
 latent_dim = 512
 n_heads = 8
 n_time_space_blocks = 6
@@ -155,6 +156,7 @@ n_samples_per_dataset = -1
 crop_to_points = true
 speed_thresh = 1.0
 query_anytime = false            # SCORER: full trajectory (query=target every frame)
+occlusion_dropout_prob = 0.5     # SCORER: 50% of samples get occlusion dropped to -1 (unknown), as in pretrain
 prop_dynamic_kpts_to_sample = 0.95
 prob_2d_only = 0.25
 no_nan_coords = false            # SCORER: allow partially-occluded tracks (missing-point token)
