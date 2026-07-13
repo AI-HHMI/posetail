@@ -11,8 +11,8 @@ prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pr
 
 [dataset.train]
 split_dir = 'train'
-n_frames = [6, 24]
-n_frames_tilt = 1.0
+n_frames = 24
+# n_frames_tilt = -1.0
 min_res = 256
 max_res = 256
 cams_to_sample = [1, 8]
@@ -34,7 +34,6 @@ prob_2d_only = 0.25
 crop_3d_enabled = true
 crop_3d_fraction = [0.05, 0.75]
 crop_3d_prob = 0.4
-# No causal_masking: the encoder's temporal self-attention is bidirectional (TapNext-only).
 
 [dataset.train.curriculum]
 enabled = false
@@ -74,12 +73,12 @@ video_encoder_requires_grad = false
 video_encoder_hierarchical = true
 
 # Inert while the encoder is frozen.
-video_encoder_finetune_last_n_layers = 12
+# video_encoder_finetune_last_n_layers = 12
 
 soft_argmax_temperature_learnable = true
 
 # processing
-stride_length = 24
+stride_length = 48
 stride_overlap = 4
 unroll_windows = false
 image_size = 256
@@ -93,11 +92,8 @@ use_volume_embedding = false
 corr_radius = 2
 principal_point_embedding = true
 intrinsic_embedding = true
-# Per-camera 3-valued occlusion query term {occluded=0, visible=1, unknown=-1}: a new gated
-# fusion term (nn.Embedding(3)) fed GT occlusion at the query frame (occlusion_dropout_prob
-# of samples see -1), and predicted occlusion carried across windows at inference.
-occlusion_embedding = true
 metric_ray_translation = true
+occlusion_embedding = true
 
 # decoder
 latent_dim = 512
