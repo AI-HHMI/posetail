@@ -100,7 +100,7 @@ def pick_trial(trials, n_frames):
     return trial_dir, is_2d, 0, T, score, True
 
 
-def launch_render(tracks_path, vids_path, is_2d):
+def launch_render(tracks_path, vids_path, is_2d, trails=True):
     """Start render_video.py as a background subprocess; return the Popen."""
     conf = '0.2' if is_2d else '0.5'
     cmd = [sys.executable, os.path.join(HERE, 'render_video.py'),
@@ -108,6 +108,8 @@ def launch_render(tracks_path, vids_path, is_2d):
            '--output-dir', vids_path,
            '--crop',
            '--conf-threshold', conf]
+    if trails:
+        cmd.append('--trails')
     print('    [render bg] $', ' '.join(cmd))
     return subprocess.Popen(cmd)
 
@@ -131,6 +133,10 @@ def main():
                     help='disable query-first (default ON): anchor each point at its first '
                          'valid+visible frame (mvtracker/training convention). With this flag, '
                          'all points are anchored at start_frame instead (legacy 3D behavior).')
+    ap.add_argument('--no-trails', dest='trails', action='store_false', default=True,
+                    help='disable motion trails (default ON): trails draw each '
+                         'point\'s recent path so a still frame conveys tracking. '
+                         'Uses render_video.py defaults (length 30, thickness 2).')
     args = ap.parse_args()
 
     out_root = os.path.expanduser(args.out_root)
@@ -200,7 +206,7 @@ def main():
             )
 
             # Render: background subprocess, overlaps the next dataset's inference.
-            renders.append((ds, launch_render(tracks_path, vids_path, is_2d)))
+            renders.append((ds, launch_render(tracks_path, vids_path, is_2d, args.trails)))
 
             summary.append((ds, 'ok', os.path.basename(trial_dir),
                             str(start), str(n_eff), f'{score:.3f}', mode))
