@@ -7,6 +7,12 @@ get_eval_metrics (MTE, MPJPE, delta-avg + per-threshold, survival, occlusion-acc
 per-threshold). Metrics use the corrected masking: non-finite GT (cleaned (0,0,-1)->NaN
 placeholders) and pre-query frames are excluded via the per-point query_times.
 
+Crop setup (best for moving subjects): query-first runs through the windowed tracker, which
+RE-CROPS each chunk to follow the subject (n_overlap sets the cadence) and expands the crop by
+a causal motion margin (--no-motion-margin to disable). This replaced an earlier static-crop
+path that held one crop over the whole clip -- so predictions cached by that old path are
+stale; pass --force (or delete the npz cache) to regenerate them through the fixed crop.
+
 Predictions already present in the output folder are REUSED (metrics recomputed from the saved
 npz) instead of re-running inference -- so the model / wandb folder / GPU are only needed for
 trials that must still be computed. Writes per-dataset metrics.json plus a combined summary.json
@@ -125,6 +131,15 @@ def main():
     ap.add_argument('--max-kpts', type=int, default=None, help='override per-dataset max_kpts')
     ap.add_argument('--n-views', type=int, default=None, help='override per-dataset n_views')
     ap.add_argument('--view-seed', type=int, default=0)
+    # Crop setup: query-first runs through the windowed tracker, which re-crops every chunk
+    # to FOLLOW the subject (the fix for the static-crop regression). motion-margin expands
+    # each chunk's crop by the previous chunk's velocity so fast subjects (dex_ycb) stay
+    # in-frame; it is ~inert for slow subjects. Both default ON = best crop setup.
+    ap.add_argument('--n-overlap', type=int, default=8,
+                    help='re-crop / re-anchor cadence: window advances by (clip_len - n_overlap) '
+                         'frames, so a smaller value re-crops more often for very fast subjects')
+    ap.add_argument('--no-motion-margin', dest='motion_margin', action='store_false', default=True,
+                    help='disable the causal motion-margin crop expansion (default ON)')
     ap.add_argument('--device', default='cuda:0')
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -185,9 +200,10 @@ def main():
                 out = run_inference(
                     model=ms['model'], config_path=ms['config_path'],
                     checkpoint_path=ms['checkpoint_path'], trial_path=w['tp'], start_frame=0,
-                    n_frames=args.n_frames, n_overlap=8, per_subject=True, device=ms['device'],
-                    max_kpts=w['max_kpts'], n_views=w['n_views'], view_seed=args.view_seed,
-                    outpath=w['npz'], query_first=True)
+                    n_frames=args.n_frames, n_overlap=args.n_overlap, per_subject=True,
+                    device=ms['device'], max_kpts=w['max_kpts'], n_views=w['n_views'],
+                    view_seed=args.view_seed, outpath=w['npz'], query_first=True,
+                    motion_margin=args.motion_margin)
                 torch.cuda.empty_cache()
                 m = eval_outputs(out, cfg['thresholds'], cfg['survival'])
                 src = 'infer'

@@ -369,7 +369,34 @@ def run_tracker_encoder_on_videos(
     pred_key_3d='coords_pred',
     clip_len=None,
     occlusion_gt=None,
+    query_times=None,
+    motion_margin=True,
+    conf_crop_thresh=0.1,
 ):
+    """Windowed multi-view tracking whose per-chunk crop FOLLOWS the subject.
+
+    Each chunk re-crops the video on the current (re-anchored) query so a moving subject
+    stays in the model's field of view — the long-horizon fix that a single static crop
+    over the whole clip lacks.
+
+    query_times (per-point, window-relative to start_frame; None -> all zeros): each point
+    is SEEDED in the chunk containing its query frame (mvtracker / query-first) and, once
+    seeded, propagated forward by re-anchoring on the previous chunk's prediction. With all
+    query_times == 0 (and motion_margin off) this reduces bit-for-bit to the legacy
+    all-points-at-start behavior.
+
+    Keypoint chunking is delegated to the model's internal ``kpt_chunk`` (scene encoded
+    ONCE per window, reused across point slices — numerically identical, lower memory).
+    NOTE: the model disables ``kpt_chunk`` for ``output_mode='gridnorm'`` (its per-camera
+    gauge couples points), so ``max_kpts`` is a no-op there and a large point set may OOM.
+
+    motion_margin: expand each chunk's crop by the previous chunk's per-point velocity
+    (a causal approximation of the training trajectory-bounded crop) so a fast subject
+    stays in-frame across the window; ~inert for slow subjects.
+    conf_crop_thresh: active points whose predicted visibility (sigmoid) falls below this
+    are excluded from the crop-bbox computation so a lost point can't drag the crop off the
+    still-tracked cluster. None disables the exclusion.
+    """
 
     # Dimensionality of the queries: R==3 -> 3D world coords (multi-view), R==2 ->
     # 2D pixel coords in a single camera frame. The model supports both.
@@ -377,40 +404,6 @@ def run_tracker_encoder_on_videos(
     # recurrence query) — e.g. 'coords_pred' (default) or '3d_pred_triangulate'.
     R = query_points_3d.shape[-1]
     is_2d = (R == 2)
-
-    # --- keypoint chunking (insert here) ---
-    n_kpts = query_points_3d.shape[0] if query_points_3d.ndim == 2 else query_points_3d.shape[1]
-    if max_kpts is not None and n_kpts > max_kpts:
-        chunk_outputs = []
-        for start_k in range(0, n_kpts, max_kpts):
-            end_k = min(start_k + max_kpts, n_kpts)
-            chunk_queries = (query_points_3d[start_k:end_k]
-                             if query_points_3d.ndim == 2
-                             else query_points_3d[:, start_k:end_k])
-            chunk_occ = occlusion_gt[start_k:end_k] if occlusion_gt is not None else None
-            print(f'  keypoint chunk {start_k}:{end_k} of {n_kpts}')
-            chunk_out = run_tracker_encoder_on_videos(
-                model=model,
-                video_paths=video_paths,
-                camera_group=camera_group,
-                query_points_3d=chunk_queries,
-                start_frame=start_frame,
-                n_frames=n_frames,
-                n_overlap=n_overlap,
-                max_kpts=None,
-                device=device,
-                pred_key_3d=pred_key_3d,
-                clip_len=clip_len,
-                occlusion_gt=chunk_occ,
-            )
-            chunk_outputs.append(chunk_out)
-        return {
-            'coords_pred':   torch.cat([o['coords_pred']  for o in chunk_outputs], dim=2),
-            'vis_pred':      torch.cat([o['vis_pred']     for o in chunk_outputs], dim=2),
-            'conf_pred':     torch.cat([o['conf_pred']    for o in chunk_outputs], dim=2),
-            'frame_numbers': chunk_outputs[0]['frame_numbers'],
-            'crop_history':  [h for o in chunk_outputs for h in o['crop_history']],
-        }
 
     if device is None:
         device = next(model.parameters()).device
@@ -444,36 +437,84 @@ def run_tracker_encoder_on_videos(
     current_queries = query_points_3d.to(device=device, dtype=torch.float32)
     if current_queries.ndim == 2:
         current_queries = current_queries.unsqueeze(0)
+    N = current_queries.shape[1]
+    # True query coordinate per point; seeded / not-yet-appeared points anchor on this
+    # (their re-anchored prediction is only meaningful once they are active).
+    original_queries = current_queries.clone()
+
+    # Per-point ABSOLUTE first-visible frame (query-first). None -> everyone at start_frame,
+    # which makes `before` always False and `seeded` true in chunk 0 -> the legacy path.
+    if query_times is None:
+        qt_abs = torch.full((N,), start_frame, device=device, dtype=torch.int64)
+    else:
+        qt_abs = start_frame + query_times.to(device=device, dtype=torch.int64).view(-1)
 
     coords_pred_all = []
     vis_pred_all = []
     conf_pred_all = []
     frame_numbers_all = []
     crop_history = []
-    query_times = None
+    is_first_chunk = True
     # Latent threaded across chunks (cross-chunk carry). For windowed models, feed more
     # than stride_length frames per forward (clip_len > model.n_frames) so the internal
     # windowing + latent carry actually engage within each chunk.
     init_latent = None
     clip_len = clip_len if clip_len is not None else model.n_frames
 
-    # Occlusion carried across chunks (occlusion_embedding). First chunk uses the GT
-    # occlusion at the query frame ({0,1,-1}); subsequent chunks re-anchor their queries
-    # on the previous chunk's prediction, so we feed the model's PREDICTED per-camera
-    # visibility ({0,1}) as their occlusion. None -> the model treats it as all-unknown.
-    occ_next = None
-    if occlusion_gt is not None:
-        occ_next = occlusion_gt.to(device=device).unsqueeze(0)  # (1, N, cams)
+    # Cross-chunk crop-robustness state: per-point velocity (world/pixel per frame) and
+    # per-point predicted visibility at the previous chunk's last frame.
+    prev_vel = None                                  # (1, N, R)
+    prev_vis = None                                  # (1, N)
+
+    # Occlusion carried across chunks (occlusion_embedding). First chunk (and each point's
+    # SEED chunk) uses the GT occlusion at the query frame ({0,1,-1}); already-active points
+    # use the model's PREDICTED per-camera visibility ({0,1}). None -> all-unknown.
+    occ_gt_dev = occlusion_gt.to(device=device).unsqueeze(0) if occlusion_gt is not None else None  # (1,N,cams)
+    occ_pred = None                                  # predicted occ carried from previous chunk
 
     with torch.no_grad():
         pbar = tqdm(total=end_frame - start_frame, desc='Tracking', unit='frames')
         while current_frame < end_frame:
             remaining = end_frame - current_frame
             current_clip_len = clip_len
+            win_end = current_frame + current_clip_len
+
+            # Per-point role this chunk (query-first, forward-only seeding):
+            before = qt_abs < current_frame                          # active (from earlier)
+            seeded = (qt_abs >= current_frame) & (qt_abs < win_end)  # query frame lands here
+            appeared = before | seeded                               # produced this chunk
+
+            # Anchor coord per point: active -> carried prediction, else true query coord.
+            coords_chunk = torch.where(before.view(1, N, 1), current_queries, original_queries)
+
+            # Model query time (offset within the window): seed offset for points seeded
+            # here, the re-anchor overlap offset for active points, 0 otherwise. With every
+            # qt_abs == start_frame this is 0 in chunk 0 and n_overlap-1 after (legacy).
+            seed_off = (qt_abs - current_frame).clamp(0, current_clip_len - 1)
+            active_off = torch.full_like(qt_abs, n_overlap - 1)
+            times_chunk = torch.where(before, active_off,
+                                      torch.where(seeded, seed_off, torch.zeros_like(qt_abs)))
+            times_chunk = times_chunk.to(torch.int32).unsqueeze(0)   # (1, N)
+
+            # --- Crop point set: appeared anchors, minus lost (low-vis) active points, plus
+            # a causal motion look-ahead so a fast subject stays in-frame over the window.
+            crop_mask = appeared.clone()
+            if conf_crop_thresh is not None and prev_vis is not None:
+                lost = before & (torch.sigmoid(prev_vis[0]) < conf_crop_thresh)
+                if bool((crop_mask & ~lost).any()):        # never empty the crop
+                    crop_mask = crop_mask & ~lost
+            crop_pts = coords_chunk[:, crop_mask]
+            if motion_margin and prev_vel is not None:
+                act = before & crop_mask
+                if bool(act.any()):
+                    look = current_queries[:, act] + prev_vel[:, act] * float(current_clip_len)
+                    crop_pts = torch.cat([crop_pts, look], dim=1)
+            if crop_pts.shape[1] == 0:
+                crop_pts = coords_chunk                     # fallback (e.g. all not-yet)
 
             camera_group_chunk, crop_boxes = crop_camera_group_to_queries(
                 camera_group=camera_group,
-                query_coords=current_queries,
+                query_coords=crop_pts,
                 min_crop_dim=model.image_size,
                 padding=20,
                 is_2d=is_2d,
@@ -492,9 +533,9 @@ def run_tracker_encoder_on_videos(
                 crop_wh = (crop_boxes[0][2:] - crop_boxes[0][:2]).to(torch.float32)
                 crop_side = torch.max(crop_wh)
                 model_scale = float(model.image_size) / float(crop_side)
-                queries_model = (current_queries - crop_low) * model_scale
+                queries_model = (coords_chunk - crop_low) * model_scale
             else:
-                queries_model = current_queries
+                queries_model = coords_chunk
 
             target_sizes = [
                 tuple(cam['size'].tolist())
@@ -535,13 +576,26 @@ def run_tracker_encoder_on_videos(
 
             views = [v.unsqueeze(0).to(device=device, dtype=torch.float32) / 255.0 for v in views]
 
+            # Occlusion fed to the model this chunk: GT at each point's query frame for the
+            # first chunk / newly-seeded points, else the previous chunk's predicted occ.
+            if occ_gt_dev is not None:
+                if is_first_chunk or occ_pred is None:
+                    occ_chunk = occ_gt_dev.clone()
+                else:
+                    occ_chunk = occ_pred.clone()
+                    if bool(seeded.any()):
+                        occ_chunk[:, seeded] = occ_gt_dev[:, seeded]
+            else:
+                occ_chunk = None
+
             outputs = model(
                 views=views,
                 coords=queries_model,
-                query_times=query_times,
+                query_times=times_chunk,
                 camera_group=camera_group_chunk,
                 init_latent=init_latent,
-                occlusion=occ_next,
+                kpt_chunk=max_kpts,
+                occlusion=occ_chunk,
             )
 
             if is_2d:
@@ -558,17 +612,25 @@ def run_tracker_encoder_on_videos(
             if coords_pred.shape[1] == 0:
                 break
 
-            if query_times is not None:
-                discard = min(n_overlap, keep_len)
-            else:
-                discard = 0
+            # Drop the overlap frames already emitted by the previous chunk (temporal
+            # dedup); the first chunk keeps everything from its start.
+            discard = 0 if is_first_chunk else min(n_overlap, keep_len)
 
             coords_pred_all.append(coords_pred[:, discard:].cpu())
             vis_pred_all.append(vis_pred[:, discard:].cpu())
             conf_pred_all.append(conf_pred[:, discard:].cpu())
             frame_numbers_all.append(torch.arange(current_frame + discard, current_frame + keep_len, dtype=torch.int64))
 
-            current_queries = coords_pred[:, -1]
+            # --- Carry state to the next chunk.
+            # Re-anchor appeared points on this chunk's last prediction; not-yet points keep
+            # their true query coord for a later chunk to seed.
+            appeared_by_end = (qt_abs < current_frame + keep_len).view(1, N, 1)
+            current_queries = torch.where(appeared_by_end, coords_pred[:, -1], original_queries)
+
+            # Per-point velocity (per frame, from the last two kept frames) for the next
+            # chunk's causal motion margin, and predicted visibility for low-conf exclusion.
+            prev_vel = (coords_pred[:, -1] - coords_pred[:, -2]) if keep_len >= 2 else None
+            prev_vis = vis_pred[:, -1, :, 0] if vis_pred.dim() == 4 else vis_pred[:, -1]
 
             # Predicted per-camera occlusion for the re-anchored queries of the NEXT chunk:
             # threshold the model's vis_pred_2d at the last kept frame (same frame the
@@ -577,24 +639,18 @@ def run_tracker_encoder_on_videos(
             if getattr(model, 'occlusion_embedding', False) and 'vis_pred_2d' in outputs:
                 vp2d = outputs['vis_pred_2d']                    # (cams, b, t, n) logits
                 vp2d_last = vp2d[:, :, keep_len - 1]             # (cams, b, n)
-                occ_pred = (torch.sigmoid(vp2d_last) >= 0.5).to(torch.int64)
-                occ_next = occ_pred.permute(1, 2, 0).contiguous()   # (cams,b,n) -> (b,n,cams)
+                occ_p = (torch.sigmoid(vp2d_last) >= 0.5).to(torch.int64)
+                occ_pred = occ_p.permute(1, 2, 0).contiguous()  # (cams,b,n) -> (b,n,cams)
             else:
-                occ_next = None
+                occ_pred = None
 
             # Thread the decoder latent into the next chunk so the carry spans the whole
             # video (not just within a chunk). None for non-windowed models / single-pass.
             init_latent = outputs.get('final_latent', None)
 
-            query_times = torch.full(
-                (current_queries.shape[0], current_queries.shape[1]),
-                n_overlap - 1,
-                device=device,
-                dtype=torch.int32,
-            )
-
             current_frame += keep_len - n_overlap
             pbar.update(keep_len - discard)
+            is_first_chunk = False
 
             # If we've reached or passed the end, stop
             if current_frame + n_overlap >= end_frame:
@@ -673,77 +729,6 @@ def resolve_video_paths(video_paths):
         if len(subdirs) > 0:
             return [os.path.join(root, d) for d in subdirs]
     return video_paths
-
-
-def run_query_first_on_videos(model, video_paths, camera_group, query_points_3d, query_times,
-                              start_frame=0, n_frames=128, max_kpts=None, device=None,
-                              pred_key_3d='coords_pred', occlusion_gt=None):
-    """Single-forward tracking with per-point query times (mvtracker query_first).
-
-    Unlike run_tracker_encoder_on_videos (which anchors all points at the chunk start and
-    re-anchors across chunks), this feeds the whole clip in one forward and lets the model's
-    internal windowing + latent carry handle each point's introduction at its query frame
-    (TrackerEncoder._forward_windows already masks frames before a track's query time). 3D-only.
-    """
-    R = query_points_3d.shape[-1]
-    if R == 2:
-        raise ValueError('run_query_first_on_videos is 3D-only')
-    n_kpts = query_points_3d.shape[0]
-
-    # Memory: keypoints are chunked INSIDE the model (kpt_chunk) so the V-JEPA scene encoding
-    # is computed once per window and reused across chunks (numerically identical; see
-    # TrackerEncoder._forward_window). This also keeps a single, consistent crop over all
-    # query points -- unlike the old external per-chunk recursion, which cropped each chunk
-    # separately. `max_kpts` becomes the internal chunk size.
-
-    if device is None:
-        device = next(model.parameters()).device
-    model = model.to(device).eval()
-    camera_group = camera_group_to_device(camera_group, device)
-    readers, reader_lengths = build_video_readers(video_paths)
-    max_available = min(reader_lengths)
-    end_frame = min(start_frame + n_frames, max_available)
-    T = end_frame - start_frame
-
-    q = query_points_3d.to(device=device, dtype=torch.float32).unsqueeze(0)          # (1,N,3)
-    qt = query_times.to(device=device, dtype=torch.int32).clamp_(max=max(T - 1, 0)).unsqueeze(0)
-
-    with torch.no_grad():
-        camera_group_chunk, crop_boxes = crop_camera_group_to_queries(
-            camera_group=camera_group, query_coords=q,
-            min_crop_dim=model.image_size, padding=20, is_2d=False)
-        camera_group_chunk = resize_camera_group(camera_group_chunk, model.image_size)
-        target_sizes = [tuple(cam['size'].tolist()) for cam in camera_group_chunk]
-
-        views, actual = load_multiview_clip(
-            readers, start_frame, T, crop_boxes=crop_boxes, target_sizes=target_sizes)
-        if actual < model.n_frames:                     # model needs >= n_frames; pad with last
-            for i in range(len(views)):
-                pad = views[i][-1:].expand(model.n_frames - actual, -1, -1, -1)
-                views[i] = torch.cat([views[i], pad], dim=0)
-        views = [v.unsqueeze(0).to(device=device, dtype=torch.float32) / 255.0 for v in views]
-
-        # per-camera GT occlusion at each point's query frame ({0,1,-1}); None -> all-unknown.
-        occ = None
-        if occlusion_gt is not None:
-            occ = occlusion_gt.to(device=device).unsqueeze(0)  # (1, N, cams)
-
-        outputs = model(views=views, coords=q, query_times=qt,
-                        camera_group=camera_group_chunk, init_latent=None, kpt_chunk=max_kpts,
-                        occlusion=occ)
-        coords_pred = outputs[pred_key_3d][:, :T]
-        vis_pred = outputs['vis_pred'][:, :T]
-        conf_pred = outputs['conf_pred'][:, :T]
-
-    del readers
-    Tret = coords_pred.shape[1]
-    return {
-        'coords_pred':   coords_pred.cpu(),
-        'vis_pred':      vis_pred.cpu(),
-        'conf_pred':     conf_pred.cpu(),
-        'frame_numbers': torch.arange(start_frame, start_frame + Tret, dtype=torch.int64),
-        'crop_history':  [{'start_frame': start_frame, 'n_frames': Tret, 'crop_boxes': crop_boxes}],
-    }
 
 
 def compute_query_first(coords, vis_gt, start_frame, n_frames):
@@ -942,6 +927,9 @@ def parse_args():
     parser.add_argument('--no-query-first', dest='query_first', action='store_false', default=True,
                         help='disable query-first (default ON): with this flag all points are '
                              'anchored at start_frame instead of their first valid+visible frame')
+    parser.add_argument('--no-motion-margin', dest='motion_margin', action='store_false', default=True,
+                        help='disable the causal motion-margin crop expansion (default ON); with '
+                             'this flag + --no-query-first the path is legacy-identical')
     parser.add_argument('--checkpoint', type=int, default=None,
                         help='Optional checkpoint step number; if omitted, use latest checkpoint')
     parser.add_argument('--device', type=str, default=None)
@@ -977,6 +965,7 @@ def run_inference(
     pred_key_3d='coords_pred',
     clip_len=None,
     query_first=True,
+    motion_margin=True,
 ):
     """Run inference on one trial with an already-loaded model.
 
@@ -984,8 +973,10 @@ def run_inference(
     once and reuse it across many trials. If outpath is given the outputs are
     saved as .npz; the outputs dict is always returned.
 
-    query_first (3D only): anchor each point at its first valid+visible frame (mvtracker /
-    training convention), via a single full-clip forward, instead of all points at start_frame.
+    query_first (3D only): seed each point at its first valid+visible frame (mvtracker /
+    training convention) within the windowed, per-chunk re-cropping tracker, instead of all
+    points at start_frame. motion_margin: expand each chunk's crop by the previous chunk's
+    per-point velocity so fast subjects stay in-frame (disable for the legacy-identical path).
     """
     if device is None:
         device = next(model.parameters()).device
@@ -1053,27 +1044,22 @@ def run_inference(
                 continue
             print(f'Tracking subject {subj_idx} ({subj_queries.shape[0]} keypoints)')
             subj_occlusion = _subject_occlusion(subj_idx)
-            if use_query_first:
-                subj_out = run_query_first_on_videos(
-                    model=model, video_paths=video_paths, camera_group=camera_group,
-                    query_points_3d=subj_queries, query_times=per_subject_query_times[subj_idx],
-                    start_frame=start_frame, n_frames=n_frames, max_kpts=max_kpts,
-                    device=device, pred_key_3d=pred_key_3d, occlusion_gt=subj_occlusion)
-            else:
-                subj_out = run_tracker_encoder_on_videos(
-                    model=model,
-                    video_paths=video_paths,
-                    camera_group=camera_group,
-                    query_points_3d=subj_queries,
-                    start_frame=start_frame,
-                    n_frames=n_frames,
-                    n_overlap=n_overlap,
-                    max_kpts=max_kpts,
-                    device=device,
-                    pred_key_3d=pred_key_3d,
-                    clip_len=clip_len,
-                    occlusion_gt=subj_occlusion,
-                )
+            subj_out = run_tracker_encoder_on_videos(
+                model=model,
+                video_paths=video_paths,
+                camera_group=camera_group,
+                query_points_3d=subj_queries,
+                start_frame=start_frame,
+                n_frames=n_frames,
+                n_overlap=n_overlap,
+                max_kpts=max_kpts,
+                device=device,
+                pred_key_3d=pred_key_3d,
+                clip_len=clip_len,
+                occlusion_gt=subj_occlusion,
+                query_times=per_subject_query_times[subj_idx] if use_query_first else None,
+                motion_margin=motion_margin,
+            )
             subj_out['subject_idx'] = subj_idx
             all_subject_outputs.append(subj_out)
 
@@ -1124,27 +1110,22 @@ def run_inference(
         else:
             occlusion_flat = None
 
-        if use_query_first:
-            outputs = run_query_first_on_videos(
-                model=model, video_paths=video_paths, camera_group=camera_group,
-                query_points_3d=query_points_3d, query_times=query_times_flat,
-                start_frame=start_frame, n_frames=n_frames, max_kpts=max_kpts,
-                device=device, pred_key_3d=pred_key_3d, occlusion_gt=occlusion_flat)
-        else:
-            outputs = run_tracker_encoder_on_videos(
-                model=model,
-                video_paths=video_paths,
-                camera_group=camera_group,
-                query_points_3d=query_points_3d,
-                start_frame=start_frame,
-                n_frames=n_frames,
-                n_overlap=n_overlap,
-                max_kpts=max_kpts,
-                device=device,
-                pred_key_3d=pred_key_3d,
-                clip_len=clip_len,
-                occlusion_gt=occlusion_flat,
-            )
+        outputs = run_tracker_encoder_on_videos(
+            model=model,
+            video_paths=video_paths,
+            camera_group=camera_group,
+            query_points_3d=query_points_3d,
+            start_frame=start_frame,
+            n_frames=n_frames,
+            n_overlap=n_overlap,
+            max_kpts=max_kpts,
+            device=device,
+            pred_key_3d=pred_key_3d,
+            clip_len=clip_len,
+            occlusion_gt=occlusion_flat,
+            query_times=query_times_flat if use_query_first else None,
+            motion_margin=motion_margin,
+        )
 
     # --- Ground-truth extraction ---
     frame_nums = (outputs['frame_numbers'].numpy()
@@ -1280,6 +1261,7 @@ def main():
         pred_key_3d=args.pred_key_3d,
         clip_len=args.clip_len,
         query_first=args.query_first,
+        motion_margin=args.motion_margin,
     )
 
 
