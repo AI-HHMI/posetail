@@ -452,6 +452,7 @@ def run_tracker_encoder_on_videos(
     coords_pred_all = []
     vis_pred_all = []
     conf_pred_all = []
+    vis_pred_2d_all = []          # per-camera visibility logits (cams,b,t,n), for occlusion eval
     frame_numbers_all = []
     crop_history = []
     is_first_chunk = True
@@ -467,8 +468,9 @@ def run_tracker_encoder_on_videos(
     prev_vis = None                                  # (1, N)
 
     # Occlusion carried across chunks (occlusion_embedding). First chunk (and each point's
-    # SEED chunk) uses the GT occlusion at the query frame ({0,1,-1}); already-active points
-    # use the model's PREDICTED per-camera visibility ({0,1}). None -> all-unknown.
+    # SEED chunk) uses the GT occlusion at the query frame ({0,1,-1}) when available, else
+    # unknown (-1); already-active points use the model's PREDICTED per-camera visibility
+    # ({0,1}), which propagates window-to-window even when no GT vis exists. None -> all-unknown.
     occ_gt_dev = occlusion_gt.to(device=device).unsqueeze(0) if occlusion_gt is not None else None  # (1,N,cams)
     occ_pred = None                                  # predicted occ carried from previous chunk
 
@@ -576,17 +578,19 @@ def run_tracker_encoder_on_videos(
 
             views = [v.unsqueeze(0).to(device=device, dtype=torch.float32) / 255.0 for v in views]
 
-            # Occlusion fed to the model this chunk: GT at each point's query frame for the
-            # first chunk / newly-seeded points, else the previous chunk's predicted occ.
-            if occ_gt_dev is not None:
-                if is_first_chunk or occ_pred is None:
-                    occ_chunk = occ_gt_dev.clone()
-                else:
-                    occ_chunk = occ_pred.clone()
-                    if bool(seeded.any()):
-                        occ_chunk[:, seeded] = occ_gt_dev[:, seeded]
+            # Occlusion fed to the model this chunk. Active points carry the previous chunk's
+            # PREDICTED per-camera occlusion so the visibility state propagates across windows;
+            # points whose query frame lands in THIS chunk are (re)seeded with GT occlusion when
+            # available, else marked unknown (-1). occ_pred is only ever set when the model uses
+            # the occlusion term (see below), so a model without it always takes the first
+            # branch and this reduces to the legacy GT-or-None behavior.
+            if is_first_chunk or occ_pred is None:
+                occ_chunk = occ_gt_dev.clone() if occ_gt_dev is not None else None
             else:
-                occ_chunk = None
+                occ_chunk = occ_pred.clone()
+                if bool(seeded.any()):
+                    occ_chunk[:, seeded] = (occ_gt_dev[:, seeded] if occ_gt_dev is not None
+                                            else -1)
 
             outputs = model(
                 views=views,
@@ -608,6 +612,9 @@ def run_tracker_encoder_on_videos(
                 coords_pred = outputs[pred_key_3d][:, :keep_len]
             vis_pred = outputs['vis_pred'][:, :keep_len]
             conf_pred = outputs['conf_pred'][:, :keep_len]
+            # Per-camera visibility logits (cams,b,t,n); time axis is dim 2, not dim 1.
+            vis_pred_2d = (outputs['vis_pred_2d'][:, :, :keep_len]
+                           if 'vis_pred_2d' in outputs else None)
 
             if coords_pred.shape[1] == 0:
                 break
@@ -619,6 +626,8 @@ def run_tracker_encoder_on_videos(
             coords_pred_all.append(coords_pred[:, discard:].cpu())
             vis_pred_all.append(vis_pred[:, discard:].cpu())
             conf_pred_all.append(conf_pred[:, discard:].cpu())
+            if vis_pred_2d is not None:
+                vis_pred_2d_all.append(vis_pred_2d[:, :, discard:].cpu())
             frame_numbers_all.append(torch.arange(current_frame + discard, current_frame + keep_len, dtype=torch.int64))
 
             # --- Carry state to the next chunk.
@@ -665,17 +674,22 @@ def run_tracker_encoder_on_videos(
             'coords_pred': torch.empty((0, 0, 0, R)),
             'vis_pred': torch.empty((0, 0, 0, 1)),
             'conf_pred': torch.empty((0, 0, 0, 1)),
+            'vis_pred_2d': torch.empty((0, 0, 0, 0)),
             'frame_numbers': torch.empty((0,), dtype=torch.int64),
             'crop_history': crop_history,
         }
 
-    return {
+    result = {
         'coords_pred': torch.cat(coords_pred_all, dim=1),
         'vis_pred': torch.cat(vis_pred_all, dim=1),
         'conf_pred': torch.cat(conf_pred_all, dim=1),
         'frame_numbers': torch.cat(frame_numbers_all, dim=0),
         'crop_history': crop_history,
     }
+    if len(vis_pred_2d_all) > 0:
+        # (cams, b, t, n) -> concat over the time axis (dim 2)
+        result['vis_pred_2d'] = torch.cat(vis_pred_2d_all, dim=2)
+    return result
 
 
 def load_tracker_encoder_checkpoint(checkpoint_path, model_kwargs, device=None,
@@ -1083,10 +1097,13 @@ def run_inference(
             coords_list = []
             vis_list = []
             conf_list = []
+            vp2d_list = []          # per-camera logits, each (cams, 1, T, K_s)
             for so in all_subject_outputs:
                 coords_list.append(so['coords_pred'])
                 vis_list.append(so['vis_pred'])
                 conf_list.append(so['conf_pred'])
+                if 'vis_pred_2d' in so:
+                    vp2d_list.append(so['vis_pred_2d'])
                 outputs['crop_history'].extend(so['crop_history'])
 
             # Concatenate along the keypoint dimension (dim=2) with batch dim=0
@@ -1094,6 +1111,10 @@ def run_inference(
             outputs['coords_pred'] = torch.cat(coords_list, dim=2)
             outputs['vis_pred'] = torch.cat(vis_list, dim=2)
             outputs['conf_pred'] = torch.cat(conf_list, dim=2)
+            # vis_pred_2d is (cams, b, t, n): keypoints are dim 3. Only when every
+            # subject produced it (same camera/time layout across subjects).
+            if len(vp2d_list) == len(all_subject_outputs) and len(vp2d_list) > 0:
+                outputs['vis_pred_2d'] = torch.cat(vp2d_list, dim=3)
 
             # Also store per-subject slicing info
             subject_kpt_counts = [so['coords_pred'].shape[2] for so in all_subject_outputs]
@@ -1135,7 +1156,7 @@ def run_inference(
     frame_nums_gt = np.clip(frame_nums, 0, n_time_gt - 1)
 
     if per_subject and 'subject_indices' in outputs:
-        coords_true_parts, vis_true_parts = [], []
+        coords_true_parts, vis_true_parts, vis_cam_parts = [], [], []
         for s_idx in outputs['subject_indices']:
             vmask = per_subject_valid_masks[s_idx]
             subj_coords = coords_gt[s_idx, frame_nums_gt]          # (T, n_kpts, 3)
@@ -1149,8 +1170,15 @@ def run_inference(
                 subj_vis = np.all(np.isfinite(subj_coords), axis=-1, keepdims=True)
             vis_true_parts.append(subj_vis)
 
+            # Per-camera GT visibility on the USED cameras (NaN=unknown preserved), for the
+            # per-camera occlusion metric. Aligned to vis_pred_2d's camera axis.
+            if vis_gt_used is not None:
+                vis_cam_parts.append(vis_gt_used[s_idx, frame_nums_gt][:, vmask, :])  # (T, K_s, cams)
+
         coords_true = np.concatenate(coords_true_parts, axis=1)[np.newaxis]  # (1, T, K, 3)
         vis_true    = np.concatenate(vis_true_parts,    axis=1)[np.newaxis]  # (1, T, K, 1)
+        vis_true_cams = (np.concatenate(vis_cam_parts, axis=1)[np.newaxis]   # (1, T, K, cams)
+                         if vis_cam_parts else None)
 
     else:
         n_subj, n_time_full, n_kpts_full, _ = coords_gt.shape
@@ -1172,6 +1200,17 @@ def run_inference(
         else:
             vis_true = np.all(np.isfinite(coords_true), axis=-1, keepdims=True)
 
+        # Per-camera GT (NaN=unknown preserved) on the USED cameras, mirroring the coords_true
+        # reshape but keeping the camera axis: (n_subj,n_time,n_kpts,cams) -> (1,T,K_valid,cams).
+        if vis_gt_used is not None:
+            n_cams_used = vis_gt_used.shape[-1]
+            vc = vis_gt_used.transpose(0, 2, 1, 3)                            # (n_subj, n_kpts, n_time, cams)
+            vc = vc.reshape(n_subj * n_kpts_full, n_time_full, n_cams_used)   # (S*K, n_time, cams)
+            vc = vc[valid_flat]                                              # (K_valid, n_time, cams)
+            vis_true_cams = vc[:, frame_nums_gt, :].transpose(1, 0, 2)[np.newaxis]  # (1, T, K_valid, cams)
+        else:
+            vis_true_cams = None
+
     # per-point query times, in the same keypoint order as coords_pred/coords_true
     if per_subject and 'subject_indices' in outputs:
         qt_parts = [np.asarray(per_subject_query_times[s]) for s in outputs['subject_indices']]
@@ -1183,6 +1222,10 @@ def run_inference(
 
     outputs['coords_true'] = coords_true   # (1, T, K, 3)
     outputs['vis_true'] = vis_true      # (1, T, K, 1)
+    # Per-camera GT visibility for the per-camera occlusion metric; paired with the model's
+    # vis_pred_2d (already in outputs from the tracker). Both omitted when GT vis is absent.
+    if vis_true_cams is not None:
+        outputs['vis_true_cams'] = vis_true_cams   # (1, T, K, cams_used), NaN=unknown
     outputs['video_paths'] = np.array(video_paths, dtype=str)
     outputs['mode'] = mode
     outputs['metadata_path'] = metadata_path if metadata_path is not None else ''

@@ -3,9 +3,13 @@
 
 For each requested dataset, runs query-first inference (mvtracker/training convention -- the
 default in run_inference) on every test trial and computes the full metric set via
-get_eval_metrics (MTE, MPJPE, delta-avg + per-threshold, survival, occlusion-acc, AJ +
-per-threshold). Metrics use the corrected masking: non-finite GT (cleaned (0,0,-1)->NaN
-placeholders) and pre-query frames are excluded via the per-point query_times.
+get_eval_metrics (MTE, MPJPE, delta-avg + per-threshold, survival, occlusion-acc,
+occlusion-acc-percam, AJ + per-threshold). Metrics use the corrected masking: non-finite GT
+(cleaned (0,0,-1)->NaN placeholders) and pre-query frames are excluded via the per-point
+query_times -- this now includes both occlusion metrics (frame counts, not the visibility gate,
+so occluded frames still count). occlusion-acc-percam scores the model's per-camera visibility
+logits (vis_pred_2d) against per-camera GT; it is NaN for predictions cached before this column
+existed (regenerate with --force to populate it).
 
 Crop setup (best for moving subjects): query-first runs through the windowed tracker, which
 RE-CROPS each chunk to follow the subject (n_overlap sets the cadence) and expands the crop by
@@ -57,7 +61,8 @@ SETTINGS = {
     'cmupanoptic_3dgs': dict(thresholds=[0.05, 0.10, 0.20, 0.40],       survival=1.0,
                              n_views=14, max_kpts=600),
 }
-METRIC_KEYS = ['mte', 'mpjpe', 'delta_x_avg', 'survival_rate', 'occlusion_acc', 'avg_jaccard']
+METRIC_KEYS = ['mte', 'mpjpe', 'delta_x_avg', 'survival_rate', 'occlusion_acc',
+               'occlusion_acc_percam', 'avg_jaccard']
 
 
 def find_test_trials(dataset):
@@ -76,9 +81,16 @@ def eval_outputs(out, thresholds, survival):
     vt = torch.as_tensor(np.asarray(out['vis_true']), dtype=torch.bool)
     qt = torch.as_tensor(np.asarray(out['query_times']), dtype=torch.long) \
         if 'query_times' in keys else None
+    # Per-camera occlusion: model logits vs per-camera GT (both saved by run_inference when the
+    # trial has visibility GT). Absent from predictions cached before this was added -> the
+    # per-cam metric is left as NaN (regenerate with --force to populate it).
+    vp2d = np.asarray(out['vis_pred_2d']) if 'vis_pred_2d' in keys else None
+    vtc = np.asarray(out['vis_true_cams']) if 'vis_true_cams' in keys else None
     m = get_eval_metrics(vp, vt, cp, ct, thresholds=thresholds,
-                         survival_threshold=survival, prefix='', query_times=qt)
+                         survival_threshold=survival, prefix='', query_times=qt,
+                         vis_pred_2d=vp2d, vis_true_cams=vtc)
     m = {k: (v.tolist() if isinstance(v, np.ndarray) else float(v)) for k, v in m.items()}
+    m.setdefault('occlusion_acc_percam', float('nan'))
     m['n_kpts'] = int(cp.shape[2])
     m['n_late_query'] = int((np.asarray(out['query_times']) > 0).sum()) if 'query_times' in keys else 0
     return m

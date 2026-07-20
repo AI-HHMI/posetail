@@ -157,10 +157,10 @@ seed = 0
 
 finetune = true
 # pretraining
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260710_151739-dqbgdtkx/files/checkpoints/checkpoint_00799996.pth'
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260710_151739-dqbgdtkx/files/checkpoints/checkpoint_00799996.pth'
 
 # finetuned 1
-# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260703_110311-8e2g5hfu/files/checkpoints/checkpoint_00860328.pth'
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260712_124515-t8ulpbro/files/checkpoints/checkpoint_01187840.pth'
 
 # finetuned 2
 # checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260705_134039-1d1r24ff/files/checkpoints/checkpoint_02058240.pth'
