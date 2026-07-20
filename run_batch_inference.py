@@ -27,10 +27,12 @@ DEFAULT_OUT_ROOT = '~/ghome/results/posetail-inference/2026-06-11'
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Per-dataset override of which 3D model output to use as the prediction.
-# Datasets not listed use the default 'coords_pred'.
-PRED_KEY_3D_OVERRIDES = {
-    'johnson-fly': '3d_pred_triangulate',
-}
+# Datasets not listed use the default 'coords_pred' (== '3d_pred_direct').
+# NOTE: johnson-fly used '3d_pred_triangulate', but its cameras are near-orthographic
+# (telecentric; DLT L9=L10=L11~=0), so weighted-DLT triangulation is ill-conditioned along
+# the low-parallax world axis and injects large anisotropic jitter (~20x GT accel on y). The
+# direct head is both smoother (0.7x GT accel) and more accurate, so it uses the default.
+PRED_KEY_3D_OVERRIDES = {}
 
 
 def find_trials(dataset_dir, split):
@@ -100,7 +102,7 @@ def pick_trial(trials, n_frames):
     return trial_dir, is_2d, 0, T, score, True
 
 
-def launch_render(tracks_path, vids_path, is_2d):
+def launch_render(tracks_path, vids_path, is_2d, trails=True):
     """Start render_video.py as a background subprocess; return the Popen."""
     conf = '0.2' if is_2d else '0.5'
     cmd = [sys.executable, os.path.join(HERE, 'render_video.py'),
@@ -108,8 +110,20 @@ def launch_render(tracks_path, vids_path, is_2d):
            '--output-dir', vids_path,
            '--crop',
            '--conf-threshold', conf]
+    if trails:
+        cmd.append('--trails')
     print('    [render bg] $', ' '.join(cmd))
     return subprocess.Popen(cmd)
+
+
+def has_rendered_video(vids_path):
+    """True if vids_path holds at least one rendered .mp4.
+
+    render_info.json is written before rendering starts, so it is not a reliable
+    'done' marker; the .mp4 files are.
+    """
+    return os.path.isdir(vids_path) and any(
+        f.endswith('.mp4') for f in os.listdir(vids_path))
 
 
 def main():
@@ -131,6 +145,15 @@ def main():
                     help='disable query-first (default ON): anchor each point at its first '
                          'valid+visible frame (mvtracker/training convention). With this flag, '
                          'all points are anchored at start_frame instead (legacy 3D behavior).')
+    ap.add_argument('--no-trails', dest='trails', action='store_false', default=True,
+                    help='disable motion trails (default ON): trails draw each '
+                         'point\'s recent path so a still frame conveys tracking. '
+                         'Uses render_video.py defaults (length 30, thickness 2).')
+    ap.add_argument('--force', action='store_true', default=False,
+                    help='re-run inference and re-render even when outputs already '
+                         'exist. By default a dataset whose tracks npz + video are both '
+                         'present is skipped; if only the video is missing, inference is '
+                         'reused and only the render runs.')
     args = ap.parse_args()
 
     out_root = os.path.expanduser(args.out_root)
@@ -162,48 +185,72 @@ def main():
     for ds in datasets:
         print(f'\n=== {ds} ===')
         try:
-            trials = find_trials(os.path.join(args.prefix, ds), args.split)
-            if not trials:
-                print(f'    [warn] no {args.split} trials found, skipping')
-                summary.append((ds, 'no-trials', '', '', '', '', ''))
-                continue
-
-            pick = pick_trial(trials, args.n_frames)
-            if pick is None:
-                print('    [warn] no loadable pose data, skipping')
-                summary.append((ds, 'no-pose', '', '', '', '', ''))
-                continue
-            trial_dir, is_2d, start, n_eff, score, clamped = pick
-            mode = '2d' if is_2d else '3d'
-            pred_key_3d = PRED_KEY_3D_OVERRIDES.get(ds, 'coords_pred')
-            print(f'    trial: {trial_dir}')
-            print(f'    mode={mode} start_frame={start} n_frames={n_eff} '
-                  f'score={score:.4f} pred_key_3d={pred_key_3d}')
-
             tracks_path = os.path.join(tracks_dir, f'{ds}.npz')
             vids_path = os.path.join(vids_dir, ds)
 
-            # Inference: in-process, sequential on the GPU (model already loaded).
-            run_inference(
-                model=model,
-                config_path=config_path,
-                checkpoint_path=checkpoint_path,
-                trial_path=trial_dir,
-                start_frame=start,
-                n_frames=n_eff,
-                n_overlap=8,
-                per_subject=True,
-                device=device,
-                outpath=tracks_path,
-                pred_key_3d=pred_key_3d,
-                query_first=args.query_first,
-            )
+            # Skip work whose output already exists (unless --force). Inference and
+            # render are gated independently: a present tracks npz is reused, and a
+            # present video skips the render.
+            need_inference = args.force or not os.path.exists(tracks_path)
+            need_render = args.force or not has_rendered_video(vids_path)
+            if not need_inference and not need_render:
+                print('    [skip] tracks + video already present (use --force to overwrite)')
+                summary.append((ds, 'skipped', os.path.basename(tracks_path),
+                                '', '', '', ''))
+                continue
+
+            if need_inference:
+                trials = find_trials(os.path.join(args.prefix, ds), args.split)
+                if not trials:
+                    print(f'    [warn] no {args.split} trials found, skipping')
+                    summary.append((ds, 'no-trials', '', '', '', '', ''))
+                    continue
+
+                pick = pick_trial(trials, args.n_frames)
+                if pick is None:
+                    print('    [warn] no loadable pose data, skipping')
+                    summary.append((ds, 'no-pose', '', '', '', '', ''))
+                    continue
+                trial_dir, is_2d, start, n_eff, score, clamped = pick
+                mode = '2d' if is_2d else '3d'
+                trial_name = os.path.basename(trial_dir)
+                pred_key_3d = PRED_KEY_3D_OVERRIDES.get(ds, 'coords_pred')
+                print(f'    trial: {trial_dir}')
+                print(f'    mode={mode} start_frame={start} n_frames={n_eff} '
+                      f'score={score:.4f} pred_key_3d={pred_key_3d}')
+
+                # Inference: in-process, sequential on the GPU (model already loaded).
+                run_inference(
+                    model=model,
+                    config_path=config_path,
+                    checkpoint_path=checkpoint_path,
+                    trial_path=trial_dir,
+                    start_frame=start,
+                    n_frames=n_eff,
+                    n_overlap=8,
+                    per_subject=True,
+                    device=device,
+                    outpath=tracks_path,
+                    pred_key_3d=pred_key_3d,
+                    query_first=args.query_first,
+                )
+                score_str = f'{score:.3f}'
+            else:
+                # Reuse existing tracks; only (re)render. Recover mode/is_2d from the npz.
+                print('    [skip inference] tracks present; rendering only')
+                mode = str(np.load(tracks_path, allow_pickle=True)['mode'])
+                is_2d = (mode == '2d')
+                trial_name = '(cached)'
+                start = n_eff = score_str = ''
 
             # Render: background subprocess, overlaps the next dataset's inference.
-            renders.append((ds, launch_render(tracks_path, vids_path, is_2d)))
+            if need_render:
+                renders.append((ds, launch_render(tracks_path, vids_path, is_2d, args.trails)))
+            else:
+                print('    [skip render] video already present')
 
-            summary.append((ds, 'ok', os.path.basename(trial_dir),
-                            str(start), str(n_eff), f'{score:.3f}', mode))
+            summary.append((ds, 'ok', trial_name,
+                            str(start), str(n_eff), score_str, mode))
         except Exception as exc:
             print(f'    [error] {ds} failed: {exc}')
             summary.append((ds, 'FAILED', '', '', '', '', ''))

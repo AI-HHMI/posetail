@@ -182,8 +182,17 @@ def load_image(cam_img_path, crop_coords=None, target_size=None, rotation=None):
         img = cv2.warpAffine(img, M_2x3, new_size)
 
     if crop_coords is not None:
-        x1, y1, x2, y2 = crop_coords
-        img = img[y1:y2, x1:x2]
+        x1, y1, x2, y2 = (int(c) for c in crop_coords)
+        # Pad-safe crop: off-frame regions are zero-filled rather than wrapped
+        # (raw negative slicing) so pixels stay aligned with the crop geometry.
+        # crop_cgroup_to_points* already keep boxes in-bounds; this guards any
+        # future off-frame box (e.g. from the rotation-augment path).
+        h, w = img.shape[:2]
+        out = np.zeros((y2 - y1, x2 - x1, img.shape[2]), dtype=img.dtype)
+        sx1, sy1, sx2, sy2 = max(x1, 0), max(y1, 0), min(x2, w), min(y2, h)
+        if sx2 > sx1 and sy2 > sy1:
+            out[sy1 - y1:sy2 - y1, sx1 - x1:sx2 - x1] = img[sy1:sy2, sx1:sx2]
+        img = out
 
     if target_size is not None:
         img = cv2.resize(img, target_size)
@@ -383,15 +392,22 @@ def custom_collate(batch):
         
     rows = batch[5][0]
     query_times = torch.stack(batch[6])
-    
-    batch = edict({'views': views, 
+
+    # per-camera occlusion query term (occlusion_embedding): plain stack, NO trailing
+    # dim (it is an embedding index tensor, unlike vis/vis_2d which get [..., None]).
+    query_occlusion = None
+    if len(batch) > 9 and batch[9][0] is not None:
+        query_occlusion = torch.stack(batch[9], axis=0)  # (b, n, cams)
+
+    batch = edict({'views': views,
                    'coords': coords,
                    'p2d': p2d,
                    'query_times': query_times,
                    'vis': vis,
                    'vis_2d': vis_2d,
+                   'query_occlusion': query_occlusion,
                    'fnums': fnums,
-                   'cgroup': cgroup, 
+                   'cgroup': cgroup,
                    'sample_info': rows})
 
     return batch
@@ -459,7 +475,14 @@ class PosetailDataset(Dataset):
         self.kpts_to_sample = format_sample_input(config.dataset[split].get('kpts_to_sample', None))
         self.speed_thresh = config.dataset[split].get('speed_thresh', None) 
         self.prop_dynamic_kpts_to_sample = config.dataset[split].get('prop_dynamic_kpts_to_sample', 0.7)
-        self.cam_thresh_for_vis = config.dataset[split].get('cam_thresh_for_vis', 1) 
+        self.cam_thresh_for_vis = config.dataset[split].get('cam_thresh_for_vis', 1)
+        # Occlusion-dropout for the occlusion_embedding query term: prob of replacing a
+        # sample's whole per-camera occlusion with -1 (unknown) so the network learns to
+        # cope when occlusion is unknown at inference. Forced 0 for val/test (deterministic
+        # eval GT occlusion).
+        self.occlusion_dropout_prob = (
+            config.dataset[split].get('occlusion_dropout_prob', 0.5)
+            if split == 'train' else 0.0)
         self.enable_kpt_filtering = config.dataset[split].get('enable_kpt_filtering', False)
         self.query_anytime = config.dataset[split].get('query_anytime', False)
         self.query_edge_bias = config.dataset[split].get('query_edge_bias', 3.0)
@@ -988,7 +1011,30 @@ class PosetailDataset(Dataset):
                 p2d = p2d.clone()
                 p2d[:, pre] = float('nan')
 
-        return views, coords, vis, fnums, cgroup, row, query_times, vis_2d, p2d
+        # Per-camera occlusion state {occluded=0, visible=1, unknown=-1} at each point's
+        # query frame, for the occlusion_embedding query term. Built here (the single
+        # tuple return) so coords/vis_2d/cgroup are all final (post subsample/keypoint-
+        # sample/cutout) and the cams count matches len(cgroup) for BOTH the 2D-only and
+        # 3D paths automatically. Source is raw vis_2d (NaN=unknown); datasets with no
+        # visibility (vis_2d None, e.g. 2D-only) -> all unknown.
+        n_kpts_out = coords.shape[1]
+        n_cams_out = len(cgroup)
+        if vis_2d is not None:
+            qt = query_times.to(torch.long)                                  # (N,)
+            v_at_q = vis_2d[qt, torch.arange(n_kpts_out)]                     # (N, cams), NaN-bearing
+            query_occlusion = torch.where(
+                torch.isnan(v_at_q),
+                torch.full_like(v_at_q, -1.0),
+                (v_at_q > 0.5).to(v_at_q.dtype))                             # NaN->-1, else 0/1
+        else:
+            query_occlusion = torch.full((n_kpts_out, n_cams_out), -1.0)
+        # per-sample occlusion-dropout: replace the whole sample with -1 (unknown)
+        if np.random.random() < self.occlusion_dropout_prob:
+            query_occlusion = torch.full((n_kpts_out, n_cams_out), -1.0)
+        query_occlusion = query_occlusion.to(torch.int64)                    # (N, cams)
+
+        return (views, coords, vis, fnums, cgroup, row, query_times, vis_2d, p2d,
+                query_occlusion)
 
 
     def _build_2d_cgroup(self, row, img_path, cam_names):

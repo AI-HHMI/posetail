@@ -142,6 +142,8 @@ def _triplet_to_device(trip, device):
         v, c, cg = trip[k]
         trip[k] = ([x.to(device) for x in v], c.to(device),
                    [dict_to_device(d, device) for d in cg])
+    if trip.get('occlusion') is not None:
+        trip['occlusion'] = trip['occlusion'].to(device)
     return trip
 
 

@@ -375,6 +375,7 @@ def make_triplet(batch, dataset, corruptor_3d, corruptor_2d, cfg):
     mode = '3d' if R == 3 else '2d'
     views = batch.views
     cgroup = batch.cgroup
+    occlusion = batch.get('occlusion')                                 # [b,n,cams] or None
     ang = cfg.get('anchor_rotate_2d_deg', 45.0)                        # shared 2D & 3D angle range
     do_crop = cfg.get('crop_to_points', True)                          # scorer owns crop-to-points
     target_res = cfg.get('target_res', 256)                            # scorer owns the resize
@@ -463,6 +464,11 @@ def make_triplet(batch, dataset, corruptor_3d, corruptor_2d, cfg):
     s_coords = s_coords[:, :, keep]
     bad_coords = bad_coords[:, :, keep]
     a_coords = a_coords[:, :, keep]
+    # Occlusion is a query-anchored per-point per-camera state, unchanged by the image
+    # rotation/crop/resize and identical for good/bad/anchor (same track, same cameras);
+    # just drop the same points as coords so it stays point-aligned.
+    if occlusion is not None:
+        occlusion = occlusion[:, keep, :]                            # [b, n', cams]
 
     good = (s_views, s_coords, s_cgroup)
     bad = (s_views, bad_coords, s_cgroup)                             # shares good's augmented pixels
@@ -472,6 +478,7 @@ def make_triplet(batch, dataset, corruptor_3d, corruptor_2d, cfg):
         'good': good, 'bad': bad, 'anchor': anchor,
         'anchor_label': anchor_label, 'mode': mode,
         'reuse_scene_for_anchor': False,
+        'occlusion': occlusion,                                       # shared by all 3 members
     }
 
 
@@ -524,10 +531,13 @@ class ScorerTripletDataset(torch.utils.data.Dataset):
             item = self.base[idx]
             if item is not None:
                 try:
-                    views, coords, vis, fnums, cgroup, row, query_times, vis_2d, p2d = item
+                    (views, coords, vis, fnums, cgroup, row, query_times, vis_2d, p2d,
+                     query_occlusion) = item
                     mini = edict({'views': [v[None] for v in views],   # add b=1 -> [1,t,h,w,3]
                                   'coords': coords[None],               # [1,t,n,R]
-                                  'cgroup': cgroup})
+                                  'cgroup': cgroup,
+                                  # per-point per-camera occlusion state -> add b=1 [1,n,cams]
+                                  'occlusion': None if query_occlusion is None else query_occlusion[None]})
                     trip = make_triplet(mini, self.base, self.corruptor_3d, self.corruptor_2d, self.cfg)
                     trip['sample_info'] = row      # carry for the bad-gradient error print
                     return trip

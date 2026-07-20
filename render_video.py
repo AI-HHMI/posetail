@@ -298,14 +298,22 @@ def main():
         p2d = coords_pred[np.newaxis]  # (1, T, N, 2)
     else:
         # Load camera group and project predicted 3D points to each view.
+        # The metadata may describe more cameras than were used for inference
+        # (e.g. runs that subsample views), so select the subset that matches
+        # video_paths by camera name and preserve video_paths order.
         camera_group = load_camera_group_from_metadata(metadata_path, device='cpu')
-        cam_names = [cam['name'] for cam in camera_group]
+        vid_cam_names = [os.path.splitext(os.path.basename(p))[0] for p in video_paths]
+        name_to_cam = {cam['name']: cam for cam in camera_group}
 
-        if n_cams != len(camera_group):
+        missing = [nm for nm in vid_cam_names if nm not in name_to_cam]
+        if missing:
             raise ValueError(
-                f'Number of video paths ({n_cams}) does not match '
-                f'number of cameras ({len(camera_group)}) in metadata'
+                f'Cameras {missing} from video_paths not found in metadata '
+                f'({metadata_path}); available cameras: {sorted(name_to_cam)}'
             )
+
+        camera_group = [name_to_cam[nm] for nm in vid_cam_names]
+        cam_names = vid_cam_names
 
         coords_3d_torch = torch.as_tensor(coords_pred, dtype=torch.float32)
         p2d = project_points_torch(camera_group, coords_3d_torch)  # (n_cams, T, N, 2)

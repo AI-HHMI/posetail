@@ -12,7 +12,7 @@ prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pr
 
 [dataset.train]
 split_dir = 'train'
-n_frames = 16
+n_frames = 24
 min_res = 256
 max_res = 256
 cams_to_sample = [1, 8]
@@ -26,12 +26,12 @@ crop_to_points = true
 speed_thresh = 3.0
 query_anytime = true
 query_edge_bias = 200.0
+occlusion_dropout_prob = 0.5
 prop_dynamic_kpts_to_sample = 0.95
 prob_2d_only = 0.25
 crop_3d_enabled = true
 crop_3d_fraction = [0.05, 0.75]
 crop_3d_prob = 0.4
-# No causal_masking: the encoder's temporal self-attention is bidirectional (TapNext-only).
 
 [dataset.train.dataset_weights]
 kubric-multiview = 3.0
@@ -44,7 +44,7 @@ intensity_floor = 0.0
 
 [dataset.val]
 split_dir = 'val'
-n_frames = 16
+n_frames = 24
 max_res = 256
 cams_to_sample = 5
 kpts_to_sample = 128
@@ -74,12 +74,12 @@ video_encoder_requires_grad = true
 video_encoder_hierarchical = true
 
 # Inert while the encoder is frozen.
-video_encoder_finetune_last_n_layers = 12
+# video_encoder_finetune_last_n_layers = 12
 
 soft_argmax_temperature_learnable = true
 
 # processing
-stride_length = 16
+stride_length = 24
 stride_overlap = 4
 unroll_windows = false
 image_size = 256
@@ -94,6 +94,7 @@ corr_radius = 2
 principal_point_embedding = true
 intrinsic_embedding = true
 metric_ray_translation = true
+occlusion_embedding = true
 
 # decoder
 latent_dim = 512
@@ -111,6 +112,15 @@ cross_attn_dim = 512
 scene_proj_dim = 512
 scene_proj_prenorm = false
 scene_proj_mlp = false
+
+
+# 'ropepos' = temporal RoPE in the decoder cross-attention + a learned spatial-only scene
+# pos_embed (restores absolute spatial position that the RoPE video backbone lacks).
+scene_pos_embed_mode = 'ropepos'
+rope_base = 100.0
+# 'fourier_rel' = Fourier encodings of absolute query, absolute target, and the relative
+# (target-query) gap as a dedicated fusion term (length-agnostic, gap-consistent).
+time_embed_mode = 'fourier_rel'
 
 
 # "gridresid" = per-axis soft-argmax bin grid (CE-supervised): 3D head emits a motion residual
@@ -147,10 +157,15 @@ seed = 0
 
 finetune = true
 # pretraining
-# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260630_195317-pi2fpadz/files/checkpoints/checkpoint_00799996.pth'
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260710_151739-dqbgdtkx/files/checkpoints/checkpoint_00799996.pth'
 
 # finetuned 1
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260703_110311-8e2g5hfu/files/checkpoints/checkpoint_00860328.pth'
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260703_110311-8e2g5hfu/files/checkpoints/checkpoint_00860328.pth'
+
+# finetuned 2
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260705_134039-1d1r24ff/files/checkpoints/checkpoint_02058240.pth'
+
+
 
 n_iterations = 8000000
 scheduler_type = 'muon'

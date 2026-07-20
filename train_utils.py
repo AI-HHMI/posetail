@@ -638,17 +638,24 @@ def train_iteration(config, model, fabric, batch,
                           torch.arange(len(query_times[0]))]
 
 
-    if cgroup: 
+    if cgroup:
         cgroup = [dict_to_device(cam_dict, device) for cam_dict in cgroup]
 
     optimizer.zero_grad()
 
+    # Per-camera occlusion query term (occlusion_embedding). Gated on the model attribute so
+    # Tracker/TrackerTapNext (whose forward doesn't accept occlusion) are unaffected.
+    model_kwargs = {}
+    if getattr(model, 'occlusion_embedding', False):
+        model_kwargs['occlusion'] = getattr(batch, 'query_occlusion', None)
+
     # with fabric.autocast():
     outputs = model(
-        views = list(views), 
+        views = list(views),
         coords = query_coords,
         query_times = query_times,
-        camera_group = cgroup)
+        camera_group = cgroup,
+        **model_kwargs)
 
     coords_pred = outputs['coords_pred']
     vis_pred = outputs['vis_pred']
