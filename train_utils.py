@@ -20,7 +20,7 @@ from easydict import EasyDict
 # from posetail.datasets.datasets import Rat7mIterableDataset
 from posetail.datasets.utils import safe_make
 from posetail.posetail.cube import get_camera_scale
-from posetail.posetail.eval_metrics import get_eval_metrics, get_metrics_by_motion
+from posetail.posetail.eval_metrics import get_eval_metrics, get_metrics_by_motion, get_direct_depth_metrics
 from posetail.posetail.cube import get_camera_scale
 from posetail.posetail.losses import get_vis_true, unroll_batch, normalize_by_mean_depth
 from posetail.posetail.tracker import Tracker
@@ -1069,6 +1069,19 @@ def test_epoch(config, model, dataloader, loss = None,
                 cube_scale = cube_scale,
                 prefix = prefix,
             ))
+            # Per-camera direct-head error split into along-ray (depth) vs in-plane,
+            # in world units, per dataset. Exposes the depth-axis failure that mte
+            # (fused) and the softmax CE hide. nan (averaged nan-safe below) for
+            # non-grid / single-cam batches with no rays_c.
+            metrics_dict.update(get_direct_depth_metrics(
+                pred_cams_direct = outputs.get('3d_pred_cams_direct'),
+                tri_pred = outputs.get('3d_pred_triangulate'),
+                rays_c = (outputs.get('grid') or {}).get('rays_c'),
+                coords_true = coords,
+                vis_true_cams = vis_2d,
+                prefix = prefix,
+                cgroup = cgroup,
+            ))
             metric_dicts.append(metrics_dict)
             metric_datasets.append(batch.sample_info.get('dataset', 'unknown'))
 
@@ -1092,8 +1105,10 @@ def test_epoch(config, model, dataloader, loss = None,
     # average evaluation metrics if we evaluated
     if evaluate and metric_dicts:
 
-        # overall averages, e.g. "val/mte_avg"
-        val_dict.update(average_metrics(metric_dicts, prefix))
+        # overall averages, e.g. "val/mte_avg". nan_safe so metrics that are nan
+        # for some datasets (e.g. dir_depth_rms on 2D/single-cam batches) don't
+        # poison the summary average; non-nan metrics (mte, etc.) are unchanged.
+        val_dict.update(average_metrics(metric_dicts, prefix, nan_safe = True))
 
         # per-dataset averages in their own folder, e.g. "val_<dataset_name>/mte_avg".
         # Optionally restrict which datasets get their own folder logged via
@@ -1106,7 +1121,8 @@ def test_epoch(config, model, dataloader, loss = None,
                 continue
             dataset_dicts = [d for d, name in zip(metric_dicts, metric_datasets)
                              if name == dataset_name]
-            val_dict.update(average_metrics(dataset_dicts, prefix, name = dataset_name))
+            val_dict.update(average_metrics(dataset_dicts, prefix, name = dataset_name,
+                                            nan_safe = True))
 
     # per-dataset loss averages, e.g. "val_<dataset_name>/coords_loss_avg"
     if loss is not None and loss_dicts:
