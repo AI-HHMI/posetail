@@ -223,6 +223,18 @@ def triangulate_simple_batch_reg(points, camera_mats, weights):
     C, N, _ = points.shape
     per_point = camera_mats.ndim == 4
 
+    # Run the geometry in float64. The recentring below keeps `b` small, but the design-matrix
+    # products (c_world, MtM, Mtb) still multiply ~camera-distance-magnitude quantities (~6.5e5
+    # for far cameras like johnson-fly); under reduced-precision float32 matmul
+    # (set_float32_matmul_precision('medium'/'high'), esp. on Blackwell) those GEMMs round the
+    # signal away and the triangulation collapses (tri error ~1e4). float64 GEMMs have no
+    # bf16/TF32 tensor-core path, so they stay exact regardless of the global setting. Cost is
+    # negligible for a per-point 3x3 solve. See scripts/precision_sim.py.
+    in_dtype = points.dtype
+    points = points.to(torch.float64)
+    camera_mats = camera_mats.to(torch.float64)
+    weights = weights.to(torch.float64)
+
     # Inhomogeneous DLT (solve directly for [X,Y,Z]) rather than the homogeneous null vector
     # [X,Y,Z,W] / W. The homogeneous form divides by W, which collapses toward 0 whenever the
     # scene sits far from the world origin (W ~ 1/|coord|) or the geometry is ill-conditioned
@@ -274,7 +286,7 @@ def triangulate_simple_batch_reg(points, camera_mats, weights):
         X = torch.linalg.lstsq(MtM, Mtb.unsqueeze(-1)).solution.squeeze(-1)
 
     p3d = X + c_world                                                 # undo the recentre
-    return p3d
+    return p3d.to(in_dtype)
 
 
 
