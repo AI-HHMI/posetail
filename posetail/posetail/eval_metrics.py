@@ -3,6 +3,75 @@ import numpy as np
 from posetail.posetail.losses import get_vis_true
 
 
+def get_direct_depth_metrics(pred_cams_direct, tri_pred, rays_c, coords_true,
+                             vis_true_cams, prefix='eval/', cgroup=None):
+    '''Decompose the per-camera DIRECT-head 3D error into along-ray (depth) vs
+    in-plane components, in world units, in each camera's ray-local frame
+    (rays_c maps world -> ray-local; axis 2 = viewing ray = depth, axes 0:1 =
+    image plane). Masked by (per-camera visible) AND (finite GT).
+
+    Always returns the SAME three keys (nan when inputs are missing / not
+    applicable: non-grid mode has no rays_c, 2D batches, no per-camera direct),
+    so the per-dataset averaging never hits a missing key.
+
+    parameters:
+        pred_cams_direct: (cams, b, t, n, 3) per-camera direct world points, or None
+        tri_pred:         (b, t, n, 3) fused triangulate world point, or None (control)
+        rays_c:           (cams, 4, 4) world -> ray-local SE(3), or None
+        coords_true:      (b, t, n, 3) GT world coords
+        vis_true_cams:    (b, t, n, cams, 1) per-camera visibility, or None
+    '''
+    keys = [f'{prefix}dir_depth_rms', f'{prefix}dir_inplane_rms', f'{prefix}tri_depth_rms']
+    out = {k: float('nan') for k in keys}
+    if (pred_cams_direct is None or rays_c is None or coords_true is None
+            or coords_true.shape[-1] != 3):
+        return out
+
+    from posetail.posetail.cube import to_homogeneous, from_homogeneous, is_point_visible
+
+    with torch.no_grad():
+        rays_c = rays_c.to(torch.float32)                             # (cams,4,4)
+        n_cams = rays_c.shape[0]
+        ct = coords_true.to(torch.float32)                           # (b,t,n,3)
+        B, T, N = ct.shape[:3]
+        gt_rl = from_homogeneous(torch.einsum(
+            'cxr,btnr->cbtnx', rays_c, to_homogeneous(ct)))          # (cams,b,t,n,3)
+
+        # per-camera visibility mask: prefer supplied vis_true_cams; else derive it
+        # from the cameras exactly as the loss does (is_point_visible, margin=2);
+        # else fall back to finite-GT only. Combined with finite GT throughout.
+        finite = torch.isfinite(ct[..., 0])                          # (b,t,n)
+        if vis_true_cams is not None:
+            vc = (vis_true_cams[..., 0].to(rays_c.device) > 0.5).permute(3, 0, 1, 2)
+        elif cgroup is not None:
+            qflat = ct.reshape(-1, 3)
+            vc = torch.stack([is_point_visible(cam, qflat, margin=2) for cam in cgroup])
+            vc = vc.reshape(n_cams, B, T, N)
+        else:
+            vc = finite[None].expand(n_cams, B, T, N)
+        mask = vc & finite[None]
+        if mask.sum() == 0:
+            return out
+
+        def rms(x):
+            return float(torch.sqrt((x[mask] ** 2).mean()).item())
+
+        pw = pred_cams_direct.to(torch.float32)                       # (cams,b,t,n,3)
+        pred_rl = from_homogeneous(torch.einsum(
+            'cxr,cbtnr->cbtnx', rays_c, to_homogeneous(pw)))
+        err = pred_rl - gt_rl
+        out[f'{prefix}dir_depth_rms'] = rms(err[..., 2].abs())
+        out[f'{prefix}dir_inplane_rms'] = rms(err[..., :2].norm(dim=-1))
+
+        if tri_pred is not None:
+            tw = tri_pred.to(torch.float32)[None].expand(n_cams, *tri_pred.shape)
+            tri_rl = from_homogeneous(torch.einsum(
+                'cxr,cbtnr->cbtnx', rays_c, to_homogeneous(tw)))
+            out[f'{prefix}tri_depth_rms'] = rms((tri_rl - gt_rl)[..., 2].abs())
+
+    return out
+
+
 def _sigmoid(x):
     # vis_pred is emitted as a raw logit (noisy-OR over per-camera logits, see
     # cube.noisy_or_logit); convert to a probability so the 0.5 threshold below

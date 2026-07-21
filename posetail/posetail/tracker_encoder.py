@@ -870,17 +870,28 @@ class TrackerEncoder(nn.Module):
                     query_3d = torch.gather(points_3d_rays, dim=1, index=t_idx)  # (b, 1, n, 3)
                     query_world = repeat(query_3d, 'b 1 n r -> cams b t n r', t=T, cams=n_cams)
 
-                # convert query from world → ray-local space, then add as residual before world transform
+                # Ray-local anchor, kept only for the CE-target consumer in losses.py. It is
+                # NOT folded into p3d_cams: the world reconstruction below is anchor-relative.
                 query_local = from_homogeneous(
                     einsum(rays_c, to_homogeneous(query_world),
                            'cams x r, cams b t n r -> cams b t n x')
                 )
-                p3d_cams = p3d_cams + query_local
 
-        points_3d_all_direct = from_homogeneous(
-            einsum(rays_c_inv, to_homogeneous(p3d_cams),
-                   'cams x r, cams b t n r -> cams b t n x')
-        )
+        if add_residual:
+            # Anchor-relative reconstruction (numerically robust):
+            #   world = query_world + R_{ray->world} @ residual
+            # is exactly  rays_c_inv @ (residual + rays_c @ query_world)  but never forms the
+            # absolute ray-local coordinate (~camera distance; ~6.5e5 for far cameras such as
+            # johnson-fly), whose magnitude annihilates the ~pixel-scale residual under
+            # reduced-precision matmul (TF32/bf16). See scripts/precision_sim.py.
+            points_3d_all_direct = query_world + einsum(
+                rays_c_inv[..., :3, :3], p3d_cams,
+                'cams i j, cams b t n j -> cams b t n i')
+        else:
+            points_3d_all_direct = from_homogeneous(
+                einsum(rays_c_inv, to_homogeneous(p3d_cams),
+                       'cams x r, cams b t n r -> cams b t n x')
+            )
         
         points_3d_direct = einsum(points_3d_all_direct, conf_3d,
                                   'cams b t n r, cams b t n -> b t n r')
