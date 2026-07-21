@@ -102,14 +102,15 @@ def parse_args():
 def run(config_path, fabric):
 
     # mp.set_start_method('spawn', force = True)
-    # 'highest' (true fp32) — NOT 'medium'/'high'. The gridresid geometry manipulates
-    # ray-local coordinates whose magnitude is the camera-to-scene distance (~6.5e5 for
-    # far-camera datasets like johnson-fly); reduced-precision matmul (bf16/TF32) rounds
-    # away the ~pixel-scale motion signal and the 3D reconstruction collapses. This bites
-    # harder on Blackwell (bf16-emulated fp32) than Hopper. The anchor-relative
-    # reconstruction (tracker_encoder) removes most of the fragility, but keep fp32 matmul
-    # for the remaining large-magnitude geometry (triangulation/reprojection).
-    torch.set_float32_matmul_precision('highest')
+    # 'medium' is safe now that the far-camera geometry is precision-robust: the direct head
+    # reconstructs anchor-relative (tracker_encoder) and triangulation runs in float64
+    # (cube.triangulate_simple_batch_reg), so neither carries the ~6.5e5 camera-distance
+    # magnitude through a reduced-precision matmul. Previously 'medium'/'high' (bf16/TF32,
+    # esp. on Blackwell) rounded away the pixel-scale signal and the 3D reconstruction
+    # collapsed on far-camera datasets like johnson-fly. Set 'highest' if a far-camera run
+    # ever looks off. (The rays head separately mispredicts absolute ~6.5e5 depth for far
+    # cameras under ANY precision — a pre-existing modeling issue, not matmul precision.)
+    torch.set_float32_matmul_precision('medium')
 
     config = load_config(config_path)
     seed = fabric.broadcast(resolve_seed(config.training.seed), src=0)
