@@ -348,7 +348,9 @@ class TrackerEncoder(nn.Module):
         scene_center = None
         scene_radius = None
         if self.metric_ray_translation:
-            centers_w = torch.stack([cam['center'] for cam in camera_group])  # (cams, 3)
+            # anchor per-camera centers at frame 0 for moving cams -> (cams, 3)
+            centers_w = torch.stack([cam['center'][0] if cam['center'].ndim == 2
+                                     else cam['center'] for cam in camera_group])  # (cams, 3)
             if R == 3:
                 scene_center = torch.nanmean(coords.to(torch.float32), dim=1)  # (B, 3)
                 dist = (centers_w[:, None, :] - scene_center[None, :, :]).norm(dim=-1)  # (cams, B)
@@ -653,22 +655,30 @@ class TrackerEncoder(nn.Module):
         query_embeds = rearrange(query_embeds, 'b (t n) cams d -> b t n cams d', t=T, n=N)
 
         if R == 3:
-            p2d_query = project_points_torch(camera_group, query_coords) # [cams, b, (t n), 2]
-            p2d_query = rearrange(p2d_query, 'cams b (t n) r -> cams b t n r', t=T, n=N)
+            # project the (constant) query anchor into each frame's camera; keep time at
+            # axis -3 (b,t,n,3) so per-frame extrinsics align in project_cam (identical
+            # values to the old (b,(t n)) flatten for static cameras).
+            qc_btn = rearrange(query_coords, 'b (t n) r -> b t n r', t=T, n=N)
+            p2d_query = project_points_torch(camera_group, qc_btn)  # (cams, b, t, n, 2)
         else:
             p2d_query = rearrange(query_coords, 'b (t n) r -> 1 b t n r', t=T, n=N)
 
         query_rays_per_cam = []
         for i in range(len(camera_group)):
+            cam_i = camera_group[i]
+            # moving cam: per-ray extrinsic = each ray's frame's ext, repeated over the n
+            # points (ray order is (t n)); static cam: ext=None -> cam['ext'] broadcast.
+            ext_pr = (repeat(cam_i['ext'], 't i j -> (t n) i j', n=N)
+                      if cam_i['ext'].ndim == 3 else None)
             rays_per_b = []
             for b in range(B):
                 p2d_ib = rearrange(p2d_query[i, b], 't n r -> (t n) r')
                 if self.metric_ray_translation:
                     rays_per_b.append(points_to_rays(
-                        camera_group[i], p2d_ib, cube_scale_shared[b],
-                        scene_center=scene_center[b], scene_radius=scene_radius[b]))
+                        cam_i, p2d_ib, cube_scale_shared[b],
+                        scene_center=scene_center[b], scene_radius=scene_radius[b], ext=ext_pr))
                 else:
-                    rays_per_b.append(points_to_rays(camera_group[i], p2d_ib, cube_scale_shared[b]))
+                    rays_per_b.append(points_to_rays(cam_i, p2d_ib, cube_scale_shared[b], ext=ext_pr))
             query_rays_per_cam.append(torch.stack(rays_per_b, dim=0))  # (B, T*N, 4, 4)
         query_rays_flat = torch.stack(query_rays_per_cam, dim=0)  # (cams, B, T*N, 4, 4)
         query_rays = rearrange(query_rays_flat, 'cams b (t n) d e -> b t n cams d e', t=T, n=N)
@@ -737,7 +747,8 @@ class TrackerEncoder(nn.Module):
             # 1D affine (scale_d, offset_d) from the KNOWN query depths (||q - center||) and
             # map to metric -> replaces cube_scale [* f_eff] (self-calibrating, ortho-safe).
             d_g = depth_pred[..., 0].float()                               # (cams,b,t,n)
-            centers_d = torch.stack([cam['center'] for cam in camera_group]).float()  # (cams,3)
+            centers_d = torch.stack([cam['center'][0] if cam['center'].ndim == 2
+                                     else cam['center'] for cam in camera_group]).float()  # (cams,3)
             qw_d = repeat(coords.float(), 'b n r -> cams b n r', cams=n_cams)          # (cams,b,n,3)
             depth_known = torch.linalg.norm(
                 qw_d - rearrange(centers_d, 'cams r -> cams 1 1 r'), dim=-1)           # (cams,b,n)
@@ -785,12 +796,20 @@ class TrackerEncoder(nn.Module):
 
         # # get 3d points from each cameras using rays
         rays_norm = to_homogeneous(points_und)
-        rot_mats = torch.stack([cam['ext'][:3,:3] for cam in camera_group])
-        rays_world = einsum(rays_norm, rot_mats, 'cams b t n r, cams r x -> cams b t n x')
+        # rot_mats: (cams,3,3) static or (cams,T,3,3) per-frame; the world-ray einsum
+        # gains a t axis in the per-frame case. (R^T applied to normalized rays = c2w.)
+        rot_mats = torch.stack([cam['ext'][..., :3, :3] for cam in camera_group])
+        if rot_mats.ndim == 4:   # per-frame (cams,T,3,3)
+            rays_world = torch.einsum('cbtnr,ctrx->cbtnx', rays_norm, rot_mats)
+        else:
+            rays_world = torch.einsum('cbtnr,crx->cbtnx', rays_norm, rot_mats)
         rays_world = F.normalize(rays_world, dim=-1)
 
         centers = torch.stack([cam['center'] for cam in camera_group])
-        cadd = repeat(centers, 'cams r -> cams 1 1 1 r')
+        if centers.ndim == 3:    # per-frame (cams,T,3)
+            cadd = rearrange(centers, 'cams t r -> cams 1 t 1 r')
+        else:
+            cadd = repeat(centers, 'cams r -> cams 1 1 1 r')
         points_3d_all_rays = cadd + einsum(rays_world, depth_pred_scaled,
                                       'cams b t n r, cams b t n -> cams b t n r')
         points_3d_rays = einsum(points_3d_all_rays, conf_pred_2d[..., 0],
@@ -803,6 +822,8 @@ class TrackerEncoder(nn.Module):
             camera_mats = torch.stack([cam['ext'] for cam in camera_group])
             weights = rearrange(conf_pred_2d, 'cams b t n 1 -> cams (b t n)')
             points_und_flat = torch.clip(points_und_flat, -2, 2)
+            if camera_mats.ndim == 4:  # moving (cams,T,4,4) -> per-point: each pt's frame's ext
+                camera_mats = repeat(camera_mats, 'cams t i j -> cams (b t n) i j', b=B, n=N)
             # Regularized eigendecomposition variant: numerically stable gradients (vs the SVD
             # version, whose grads spike on near-degenerate geometry) -> lets the triangulation
             # supervision be enabled.
@@ -817,7 +838,11 @@ class TrackerEncoder(nn.Module):
         # direct residual predictions
         center = torch.tensor([self.image_size // 2, self.image_size//2],
                               device=device, dtype=torch.float32).reshape(1, 2)
-        rays_c = torch.stack([points_to_rays(cam, center, normalize_t=False)[0] for cam in camera_group])
+        # ray-local gauge frame: anchor at frame 0 for moving cams (a stable per-clip frame).
+        rays_c = torch.stack([
+            points_to_rays(cam, center, normalize_t=False,
+                           ext=(cam['ext'][0] if cam['ext'].ndim == 3 else None))[0]
+            for cam in camera_group])
         rays_c_inv = _invert_SE3(rays_c)  # [cams, 4, 4], ray-local → world
         
         add_residual = (self.output_mode in ('residual', 'gridresid')) or \

@@ -7,8 +7,8 @@ mode = 'online' # 'online', 'offline', 'disabled'
 # batch_size=1 REQUIRED for mixed 2D+3D (2D loss assumes B=cams=1). Multi-GPU: --strategy ddp.
 batch_size = 1
 num_workers = 12
-prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3'
-# prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v3'
+# prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3'
+prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v4'
 
 [dataset.train]
 split_dir = 'train'
@@ -33,8 +33,8 @@ crop_3d_enabled = true
 crop_3d_fraction = [0.05, 0.75]
 crop_3d_prob = 0.4
 
-[dataset.train.dataset_weights]
-kubric-multiview = 3.0
+# [dataset.train.dataset_weights]
+# kubric-multiview = 3.0
 
 [dataset.train.curriculum]
 enabled = false
@@ -157,13 +157,13 @@ seed = 0
 
 finetune = true
 # pretraining
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260710_151739-dqbgdtkx/files/checkpoints/checkpoint_00799996.pth'
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260710_151739-dqbgdtkx/files/checkpoints/checkpoint_00799996.pth'
 
 # finetuned 1
-# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260703_110311-8e2g5hfu/files/checkpoints/checkpoint_00860328.pth'
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260712_124515-t8ulpbro/files/checkpoints/checkpoint_01187840.pth'
 
 # finetuned 2
-# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260705_134039-1d1r24ff/files/checkpoints/checkpoint_02058240.pth'
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260716_220801-066k6c9u/files/checkpoints/checkpoint_01177600.pth'
 
 
 

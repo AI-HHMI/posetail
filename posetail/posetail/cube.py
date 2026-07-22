@@ -88,7 +88,12 @@ def project_cam(cam, p3d_t, downsample_factor = 1, max_normalized = 3.0):
     dist = cam['dist']
     cam_type = cam['type'] # pinhole, fisheye # TODO: implement functionality for different camera types
 
-    p2d_proj_cam = torch.matmul(to_homogeneous(p3d_t), ext_t.T)[..., :3]
+    # ext_t is (4,4) for a static camera or (T,4,4) for a moving (per-frame) camera.
+    # transpose(-1,-2) transposes only the matrix dims (unlike .T, which reverses all
+    # axes and would corrupt a (T,4,4)); torch.matmul then broadcasts: a static ext
+    # applies to every leading dim of p3d_t, while a (T,4,4) ext aligns with a time
+    # axis that the caller must place at position -3 of p3d_t (i.e. p3d_t is (...,T,N,3)).
+    p2d_proj_cam = torch.matmul(to_homogeneous(p3d_t), ext_t.transpose(-1, -2))[..., :3]
     # Clamp the projective depth magnitude (sign-preserving) before the perspective division so
     # its gradient stays bounded; near-zero predicted depth otherwise spikes reprojection grads
     # (the reason rays_reproj was disabled). Only affects degenerate near-camera points -> valid
@@ -208,12 +213,15 @@ def triangulate_simple_batch_reg(points, camera_mats, weights):
     '''
     Inputs:
         points: [C, N, 2] 2d points to triangulate
-        camera_mats: [C, 4, 4] camera extrinsics
+        camera_mats: [C, 4, 4] shared extrinsic per camera, OR [C, N, 4, 4] per-point
+            (moving cameras: one extrinsic per (camera, point), so each point is
+            triangulated with its own frame's cameras)
         weights: [C, N] weight for each camera
     Outputs:
         p3d: [N, 3] triangulated 3d point
     '''
     C, N, _ = points.shape
+    per_point = camera_mats.ndim == 4
 
     # Inhomogeneous DLT (solve directly for [X,Y,Z]) rather than the homogeneous null vector
     # [X,Y,Z,W] / W. The homogeneous form divides by W, which collapses toward 0 whenever the
@@ -225,16 +233,23 @@ def triangulate_simple_batch_reg(points, camera_mats, weights):
     # origin-independent, and ill-conditioned depth stays bounded by the eps regularization
     # instead of exploding. We still recentre on the camera centroid first (constant w.r.t. the
     # 2D inputs -> gradient-safe) to keep `b` small for float32.
-    R_ext = camera_mats[:, :3, :3]
-    t_ext = camera_mats[:, :3, 3]
-    c_world = (-torch.einsum('cji,cj->ci', R_ext, t_ext)).mean(0)     # camera centroid = mean(-R^T t)
+    R_ext = camera_mats[..., :3, :3]        # (C,3,3) or (C,N,3,3)
+    t_ext = camera_mats[..., :3, 3]         # (C,3)   or (C,N,3)
+    # camera centre = -R^T t; recentre the world origin on the centroid (constant w.r.t.
+    # the 2D inputs -> gradient-safe). Per-point cameras -> per-point centroid c_world.
+    c_cen = -torch.einsum('...ji,...j->...i', R_ext, t_ext)          # (C,3) or (C,N,3)
+    c_world = c_cen.mean(0)                                          # (3,) or (N,3)
     cm = camera_mats.clone()
-    cm[:, :3, 3] = t_ext + torch.einsum('cij,j->ci', R_ext, c_world)  # shift world origin to centroid
+    if per_point:
+        cm[..., :3, 3] = t_ext + torch.einsum('cnij,nj->cni', R_ext, c_world)
+        P0, P1, P2 = cm[:, :, 0, :], cm[:, :, 1, :], cm[:, :, 2, :]  # (C,N,4)
+    else:
+        cm[:, :3, 3] = t_ext + torch.einsum('cij,j->ci', R_ext, c_world)  # shift world origin to centroid
+        P0, P1, P2 = cm[:, None, 0, :], cm[:, None, 1, :], cm[:, None, 2, :]  # (C,1,4)
 
     # Each (camera, point) contributes two rows linear in X=[X,Y,Z]:
     #   (x*row2 - row0)[:3] . X = -(x*row2 - row0)[3]   (and likewise y with row1).
     x = points[..., 0:1]; y = points[..., 1:2]                       # (C,N,1)
-    P0 = cm[:, None, 0, :]; P1 = cm[:, None, 1, :]; P2 = cm[:, None, 2, :]   # (C,1,4)
     ax = x * P2 - P0                                                  # (C,N,4)
     ay = y * P2 - P1
     w = weights[..., None]                                            # (C,N,1)
@@ -293,13 +308,35 @@ def undistort_points(cam, points):
     return torch.stack([x, y], dim=1).reshape(shape)
 
 
+def _static_cam(cam, t=0):
+    """Return a camera dict with a single static extrinsic.
+
+    If `cam` is moving (ext is (T,4,4)), slice frame `t` of ext/ext_inv/center;
+    otherwise return it unchanged. Used by the scale/sensitivity helpers below,
+    whose (cams, B) output is inherently per-camera (not per-frame) — under the
+    per-window cube_scale policy the model passes one representative frame.
+    """
+    if not torch.is_tensor(cam.get('ext')) or cam['ext'].ndim != 3:
+        return cam
+    out = dict(cam)
+    out['ext'] = cam['ext'][t]
+    if torch.is_tensor(cam.get('ext_inv')) and cam['ext_inv'].ndim == 3:
+        out['ext_inv'] = cam['ext_inv'][t]
+    if torch.is_tensor(cam.get('center')) and cam['center'].ndim == 2:
+        out['center'] = cam['center'][t]
+    out['moving'] = False
+    return out
+
+
 def projection_sensitivity(cam, p):
     p = p.float()
     n_points = p.shape[0]
     fx = cam['mat'][0,0]
     fy = cam['mat'][1,1]
     ext_t = cam['ext'].float()
-    
+    if ext_t.ndim == 3:      # moving cam: use a representative (frame-0) pose
+        ext_t = ext_t[0]
+
     p_cam = torch.matmul(to_homogeneous(p), ext_t.T)[:, :3]
     depth = p_cam[:,2]
     # print("depth min:", depth.min())
@@ -328,17 +365,17 @@ def is_point_visible(cam, p3d, margin=0):
     p2d = project_cam(cam, p3d)
     w, h = cam['size']
 
-    # check if in bounds
+    # index with ... so this works for flat (M,3) points and per-frame (...,T,N,3)
     in_bounds = (
-        (p2d[:, 0] >= margin) & 
-        (p2d[:, 0] < w - margin) &
-        (p2d[:, 1] >= margin) & 
-        (p2d[:, 1] < h - margin)
+        (p2d[..., 0] >= margin) &
+        (p2d[..., 0] < w - margin) &
+        (p2d[..., 1] >= margin) &
+        (p2d[..., 1] < h - margin)
     )
 
-    # check if point is in front of camera
-    p_cam = torch.matmul(to_homogeneous(p3d), cam['ext'].T)[:, :3]
-    in_front = p_cam[:, 2] > 0
+    # check if point is in front of camera (transpose(-1,-2) supports (4,4) and (T,4,4))
+    p_cam = torch.matmul(to_homogeneous(p3d), cam['ext'].transpose(-1, -2))[..., :3]
+    in_front = p_cam[..., 2] > 0
 
     return in_bounds & in_front
 
@@ -364,6 +401,7 @@ def get_camera_scale(camera_group, p):
     sensitivity = p.new_full((n_cams, B), float('nan'))
 
     for ci, cam in enumerate(camera_group):
+        cam = _static_cam(cam)  # per-camera scale uses one representative frame
         for b in range(B):
             visible = is_point_visible(cam, p[b])
             if torch.sum(visible) > 0:
@@ -580,7 +618,7 @@ def _invert_SE3(transforms: torch.Tensor) -> torch.Tensor:
 
 
 def points_to_rays(cam, p2d, cube_scale=1, normalize_t=True,
-                   scene_center=None, scene_radius=None):
+                   scene_center=None, scene_radius=None, ext=None):
     """Inputs:
     cam: camera dict
     p2d: [B, 2]
@@ -602,32 +640,35 @@ def points_to_rays(cam, p2d, cube_scale=1, normalize_t=True,
     d_cam = to_homogeneous(p2d_und)               # [B, 3]
     d_cam = F.normalize(d_cam, dim=-1, eps=1e-8)
 
-    # Camera-to-world rotation and translation from ext
-    ext = cam['ext'].clone()                              # [4, 4] world-to-camera
-    R_c2w = ext[:3, :3].T # [3, 3], transpose = invert rotation
+    # world->camera extrinsic per ray. `ext` overrides cam['ext'] and may be (4,4)
+    # [shared across rays, broadcast] or (B,4,4) [one per ray] for moving cameras, where
+    # the caller supplies each ray's frame's extrinsic. Broadcasting a single (4,4) to
+    # (B,4,4) makes the rest uniformly per-ray and identical to the old static path.
+    ext_b = (cam['ext'] if ext is None else ext).to(device=device, dtype=dtype)
+    if ext_b.ndim == 2:
+        ext_b = ext_b[None].expand(B, 4, 4)
+    R_c2w = ext_b[:, :3, :3].transpose(-1, -2)           # [B,3,3] camera-to-world rotation
+    t_ext = ext_b[:, :3, 3]                              # [B,3]
+    center = -torch.einsum('bij,bj->bi', R_c2w, t_ext)   # [B,3] world camera center per ray
     if normalize_t:
         if scene_center is not None:
             # Metric mode: world camera center recentered to the scene centroid and
             # divided by a shared metric radius -> origin- and focal-invariant, O(1).
-            center = -einsum(R_c2w, ext[:3, 3], 'i j, j -> i')   # world camera center
             if not torch.is_tensor(scene_radius):
                 scene_radius = torch.tensor(scene_radius, device=device, dtype=dtype)
-            t_c2w = (center - scene_center) / scene_radius.clamp_min(1e-6)
+            origin = (center - scene_center) / scene_radius.clamp_min(1e-6)
         else:
-            t_c2w = -einsum(R_c2w, ext[:3, 3] / cube_scale / 200.0, 'i j, j -> i')
+            origin = -torch.einsum('bij,bj->bi', R_c2w, t_ext / cube_scale / 200.0)
     else:
-        t_c2w = -einsum(R_c2w, ext[:3, 3], 'i j, j -> i')
+        origin = center
 
 
-    # Ray directions in world space
-    d_world = einsum(R_c2w, d_cam, 'i j, b j -> b i')
+    # Ray directions in world space (R_c2w is (B,3,3), d_cam (B,3))
+    d_world = torch.einsum('bij,bj->bi', R_c2w, d_cam)
     d_world = F.normalize(d_world, dim=-1, eps=1e-8)  # [B, 3]
 
-    # Camera origin broadcast to all rays
-    origin = repeat(t_c2w, 'c -> b c', b=B)      # [B, 3]
-
-    # Camera y-axis (column 1 of R_c2w) broadcast to all rays
-    cam_y = repeat(R_c2w[:, 1], 'c -> b c', b=B) # [B, 3]
+    # origin is already per-ray (B,3); camera y-axis = column 1 of R_c2w, per ray
+    cam_y = R_c2w[:, :, 1]                        # [B, 3]
 
     # Orthonormal ray-local frame: z=ray, x=cam_y×z, y=z×x
     z_ray = d_world
@@ -638,7 +679,7 @@ def points_to_rays(cam, p2d, cube_scale=1, normalize_t=True,
     R_w2r = torch.stack([x_ray, y_ray, z_ray], dim=1)  # [B, 3, 3]
 
     # world-to-ray translation
-    t_w2r = -einsum(R_w2r, origin, 'b i j, b j -> b i')  # [B, 3]
+    t_w2r = -torch.einsum('bij,bj->bi', R_w2r, origin)  # [B, 3]
 
     # Assemble 4x4 matrices
     ray_matrices = torch.zeros(B, 4, 4, device=device, dtype=dtype)

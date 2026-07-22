@@ -4,8 +4,8 @@ from posetail.posetail.losses import get_vis_true
 
 
 def _sigmoid(x):
-    # vis_pred is emitted as a raw logit (max over per-camera logits, see
-    # tracker_tapnext.py); convert to a probability so the 0.5 threshold below
+    # vis_pred is emitted as a raw logit (noisy-OR over per-camera logits, see
+    # cube.noisy_or_logit); convert to a probability so the 0.5 threshold below
     # matches the decision boundary the BCE-with-logits vis loss optimizes toward.
     return 1.0 / (1.0 + np.exp(-x))
 
@@ -13,7 +13,8 @@ def get_eval_metrics(vis_pred, vis_true, coords_pred,
                      coords_true, thresholds = None,
                      survival_threshold = 50, prefix = 'eval/',
                      cube_scale = None, delta_x_multiplier = 1.0,
-                     query_times = None):
+                     query_times = None, vis_pred_2d = None,
+                     vis_true_cams = None):
 
     # cube_scale: optional (B,) world-units-per-pixel (median over cameras). When given, the
     # delta_x thresholds become k * cube_scale * delta_x_multiplier world units, i.e. delta_x_k
@@ -34,24 +35,25 @@ def get_eval_metrics(vis_pred, vis_true, coords_pred,
     coords_pred = coords_pred.detach().cpu().to(torch.float32).numpy()
     coords_true = coords_true.detach().cpu().to(torch.float32).numpy()
 
-    # Effective visibility for the position metrics (MTE/MPJPE/delta_x/survival/jaccard):
-    # a frame counts only if the GT is finite AND (query_first) at/after the point's query
-    # time. This drops invalid GT (e.g. cleaned (0,0,-1)->NaN placeholders) and pre-query
-    # frames, matching the mvtracker convention. occlusion_acc keeps the raw vis_true.
-    finite = np.isfinite(coords_true).all(axis=-1, keepdims=True)     # B,T,N,1
-    vis_eff = vis_true & finite
+    # `valid` = frames that count at all: GT is finite AND (query_first) at/after the point's
+    # query time. This drops invalid GT (e.g. cleaned (0,0,-1)->NaN placeholders) and pre-query
+    # frames, matching the mvtracker convention. Occlusion accuracy is masked by `valid` (both
+    # visible AND occluded valid frames count); the position metrics additionally require the
+    # point to be VISIBLE, so they use vis_eff = valid & vis_true.
+    valid = np.isfinite(coords_true).all(axis=-1, keepdims=True)      # B,T,N,1
     if query_times is not None:
         if isinstance(query_times, torch.Tensor):
             query_times = query_times.detach().cpu().numpy()
         qt = np.asarray(query_times)                                  # (N,) or (B,N)
-        B, T, N = vis_eff.shape[0], vis_eff.shape[1], vis_eff.shape[2]
+        B, T, N = valid.shape[0], valid.shape[1], valid.shape[2]
         qt = np.broadcast_to(qt.reshape(-1, N) if qt.ndim > 1 else qt.reshape(1, N), (B, N))
         at_or_after = np.arange(T)[None, :, None] >= qt[:, None, :]    # B,T,N
-        vis_eff = vis_eff & at_or_after[..., None]
+        valid = valid & at_or_after[..., None]
+    vis_eff = vis_true & valid
 
     mte = get_mte(coords_pred, coords_true, vis_eff)
 
-    occlusion_acc = get_occlusion_accuracy(vis_pred, vis_true)
+    occlusion_acc = get_occlusion_accuracy(vis_pred, vis_true, mask=valid)
 
     mpjpe = get_mpjpe(coords_pred, coords_true, vis_pred, vis_eff)
 
@@ -66,12 +68,19 @@ def get_eval_metrics(vis_pred, vis_true, coords_pred,
         coords_true, vis_pred, vis_eff, thresholds=thresholds,
         cube_scale=cube_scale, multiplier=delta_x_multiplier)
 
-    metrics = {f'{prefix}mte': mte, 
-               f'{prefix}delta_x_avg': delta_x_avg, 
+    metrics = {f'{prefix}mte': mte,
+               f'{prefix}delta_x_avg': delta_x_avg,
                f'{prefix}occlusion_acc': occlusion_acc,
                f'{prefix}avg_jaccard': avg_jaccard,
-               f'{prefix}survival_rate': survival_rate, 
+               f'{prefix}survival_rate': survival_rate,
                f'{prefix}mpjpe': mpjpe}
+
+    # Per-camera occlusion accuracy: scores the model's per-camera visibility logits
+    # (vis_pred_2d) against per-camera GT (vis_true_cams, NaN=unknown), using the same
+    # `valid` frame mask. Only computed when the caller supplies both tensors.
+    if vis_pred_2d is not None and vis_true_cams is not None:
+        metrics[f'{prefix}occlusion_acc_percam'] = get_occlusion_accuracy_per_cam(
+            vis_pred_2d, vis_true_cams, valid=valid)
 
     # add per-threshold metrics for delta_x and avg_jaccard
     for k, v in delta_x_dict.items(): 
@@ -111,22 +120,59 @@ def get_mte(coords_pred, coords_true, vis_true):
     return float(np.mean(track_mtes))
 
 
-def get_occlusion_accuracy(vis_pred, vis_true): 
-    ''' 
+def get_occlusion_accuracy(vis_pred, vis_true, mask=None):
+    '''
     parameters:
-        vis_pred: B, T, N, 1
-        vis_true: B, T, N, 1
+        vis_pred: B, T, N, 1  (raw logit)
+        vis_true: B, T, N, 1  (bool)
+        mask:     B, T, N, 1  (bool) frames to count; None -> all frames. Note the
+                  mask must NOT be vis_true-derived (occluded frames must count too);
+                  pass the finite/at-or-after `valid` mask.
 
-    returns: 
-        occlusion_acc (float)
+    returns:
+        occlusion_acc (float; NaN if no frames are counted)
     '''
 
     occlusion_pred = _sigmoid(vis_pred) < 0.5
     occlusion_true = ~vis_true
 
-    occlusion_acc = np.mean(occlusion_pred == occlusion_true)
+    correct = (occlusion_pred == occlusion_true)
+    if mask is not None:
+        correct = correct[mask]
 
-    return occlusion_acc
+    if correct.size == 0:
+        return float('nan')
+    return float(np.mean(correct))
+
+
+def get_occlusion_accuracy_per_cam(vis_pred_2d, vis_true_cams, valid=None):
+    '''Per-camera occlusion accuracy: parallels get_occlusion_accuracy on the camera axis.
+
+    parameters:
+        vis_pred_2d:   (cams, B, T, N) raw per-camera visibility logits.
+        vis_true_cams: (B, T, N, cams) per-camera GT visibility; NaN = unknown (not counted).
+        valid:         (B, T, N, 1) bool frame mask (finite GT + at/after query); None -> all.
+
+    Predicted-occluded = sigmoid(logit) < 0.5. GT-occluded = (vis <= 0.5) where known.
+    Accuracy is over {camera, valid, known} entries. Returns NaN if none.
+    '''
+    vp = _to_np(vis_pred_2d)                                # (cams, B, T, N)
+    vt = _to_np(vis_true_cams)                              # (B, T, N, cams)
+    vt = np.moveaxis(vt, -1, 0)                             # (cams, B, T, N)
+
+    occlusion_pred = _sigmoid(vp) < 0.5                    # (cams, B, T, N)
+    known = np.isfinite(vt)                                 # NaN -> unknown, excluded
+    occlusion_true = vt <= 0.5                              # meaningful only where known
+
+    mask = known
+    if valid is not None:
+        v = _to_np(valid).astype(bool)[..., 0]             # (B, T, N)
+        mask = mask & v[None]                              # broadcast over cams
+
+    correct = (occlusion_pred == occlusion_true)[mask]
+    if correct.size == 0:
+        return float('nan')
+    return float(np.mean(correct))
 
 
 def get_delta_x(coords_pred, coords_true, vis_true, threshold,

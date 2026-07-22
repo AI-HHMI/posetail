@@ -554,33 +554,51 @@ def get_timestamp():
 
     return timestamp_fmt
 
-def format_camera(cam, offset_dict, cam_type, device):
+def format_camera(cam, offset_dict, cam_type, device, ext_override=None):
+    """Build a camera dict from an aniposelib Camera.
+
+    Static cameras (default): 'ext'/'ext_inv' are (4,4) and 'center' is (3,).
+    Moving cameras: pass ext_override of shape (T,4,4) (per-frame world->cam) and
+    'ext'/'ext_inv' become (T,4,4), 'center' becomes (T,3). Intrinsics ('mat',
+    'dist', 'size', 'offset') are time-invariant either way. A 'moving' bool records
+    which representation this dict carries so downstream code can branch cheaply.
+    """
+    if ext_override is None:
+        ext = torch.as_tensor(cam.get_extrinsics_mat(), device=device, dtype=torch.float)
+    else:
+        ext = torch.as_tensor(ext_override, device=device, dtype=torch.float)  # (T,4,4)
 
     cam_dict = {
         'name': cam.get_name(),
         'type': cam_type, # pinhole, fisheye
-        'ext': torch.as_tensor(cam.get_extrinsics_mat(), device = device, dtype = torch.float),
+        'ext': ext,
         'mat': torch.as_tensor(cam.get_camera_matrix(), device = device, dtype = torch.float),
         'dist': torch.as_tensor(cam.dist, device = device, dtype = torch.float),
-        'size': torch.as_tensor(cam.get_size(), device = device, dtype = torch.int), 
+        'size': torch.as_tensor(cam.get_size(), device = device, dtype = torch.int),
     }
 
-    if offset_dict: 
+    if offset_dict:
         offset = offset_dict[cam_dict['name']][:2]
         cam_dict['offset'] = torch.as_tensor(offset, device = device, dtype = torch.float)
     else:
         cam_dict['offset'] = torch.as_tensor([0.0, 0.0], device = device, dtype = torch.float)
 
-    cam_dict['ext_inv'] = torch.linalg.inv(cam_dict['ext'])
-        
-    R = cam_dict['ext'][:3,:3]
-    t = cam_dict['ext'][:3, 3]
-    cam_dict['center'] = -R.T @ t
-        
+    cam_dict['ext_inv'] = torch.linalg.inv(ext)  # batched over leading T if present
+
+    # center = -R^T t, per frame if ext is (T,4,4). '...ji,...j->...i' == -(R^T t).
+    R = ext[..., :3, :3]
+    t = ext[..., :3, 3]
+    cam_dict['center'] = -torch.einsum('...ji,...j->...i', R, t)
+    cam_dict['moving'] = ext.ndim == 3
+
     return cam_dict
 
-def format_camera_group(camera_group, offset_dict, cam_type, device):
-    return [format_camera(cam, offset_dict, cam_type, device)
+def format_camera_group(camera_group, offset_dict, cam_type, device, moving_ext=None):
+    """moving_ext: optional {cam_name: (T,4,4)} of per-frame extrinsics. Cameras absent
+    from the dict (or when moving_ext is None) fall back to their static extrinsic."""
+    return [format_camera(cam, offset_dict, cam_type, device,
+                          ext_override=(None if moving_ext is None
+                                        else moving_ext.get(cam.get_name())))
             for cam in camera_group.cameras]
 
 def dict_to_device(dd, device):
@@ -713,6 +731,8 @@ def train_iteration(config, model, fabric, batch,
     if evaluate and coords.shape[-1] == 3:
         if p2d is not None:
             C = cgroup[0]['center']
+            if C.ndim == 2:   # moving cam: (T,3) -> (T,1,3) to broadcast per-frame over the point axis
+                C = C[:, None, :]
             vis_for_norm = vis.to(coords.device) if vis is not None else get_vis_true(coords)
             _, pred_md = normalize_by_mean_depth(coords_pred, vis_for_norm, C)
             _, tgt_md  = normalize_by_mean_depth(coords, vis_for_norm, C)
@@ -854,6 +874,8 @@ def train_epoch(config, model, fabric, dataloader,
         if evaluate and coords.shape[-1] == 3:
             if p2d is not None:
                 C = cgroup[0]['center']
+                if C.ndim == 2:   # moving cam: (T,3) -> (T,1,3) to broadcast per-frame over the point axis
+                    C = C[:, None, :]
                 vis_for_norm = vis.to(coords.device) if vis is not None else get_vis_true(coords)
                 _, pred_md = normalize_by_mean_depth(coords_pred, vis_for_norm, C)
                 _, tgt_md  = normalize_by_mean_depth(coords, vis_for_norm, C)
@@ -1021,6 +1043,8 @@ def test_epoch(config, model, dataloader, loss = None,
         if evaluate and coords.shape[-1] == 3:
             if p2d is not None:
                 C = cgroup[0]['center']
+                if C.ndim == 2:   # moving cam: (T,3) -> (T,1,3) to broadcast per-frame over the point axis
+                    C = C[:, None, :]
                 vis_for_norm = vis.to(coords.device) if vis is not None else get_vis_true(coords)
                 _, pred_md = normalize_by_mean_depth(coords_pred, vis_for_norm, C)
                 _, tgt_md  = normalize_by_mean_depth(coords, vis_for_norm, C)

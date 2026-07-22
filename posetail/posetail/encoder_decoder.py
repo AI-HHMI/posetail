@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from posetail.posetail.networks import EmbedV2V
-from posetail.posetail.cube import is_point_visible, project_points_torch
+from posetail.posetail.cube import is_point_visible, project_points_torch, project_cam
 from posetail.posetail.cube import CameraSelfAttention
 from posetail.posetail.cube import signed_log1p, signed_expm1
 from posetail.posetail.utils import get_fourier_encoding, apply_rope_1d, get_3d_sincos_pos_embed
@@ -59,15 +59,22 @@ def sample_feature_cubes_time(feature_planes, camera_group,
     else:
         xyz = xyz_unit * cube_interval  # (total, 3)
         cube_coords = cube_centers[..., None, :] + xyz  # (B, K, total, 3)
-    cube_coords_flat = rearrange(cube_coords, 'b k total r -> (b k total) r')
-    p2d_flat = project_points_torch(
-        camera_group=camera_group, 
-        coords_3d=cube_coords_flat, 
-        downsample_factor=downsample_ratio,
-    )
-
-    p2d = rearrange(p2d_flat, 'ncams (b k total) r -> ncams b k total r',
-                    b=B, k=K)
+    if any(c['ext'].ndim == 3 for c in camera_group):
+        # moving cams: project each cube center with the camera at that query's frame
+        # (query_time), matching the feature plane gathered at query_time below.
+        p2d = torch.stack([
+            project_cam(dict(cam, ext=cam['ext'][query_time.long()]) if cam['ext'].ndim == 3 else cam,
+                        cube_coords, downsample_factor=downsample_ratio)
+            for cam in camera_group])   # (ncams, b, k, total, 2)
+    else:
+        cube_coords_flat = rearrange(cube_coords, 'b k total r -> (b k total) r')
+        p2d_flat = project_points_torch(
+            camera_group=camera_group,
+            coords_3d=cube_coords_flat,
+            downsample_factor=downsample_ratio,
+        )
+        p2d = rearrange(p2d_flat, 'ncams (b k total) r -> ncams b k total r',
+                        b=B, k=K)
 
     all_samples = []
     all_masks = []
@@ -368,7 +375,16 @@ class QueryEncoder(nn.Module):
 
         # Build p2d_full [ncams, B, T_query, 2]: projected pixel coords per camera
         if coord_dim == 3:
-            p2d_full = project_points_torch(camera_group, query_coords)
+            if any(cam['ext'].ndim == 3 for cam in camera_group):
+                # moving cams: query_coords is (b,(t n)) flattened; expose the frame axis
+                # (t) so per-frame extrinsics align, then re-flatten (static-identical).
+                T_clip = preprocessed_views[0].shape[1]
+                N_q = T_query // T_clip
+                qc_btn = rearrange(query_coords, 'b (t n) r -> b t n r', t=T_clip, n=N_q)
+                p2d_full = rearrange(project_points_torch(camera_group, qc_btn),
+                                     'cams b t n r -> cams b (t n) r')
+            else:
+                p2d_full = project_points_torch(camera_group, query_coords)
         else:
             # 2D coords are already pixel-space for the single camera
             p2d_full = rearrange(query_coords, 'b t r -> 1 b t r')
@@ -443,7 +459,8 @@ class QueryEncoder(nn.Module):
         # Depth, visibility, volume: computed for 3D; missing tokens for 2D
         if coord_dim == 3:
             # Depth
-            centers = torch.stack([cam['center'] for cam in camera_group]).to(query_coords.dtype)
+            centers = torch.stack([cam['center'][0] if cam['center'].ndim == 2
+                                   else cam['center'] for cam in camera_group]).to(query_coords.dtype)
             qc = rearrange(query_coords, 'b t r -> b t 1 r')
             cs_bnc = rearrange(cube_scale, 'cams b -> b 1 cams')
             raw_depths = torch.linalg.norm(qc - centers, dim=-1) / cs_bnc
@@ -453,11 +470,19 @@ class QueryEncoder(nn.Module):
             fourier_depth = torch.cat([dr, fourier_depth], dim=-1)
             embed_depth = self.linear_depth(fourier_depth)
 
-            # Visibility
-            qflat = rearrange(query_coords, 'b t r -> (b t) r')
-            visible = torch.stack([is_point_visible(cam, qflat, margin=2)
-                                   for cam in camera_group])
-            visible = rearrange(visible, 'ncams (b t) -> b t ncams', b=B)
+            # Visibility (per-frame for moving cams: anchor is visible in some frames only)
+            if any(cam['ext'].ndim == 3 for cam in camera_group):
+                T_clip = preprocessed_views[0].shape[1]
+                N_q = T_query // T_clip
+                qc_btn = rearrange(query_coords, 'b (t n) r -> b t n r', t=T_clip, n=N_q)
+                visible = torch.stack([is_point_visible(cam, qc_btn, margin=2)
+                                       for cam in camera_group])          # (ncams,b,t,n)
+                visible = rearrange(visible, 'ncams b t n -> b (t n) ncams')
+            else:
+                qflat = rearrange(query_coords, 'b t r -> (b t) r')
+                visible = torch.stack([is_point_visible(cam, qflat, margin=2)
+                                       for cam in camera_group])
+                visible = rearrange(visible, 'ncams (b t) -> b t ncams', b=B)
             embed_vis = self.vis_embed(visible.to(torch.int32))
 
             # Volume (optional)

@@ -393,8 +393,11 @@ class TotalLoss(nn.Module):
             coords_true_cams = repeat(coords_true, 'b t n r -> cams b t n r',
                                       cams=len(cgroup))
 
-            centers = rearrange(torch.stack([cam['center'] for cam in cgroup]),
-                                'cams r -> cams 1 1 1 r')
+            centers_stack = torch.stack([cam['center'] for cam in cgroup])  # (cams,3) or (cams,T,3)
+            if centers_stack.ndim == 3:   # moving cams: camera position at each frame
+                centers = rearrange(centers_stack, 'cams t r -> cams 1 t 1 r')
+            else:
+                centers = rearrange(centers_stack, 'cams r -> cams 1 1 1 r')
 
             depths_true = torch.linalg.norm(coords_true_cams - centers, dim=-1)[..., None]
 
@@ -402,12 +405,18 @@ class TotalLoss(nn.Module):
                 valid_vis = False
                 vis_true = get_vis_true(coords_true)
 
-                qflat = rearrange(coords_true, 'b t n r -> (b t n) r')
-                visible = torch.stack([
-                    is_point_visible(cam, qflat, margin=2)
-                    for cam in cgroup
-                ])
-                vis_true_cams = rearrange(visible, 'cams (b t n) -> cams b t n 1', b=B, t=T, n=N)
+                if any(cam['ext'].ndim == 3 for cam in cgroup):
+                    # moving cams: keep time explicit (b,t,n,3) so per-frame ext aligns
+                    visible = torch.stack([is_point_visible(cam, coords_true, margin=2)
+                                           for cam in cgroup])              # (cams,b,t,n)
+                    vis_true_cams = rearrange(visible, 'cams b t n -> cams b t n 1')
+                else:
+                    qflat = rearrange(coords_true, 'b t n r -> (b t n) r')
+                    visible = torch.stack([
+                        is_point_visible(cam, qflat, margin=2)
+                        for cam in cgroup
+                    ])
+                    vis_true_cams = rearrange(visible, 'cams (b t n) -> cams b t n 1', b=B, t=T, n=N)
 
             else:
                 valid_vis = True

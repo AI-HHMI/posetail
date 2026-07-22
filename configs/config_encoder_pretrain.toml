@@ -78,7 +78,7 @@ video_encoder_hierarchical = true
 soft_argmax_temperature_learnable = true
 
 # processing
-stride_length = 48
+stride_length = 24
 stride_overlap = 4
 unroll_windows = false
 image_size = 256

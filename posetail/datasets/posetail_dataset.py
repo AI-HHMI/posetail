@@ -155,9 +155,12 @@ def rotate_camera_image_plane_3d(cam, angle_deg):
     R_roll[0, 1] = sin_a
     R_roll[1, 0] = -sin_a
     R_roll[1, 1] = cos_a
+    # R_roll @ ext: matmul broadcasts a static (4,4) or per-frame (T,4,4) ext (the
+    # same image-plane roll applies to every frame). center = -R^T t per frame.
     cam_rot['ext'] = R_roll @ cam['ext']
     cam_rot['ext_inv'] = torch.linalg.inv(cam_rot['ext'])
-    cam_rot['center'] = -cam_rot['ext'][:3, :3].T @ cam_rot['ext'][:3, 3]
+    cam_rot['center'] = -torch.einsum('...ji,...j->...i',
+                                      cam_rot['ext'][..., :3, :3], cam_rot['ext'][..., :3, 3])
 
     # mat[:2,:2] is unchanged (stays diagonal); principal point tracks the canvas expansion
     # (tx, ty) and the crop offset (x1, y1). offset unchanged.
@@ -169,6 +172,40 @@ def rotate_camera_image_plane_3d(cam, angle_deg):
                                    device=cam['size'].device)
 
     return cam_rot, (M_2x3, (cw_i, ch_i))
+
+
+def canonicalize_world_to_reference(coords, ext_by_view, ref_idx):
+    """Rebase a moving-camera clip so one reference camera is fixed and the world moves.
+
+    Given per-frame world->cam extrinsics for V views over T frames and the 3D world
+    points, produce new world points and new per-frame extrinsics that (a) reproduce
+    every camera's 2D projection EXACTLY and (b) make the reference view's extrinsic
+    constant over time (== its frame-0 pose). For a rigid rig every other view also
+    becomes constant; for a non-rigid rig the others stay time-varying, but the
+    reference camera — and the coordinate frame the 3D targets live in — is pinned.
+
+    Math (E = world->cam extrinsic). To keep x = E_v(t) X(t) while forcing
+    E'_ref(t) = E_ref(0):
+        X'(t)   = E_ref(0)^{-1} E_ref(t) X(t)
+        E'_v(t) = E_v(t) E_ref(t)^{-1} E_ref(0)
+
+    Args:
+        coords:      (T, N, 3) world points
+        ext_by_view: (V, T, 4, 4) per-view per-frame world->cam extrinsics
+        ref_idx:     reference view index in [0, V)
+    Returns:
+        coords2 (T, N, 3), ext_by_view2 (V, T, 4, 4); ext_by_view2[ref_idx] is constant in T.
+    """
+    Er = ext_by_view[ref_idx]                          # (T,4,4)
+    Er0 = Er[0]                                         # (4,4)
+    Er_inv = torch.linalg.inv(Er)                       # (T,4,4)
+    G = torch.linalg.inv(Er0).unsqueeze(0) @ Er         # (T,4,4): X'(t)=G(t)X(t)
+    ones = torch.ones((*coords.shape[:-1], 1), dtype=coords.dtype, device=coords.device)
+    Xh = torch.cat([coords, ones], dim=-1)              # (T,N,4)
+    Xph = torch.einsum('tij,tnj->tni', G, Xh)           # (T,N,4)
+    coords2 = Xph[..., :3]                              # SE(3): homogeneous w stays 1
+    ext_by_view2 = torch.einsum('vtij,tjk,kl->vtil', ext_by_view, Er_inv, Er0)
+    return coords2, ext_by_view2
 
 
 def load_image(cam_img_path, crop_coords=None, target_size=None, rotation=None):
@@ -476,6 +513,16 @@ class PosetailDataset(Dataset):
         self.speed_thresh = config.dataset[split].get('speed_thresh', None) 
         self.prop_dynamic_kpts_to_sample = config.dataset[split].get('prop_dynamic_kpts_to_sample', 0.7)
         self.cam_thresh_for_vis = config.dataset[split].get('cam_thresh_for_vis', 1)
+        # Moving (per-frame) cameras are driven PER DATASET by the metadata.yaml flag
+        # `moving_cams: true` (read in _load_cameras; absent -> static) -- there is no global
+        # switch. The params below only control the optional fix-camera/move-world
+        # canonicalization applied to moving-cam clips: a scene counts as "static" (always
+        # canonicalized) when its mean per-frame 3D point motion is below
+        # moving_cam_static_thresh; dynamic scenes are canonicalized with prob
+        # moving_cam_aug_prob. Set thresh=0 and aug_prob=0 to load per-frame extrinsics
+        # without ever canonicalizing.
+        self.moving_cam_static_thresh = config.dataset[split].get('moving_cam_static_thresh', 1e-3)
+        self.moving_cam_aug_prob = config.dataset[split].get('moving_cam_aug_prob', 0.5)
         # Occlusion-dropout for the occlusion_embedding query term: prob of replacing a
         # sample's whole per-camera occlusion with -1 (unknown) so the network learns to
         # cope when occlusion is unknown at inference. Forced 0 for val/test (deterministic
@@ -802,21 +849,35 @@ class PosetailDataset(Dataset):
                 vis = vis.sum(dim=-1) >= self.cam_thresh_for_vis  # (time, n_kpts)
 
             # load cameras
-            cgroup, offset_dict, cam_type = self._load_cameras(row['camera_metadata_path'])
+            cgroup, offset_dict, cam_type, moving_ext = self._load_cameras(row['camera_metadata_path'])
             cgroup = cgroup.subset_cameras_names(cam_names)
-            cgroup = format_camera_group(cgroup, offset_dict, cam_type, device='cpu')
+
+            if moving_ext:  # this dataset's metadata has moving_cams: true
+                # per-frame extrinsics: slice to this clip's sampled frames (fnums), in
+                # cgroup order, then optionally rebase to a fixed reference camera.
+                sel = [c.get_name() for c in cgroup.cameras]
+                fsel = fnums.cpu().numpy()
+                ext_bv = torch.as_tensor(
+                    np.stack([moving_ext[n][fsel] for n in sel]), dtype=torch.float)  # (V,T,4,4)
+                if ext_bv.shape[1] == coords.shape[0] and self._should_canonicalize(coords):
+                    ref = int(np.random.randint(len(sel)))
+                    coords, ext_bv = canonicalize_world_to_reference(coords, ext_bv, ref)
+                moving_ext_sel = {n: ext_bv[i] for i, n in enumerate(sel)}
+                cgroup = format_camera_group(cgroup, offset_dict, cam_type, device='cpu',
+                                             moving_ext=moving_ext_sel)
+            else:
+                cgroup = format_camera_group(cgroup, offset_dict, cam_type, device='cpu')
 
             # per-camera image-plane rotation augmentation (before cropping)
             if should_augment:
                 cgroup, rotation_info = self.augment_image_rotation(cgroup)
                 if vis_2d is not None:
-                    s, n, _ = coords.shape
-                    coords_flat = rearrange(coords, 's n r -> (s n) r')
                     for cnum, cam in enumerate(cgroup):
                         if rotation_info[cnum] is None:
                             continue
-                        visible = rearrange(is_point_visible(cam, coords_flat),
-                                            '(s n) -> s n', s=s, n=n)
+                        # keep time explicit (coords is (time, n_kpts, r); time at axis -3)
+                        # so a per-frame (T,4,4) extrinsic aligns instead of being flattened
+                        visible = is_point_visible(cam, coords)   # (time, n_kpts)
                         vis_2d[:, :, cnum][~visible] = 0
                     if vis is not None:
                         per_cam = vis_2d.clone()
@@ -830,10 +891,9 @@ class PosetailDataset(Dataset):
             if vis is not None:
                 valid_mask = valid_mask & vis
             else:
-                t, n, _ = coords.shape
-                coords_flat = rearrange(coords, 't n r -> (t n) r')
-                cam_visible = torch.stack([is_point_visible(cam, coords_flat) for cam in cgroup])
-                proxy_vis = rearrange(cam_visible, 'c (t n) -> t n c', t=t, n=n).sum(dim=-1) >= self.cam_thresh_for_vis
+                # keep time explicit (axis -3) so per-frame extrinsics align
+                cam_visible = torch.stack([is_point_visible(cam, coords) for cam in cgroup])  # (c, time, n_kpts)
+                proxy_vis = rearrange(cam_visible, 'c t n -> t n c').sum(dim=-1) >= self.cam_thresh_for_vis
                 valid_mask = valid_mask & proxy_vis
 
             if self.query_anytime:
@@ -1056,8 +1116,9 @@ class PosetailDataset(Dataset):
                 k in cam_meta for k in ('intrinsic_matrices', 'extrinsic_matrices',
                                         'distortion_matrices',
                                         'camera_heights', 'camera_widths')):
-            # fully calibrated 2D metadata — use the real cameras
-            cgroup_raw, offset_dict, cam_type = self._load_cameras(metadata_path)
+            # fully calibrated 2D metadata — use the real cameras (single-camera 2D path;
+            # per-frame extrinsics not handled here)
+            cgroup_raw, offset_dict, cam_type, _moving_ext = self._load_cameras(metadata_path)
             cgroup_raw = cgroup_raw.subset_cameras_names(cam_names)
             return format_camera_group(cgroup_raw, offset_dict, cam_type, device='cpu')
 
@@ -1173,14 +1234,13 @@ class PosetailDataset(Dataset):
 
     def filter_keypoints(self, coords, vis, vis_2d, cgroup): 
 
-        # filter keypoints that are not visible from enough views 
-        s, n, _ = coords.shape
-        coords_flat = rearrange(coords, 's n r -> (s n) r')
-        all_visible = torch.stack([is_point_visible(cam, coords_flat) 
-                                    for cam in cgroup])
-        count_flat = torch.sum(all_visible, dim = 0)
-        count = rearrange(count_flat, '(s n) -> s n', s = s, n = n)
-        good = torch.all(count >= self.cam_thresh_for_vis, dim = 0)
+        # filter keypoints that are not visible from enough views.
+        # keep time explicit (coords is (time, n_kpts, r); time at axis -3) so a
+        # per-frame (T,4,4) extrinsic aligns instead of being flattened into points.
+        all_visible = torch.stack([is_point_visible(cam, coords)
+                                    for cam in cgroup])                 # (c, time, n_kpts)
+        count = torch.sum(all_visible, dim=0)                           # (time, n_kpts)
+        good = torch.all(count >= self.cam_thresh_for_vis, dim=0)       # (n_kpts,)
         coords = coords[:, good, :]
 
         # filter vis if available
@@ -1414,12 +1474,12 @@ class PosetailDataset(Dataset):
 
         for cam in cgroup:
             cam_rot = dict(cam)
+            # matmul broadcasts static (4,4) or per-frame (T,4,4) ext against rmat (4,4);
+            # center = -R^T t per frame via einsum (handles both leading shapes).
             cam_rot['ext'] = torch.matmul(cam['ext'], rmat)
             cam_rot['ext_inv'] = torch.linalg.inv(cam_rot['ext'])
-
-            R = cam_rot['ext'][:3,:3]
-            t = cam_rot['ext'][:3, 3]
-            cam_rot['center'] = -R.T @ t
+            cam_rot['center'] = -torch.einsum('...ji,...j->...i',
+                                              cam_rot['ext'][..., :3, :3], cam_rot['ext'][..., :3, 3])
 
             camera_group_rotated.append(cam_rot)
 
@@ -1551,6 +1611,20 @@ class PosetailDataset(Dataset):
     #     return scale_dict, res_dict, new_res_dict
 
 
+    def _should_canonicalize(self, coords):
+        """Whether to apply the fix-camera/move-world transform for this clip.
+
+        Static scene -> always (the only way to make moving-camera data self-consistent
+        under per-frame extrinsics). Dynamic scene -> with prob moving_cam_aug_prob
+        (augmentation; entangles real + induced motion so we don't always do it).
+        `coords` is (T, N, 3).
+        """
+        disp = torch.linalg.norm(coords[1:] - coords[:-1], dim=-1)  # (T-1, N)
+        motion = float(torch.nan_to_num(disp).mean())
+        if motion < self.moving_cam_static_thresh:
+            return True
+        return np.random.random() < self.moving_cam_aug_prob
+
     def _load_cameras(self, camera_metadata_path):
 
         cam_metadata = load_yaml(camera_metadata_path)
@@ -1574,18 +1648,42 @@ class PosetailDataset(Dataset):
 
         if all(cam_name.isdigit() for cam_name in cam_names):
             cam_names = sorted(cam_names, key = int)
-        else: 
-            cam_names = sorted(cam_names) 
+        else:
+            cam_names = sorted(cam_names)
+
+        # moving cameras: per-frame extrinsics. Intrinsics/distortion are time-invariant,
+        # so the aniposelib Camera is built from the frame-0 pose (used for intrinsics and
+        # as the static fallback); the full (T,4,4) extrinsics are returned separately.
+        moving = bool(cam_metadata.get('moving_cams', False))
+        moving_ext = {} if moving else None
 
         cams = []
 
-        for cam_name in cam_names: 
+        for cam_name in cam_names:
 
-            rvec, tvec = disassemble_extrinsics(extrinsics_dict[cam_name])
+            ext_raw = extrinsics_dict[cam_name]
+            mat_raw = intrinsics_dict[cam_name]
+            dist_raw = distortions_dict[cam_name]
+            if moving:
+                ext_full = np.asarray(ext_raw, dtype=np.float64)  # (T,4,4)
+                if ext_full.ndim != 3 or ext_full.shape[-2:] != (4, 4):
+                    raise ValueError(
+                        "moving_cams=true but extrinsics for %s have shape %s (expected (T,4,4))"
+                        % (cam_name, tuple(ext_full.shape)))
+                moving_ext[cam_name] = ext_full
+                rvec, tvec = disassemble_extrinsics(ext_full[0])
+                # intrinsics/distortion are stored per-frame too (but are time-invariant,
+                # per Step 0); collapse to frame 0 for the (static) aniposelib Camera.
+                mat_arr = np.asarray(mat_raw, dtype=np.float64)
+                mat_raw = mat_arr[0] if mat_arr.ndim == 3 else mat_arr
+                dist_arr = np.asarray(dist_raw, dtype=np.float64)
+                dist_raw = dist_arr[0] if dist_arr.ndim == 2 else dist_arr
+            else:
+                rvec, tvec = disassemble_extrinsics(ext_raw)
 
             cam = Camera(
-                matrix = intrinsics_dict[cam_name],
-                dist = distortions_dict[cam_name],
+                matrix = mat_raw,
+                dist = dist_raw,
                 rvec = rvec,
                 tvec = tvec,
                 name = cam_name)
@@ -1596,10 +1694,10 @@ class PosetailDataset(Dataset):
             # cam.resize_camera(scale_dict[cam_name])
             cams.append(cam)
 
-            # if offset_dict: 
+            # if offset_dict:
             #     offsets = offset_dict[cam_name]
             #     offset_dict[cam_name] = [offsets[0] * scale_dict[cam_name], offsets[1] * scale_dict[cam_name]]
 
         cgroup = CameraGroup(cams)
 
-        return cgroup, offset_dict, cam_type
+        return cgroup, offset_dict, cam_type, moving_ext
