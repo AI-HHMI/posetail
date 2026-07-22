@@ -33,14 +33,19 @@ classifiers = [
     'Programming Language :: Python :: 3'
 ]
 
-[project.optional-dependencies]
+# [project.optional-dependencies]
 # Backbones for the legacy Tracker network (posetail.posetail.tracker.Tracker),
 # which is no longer used by the default TrackerEncoder/ScorerEncoder path. Only
 # needed if you build the old sam2/hiera-based feature extractors.
-legacy-tracker = [
-    "sam-2 @ git+https://github.com/facebookresearch/sam2.git",
-    "hiera-transformer",
-]
+#
+# Commented out because PyPI forbids direct URL (git) dependencies in uploaded
+# distribution metadata, which would make `twine upload` fail. If you need the
+# legacy path, install sam2 manually:
+#     pip install "hiera-transformer" "sam-2 @ git+https://github.com/facebookresearch/sam2.git"
+# legacy-tracker = [
+#     "sam-2 @ git+https://github.com/facebookresearch/sam2.git",
+#     "hiera-transformer",
+# ]
 
 [tool.pixi.system-requirements]
 libc = { family = "glibc", version = "2.34" }
@@ -82,6 +87,8 @@ setuptools = "<81"
 pip = "*"
 
 [tool.pixi.feature.dev.dependencies]
+python-build = "*"
+twine = "*"
 matplotlib = "*"
 ipython = "*"
 notebook = "*"
