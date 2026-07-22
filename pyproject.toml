@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "posetail"
-version = "0.8.0"
+version = "0.1.0"
 dependencies = [
     "aniposelib>=0.7.0",
     "easydict==1.13",
