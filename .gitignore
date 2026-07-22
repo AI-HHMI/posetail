@@ -194,3 +194,5 @@ scripts/
 notebooks/
 reports/
 setup_env_vars.sh
+
+plans/
