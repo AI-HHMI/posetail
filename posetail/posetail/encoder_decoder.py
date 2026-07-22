@@ -14,19 +14,12 @@ from posetail.posetail.utils import get_fourier_encoding, apply_rope_1d, get_3d_
 
 from einops import rearrange, repeat, einsum
 
-from hub.backbones import (
+from posetail.posetail.vjepa2 import (
     vjepa2_1_vit_base_384,
     vjepa2_1_vit_large_384,
     vjepa2_1_vit_giant_384,
     vjepa2_1_vit_gigantic_384,
 )
-
-# weird hackery for vjepa
-import hub # from vjepa
-import os
-import sys
-vjepa_path = os.path.dirname(os.path.dirname(hub.__path__[0]))
-sys.path.append(vjepa_path)
 
 
 def sample_feature_cubes_time(feature_planes, camera_group,

@@ -330,13 +330,22 @@ class FeatureExtractor(nn.Module):
 
 from torchvision.ops import FeaturePyramidNetwork
 from collections import OrderedDict
-import hiera
 from einops import rearrange, reduce
 
 class HieraFeatureExtractor(nn.Module):
     def __init__(self, output_dim=128, pretrained_model='facebook/hiera_base_224.mae_in1k'):
         super().__init__()
-        
+
+        # Lazy import: hiera is only needed by the legacy Tracker path.
+        # Install via `pip install posetail[legacy-tracker]`.
+        try:
+            import hiera
+        except ImportError as e:
+            raise ImportError(
+                "HieraFeatureExtractor requires the 'hiera-transformer' package "
+                "(legacy Tracker only). Install it with: pip install posetail[legacy-tracker]"
+            ) from e
+
         self.model = hiera.Hiera.from_pretrained(pretrained_model)
 
         # Ensure all parameters require gradients
@@ -367,12 +376,20 @@ class HieraFeatureExtractor(nn.Module):
         out = self.fpn(features)
         return out[0]
 
-from sam2.sam2_image_predictor import SAM2ImagePredictor
-
 class SAM2HieraFeatureExtractor(nn.Module):
     def __init__(self, output_dim=128, pretrained_model="facebook/sam2.1-hiera-small",
                  requires_grad=False, freeze_nonlast_fpn=True):
         super().__init__()
+
+        # Lazy import: sam2 is only needed by the legacy Tracker path.
+        # Install via `pip install posetail[legacy-tracker]`.
+        try:
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+        except ImportError as e:
+            raise ImportError(
+                "SAM2HieraFeatureExtractor requires the 'sam-2' package "
+                "(legacy Tracker only). Install it with: pip install posetail[legacy-tracker]"
+            ) from e
 
         predictor = SAM2ImagePredictor.from_pretrained(pretrained_model)
         self.model = predictor.model.image_encoder.trunk
@@ -520,24 +537,12 @@ class VJEPAFeatureUpsampler(nn.Module):
         
         return outputs        
     
-from hub.backbones import (
-    vjepa2_ac_vit_giant,
-    vjepa2_vit_giant,
-    vjepa2_vit_giant_384,
-    vjepa2_vit_huge,
-    vjepa2_vit_large,
+from posetail.posetail.vjepa2 import (
     vjepa2_1_vit_base_384,
     vjepa2_1_vit_large_384,
     vjepa2_1_vit_giant_384,
     vjepa2_1_vit_gigantic_384,
 )
-
-# weird hackery for vjepa
-import hub # from vjepa
-import os
-import sys
-vjepa_path = os.path.dirname(os.path.dirname(hub.__path__[0]))
-sys.path.append(vjepa_path)
 
 class VJEPAFeatureExtractor(nn.Module):
     def __init__(self, output_dim=256, version='large',

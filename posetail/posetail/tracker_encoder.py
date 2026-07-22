@@ -15,7 +15,10 @@ from posetail.posetail.utils import PadToMultiple, PadToSize, count_parameters
 from posetail.posetail.encoder_decoder import SceneRepresentation, QueryEncoder, Decoder
 
 from torchvision import transforms
-from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+
+# ImageNet normalization stats (inlined from timm.data.constants to drop the dep).
+IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 # Time axis of each time-indexed window output, used both to stitch windows in
 # _forward_windows and (as t_axis + 1 = the point axis, since layout is always

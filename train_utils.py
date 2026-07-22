@@ -15,7 +15,6 @@ from torch.utils.data import Dataset, IterableDataset
 
 from datetime import datetime, timezone, timedelta
 from easydict import EasyDict
-# from pytorch_memlab import MemReporter, LineProfiler, profile
 
 # from posetail.datasets.datasets import Rat7mIterableDataset
 from posetail.datasets.utils import safe_make

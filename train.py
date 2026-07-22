@@ -41,8 +41,6 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from lightning.fabric import Fabric
 
-# from pytorch_memlab import MemReporter, LineProfiler, profile
-
 from posetail.datasets.posetail_dataset import PosetailDataset, custom_collate
 from posetail.posetail.losses import *
 from posetail.posetail.tracker import Tracker
