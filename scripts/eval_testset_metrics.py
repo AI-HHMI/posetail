@@ -45,7 +45,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from inference_video import load_model_from_base_folder, run_inference   # noqa: E402
+from posetail.inference.inference_utils import load_model_from_base_folder, run_inference   # noqa: E402
 from posetail.posetail.eval_metrics import get_eval_metrics              # noqa: E402
 
 DEFAULT_WANDB = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260628_134003-39yczenk'

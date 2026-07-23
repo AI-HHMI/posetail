@@ -4,7 +4,7 @@ import os
 from torch.utils.data import DataLoader
 
 from posetail.datasets.inference_dataset import PosetailInferenceDataset, custom_collate
-from inference_utils import *
+from posetail.inference.inference_utils import *
 from viz3d import *
 
 

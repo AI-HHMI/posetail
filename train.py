@@ -46,7 +46,7 @@ from posetail.posetail.losses import *
 from posetail.posetail.tracker import Tracker
 from posetail.posetail.tracker_encoder import TrackerEncoder
 from posetail.posetail.tracker_tapnext import TrackerTapNext
-from train_utils import *
+from posetail.posetail.train_utils import *
 
 from schedulefree import AdamWScheduleFree
 

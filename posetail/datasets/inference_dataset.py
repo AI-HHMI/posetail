@@ -16,7 +16,7 @@ from einops import rearrange
 
 from posetail.datasets.utils import get_dirs, load_yaml, disassemble_extrinsics, format_sample_input
 from posetail.posetail.cube import project_points_torch, is_point_visible
-from train_utils import format_camera_group, dict_to_device
+from posetail.posetail.train_utils import format_camera_group, dict_to_device
 
 
 

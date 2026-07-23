@@ -22,7 +22,7 @@ from posetail.posetail.cube import (
     to_homogeneous, from_homogeneous, project_points_torch,
 )
 from posetail.posetail.losses import normalize_by_mean_depth
-from inference_video import load_camera_group_from_metadata
+from posetail.inference.inference_utils import load_camera_group_from_metadata
 
 DATA = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3/kubric-multiview'
 IMAGE_SIZE = 256          # model input res (only used by the gridresid comparison)

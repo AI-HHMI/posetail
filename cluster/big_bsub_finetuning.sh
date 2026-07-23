@@ -7,7 +7,7 @@ export NCCL_BUFFSIZE=8388608
 export NCCL_P2P_DISABLE=0
 export NCCL_SHM_DISABLE=0
 
-source setup_env_vars.sh
+source cluster/setup_env_vars.sh
 
 d=$(date +d%dh%H)
 
@@ -29,16 +29,16 @@ d=$(date +d%dh%H)
 
 #bsub -J enf6-$d -e ~/logs/posetail/enf6-$d.err -o ~/logs/posetail/enf6-$d.out \
 #    -n 96 -q gpu_h100 -R "span[hosts=1]" -gpu "num=8" -W 96:00 \
-#    /bin/bash train_script.sh configs/config_encoder_gridresid_finetune.toml
+#    /bin/bash cluster/train_script.sh configs/config_encoder_gridresid_finetune.toml
 
 # bsub -J enm2-$d -e ~/logs/posetail/enm2-$d.err -o ~/logs/posetail/enm2-$d.out \
 #     -n 96 -q gpu_h100 -R "span[hosts=1]" -gpu "num=8" -W 168:00 \
-#     /bin/bash train_script.sh configs/config_ft_muonsf_8gpu_5.toml
+#     /bin/bash cluster/train_script.sh configs/config_ft_muonsf_8gpu_5.toml
 
 # bsub -J enm3-$d -e ~/logs/posetail/enm3-$d.err -o ~/logs/posetail/enm3-$d.out \
 #     -n 96 -q gpu_h100 -R "span[hosts=1]" -gpu "num=8" -W 168:00 \
-#     /bin/bash train_script.sh configs/config_ft_muonsf_8gpu_5b.toml
+#     /bin/bash cluster/train_script.sh configs/config_ft_muonsf_8gpu_5b.toml
 
 bsub -J enf8-$d -e ~/logs/posetail/enm8-$d.err -o ~/logs/posetail/enf8-$d.out \
     -n 96 -q gpu_h100 -R "span[hosts=1]" -gpu "num=8" -W 96:00 \
-    /bin/bash train_script.sh configs/config_encoder_finetune.toml
+    /bin/bash cluster/train_script.sh configs/config_encoder_finetune.toml

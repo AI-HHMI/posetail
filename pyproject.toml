@@ -54,11 +54,9 @@ libc = { family = "glibc", version = "2.34" }
 Repository = "https://github.com/AllenNeuralDynamics/posetail"
 
 [tool.setuptools]
-# `posetail` (now a real package via posetail/__init__.py) plus its subpackages are picked
-# up by setup.py's find_packages(). These are the top-level helper modules that live at the
-# repo root (outside the package) but are imported bare (e.g. `from train_utils import ...`,
-# `from inference_video import ...`); list them so an install exposes them too.
-py-modules = ["train_utils", "inference_video", "inference_utils"]
+# `posetail` (a real package via posetail/__init__.py) plus its subpackages — including
+# `posetail.posetail` (with train_utils) and `posetail.inference` (with inference_utils) —
+# are discovered by setup.py's find_packages(). No top-level root modules to expose anymore.
 
 
 [tool.pixi.workspace]

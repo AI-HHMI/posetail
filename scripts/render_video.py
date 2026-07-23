@@ -35,7 +35,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from inference_video import (
+from posetail.inference.inference_utils import (
     build_video_readers,
     load_camera_group_from_metadata,
 )
@@ -260,7 +260,7 @@ def main():
 
     # Override with trial path if provided (recompute video paths from the trial)
     if args.trial_path is not None:
-        from inference_video import load_trial
+        from posetail.inference.inference_utils import load_trial
         trial = load_trial(args.trial_path, start_frame=start_frame)
         metadata_path = trial['metadata_path']
         video_paths = trial['video_paths']

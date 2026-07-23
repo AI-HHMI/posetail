@@ -189,7 +189,7 @@ pixi.lock
 
 # local scratch / working dirs
 logs/
-parity_check/
+tests/
 scripts/
 notebooks/
 reports/

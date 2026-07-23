@@ -40,7 +40,7 @@ from posetail.datasets.scorer_corruption import (ScorerTripletDataset, triplet_c
                                                  seed_worker)
 from posetail.posetail.scorer_encoder import ScorerEncoder
 from posetail.posetail.losses_scorer import TripletScorerLoss
-from train_utils import (load_config, save_config, set_seeds, resolve_seed, write_json,
+from posetail.posetail.train_utils import (load_config, save_config, set_seeds, resolve_seed, write_json,
                          build_optimizer_param_groups, load_checkpoint, save_checkpoint,
                          total_to_per_gpu, dict_to_device, get_timestamp,
                          drop_nan_motion_metrics)
