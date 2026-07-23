@@ -372,6 +372,7 @@ def run_tracker_encoder_on_videos(
     query_times=None,
     motion_margin=True,
     conf_crop_thresh=0.1,
+    carry_latent=False,
 ):
     """Windowed multi-view tracking whose per-chunk crop FOLLOWS the subject.
 
@@ -456,9 +457,13 @@ def run_tracker_encoder_on_videos(
     frame_numbers_all = []
     crop_history = []
     is_first_chunk = True
-    # Latent threaded across chunks (cross-chunk carry). For windowed models, feed more
-    # than stride_length frames per forward (clip_len > model.n_frames) so the internal
-    # windowing + latent carry actually engage within each chunk.
+    # Latent threaded across chunks (cross-chunk carry), only when carry_latent=True. The
+    # carried latent is the full-N decoder latent (b,t,N,cams,D) and is reassembled to full N
+    # (immune to kpt_chunk), so on chunk 2+ it coexists on-GPU with the current window's latent
+    # -> ~2x peak. For dense point sets (tens of thousands of points) that alone can OOM, so the
+    # carry is OFF by default; cross-chunk continuity is still provided by query re-anchoring
+    # (current_queries below). With carry ON, a windowed model can also feed clip_len >
+    # model.n_frames so the internal windowing + carry engage within each chunk.
     init_latent = None
     clip_len = clip_len if clip_len is not None else model.n_frames
 
@@ -653,13 +658,24 @@ def run_tracker_encoder_on_videos(
             else:
                 occ_pred = None
 
-            # Thread the decoder latent into the next chunk so the carry spans the whole
-            # video (not just within a chunk). None for non-windowed models / single-pass.
-            init_latent = outputs.get('final_latent', None)
+            # Thread the decoder latent into the next chunk so the carry spans the whole video
+            # (not just within a chunk) -- only when carry_latent. Left None otherwise (the
+            # default) to avoid the full-N latent's ~2x peak on dense point sets; None also for
+            # non-windowed models / single-pass.
+            init_latent = outputs.get('final_latent', None) if carry_latent else None
 
             current_frame += keep_len - n_overlap
             pbar.update(keep_len - discard)
             is_first_chunk = False
+
+            # Release this chunk's GPU tensors before the next window builds its own full-N
+            # latent + grid. Chiefly the ~full-N 'final_latent' held in `outputs`: with carry
+            # off it is dead weight, and holding it across the next model() call would keep two
+            # full-N latents live and double peak memory (the OOM on dense point sets). When
+            # carrying, init_latent already holds the latent, so dropping the dict is safe.
+            del coords_pred, vis_pred, conf_pred, outputs
+            if vis_pred_2d is not None:
+                del vis_pred_2d
 
             # If we've reached or passed the end, stop
             if current_frame + n_overlap >= end_frame:
@@ -944,6 +960,11 @@ def parse_args():
     parser.add_argument('--no-motion-margin', dest='motion_margin', action='store_false', default=True,
                         help='disable the causal motion-margin crop expansion (default ON); with '
                              'this flag + --no-query-first the path is legacy-identical')
+    parser.add_argument('--carry-latent', action='store_true', default=False,
+                        help='thread the decoder latent across chunks (default OFF): the carried '
+                             'full-N latent (b,t,N,cams,D) is immune to --max-kpts chunking and '
+                             'roughly doubles peak memory on dense point sets, so it is off by '
+                             'default; query re-anchoring still provides cross-chunk continuity')
     parser.add_argument('--checkpoint', type=int, default=None,
                         help='Optional checkpoint step number; if omitted, use latest checkpoint')
     parser.add_argument('--device', type=str, default=None)
@@ -980,6 +1001,7 @@ def run_inference(
     clip_len=None,
     query_first=True,
     motion_margin=True,
+    carry_latent=False,
 ):
     """Run inference on one trial with an already-loaded model.
 
@@ -1073,6 +1095,7 @@ def run_inference(
                 occlusion_gt=subj_occlusion,
                 query_times=per_subject_query_times[subj_idx] if use_query_first else None,
                 motion_margin=motion_margin,
+                carry_latent=carry_latent,
             )
             subj_out['subject_idx'] = subj_idx
             all_subject_outputs.append(subj_out)
@@ -1146,6 +1169,7 @@ def run_inference(
             occlusion_gt=occlusion_flat,
             query_times=query_times_flat if use_query_first else None,
             motion_margin=motion_margin,
+            carry_latent=carry_latent,
         )
 
     # --- Ground-truth extraction ---
@@ -1305,6 +1329,7 @@ def main():
         clip_len=args.clip_len,
         query_first=args.query_first,
         motion_margin=args.motion_margin,
+        carry_latent=args.carry_latent,
     )
 
 

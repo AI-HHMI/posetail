@@ -67,7 +67,7 @@ device = 'cuda'
 [model]
 mode_3d = "encoder"
 
-video_encoder_version = 'large'
+video_encoder_version = 'base'
 # VJEPA backbone frozen for all of pretraining; finetuning unlocks the whole encoder.
 video_encoder_requires_grad = false
 video_encoder_hierarchical = true

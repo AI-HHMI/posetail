@@ -594,6 +594,11 @@ class TrackerEncoder(nn.Module):
                     scene_features, views_norm, coords[:, k0:k1], query_times[:, k0:k1],
                     camera_group, cube_scale, cube_scale_shared, f_eff,
                     scene_center, scene_radius, prev_latent=pl, occlusion=occ)
+                # Drop the loss-only grid tensors NOW (not at concat): they carry the huge
+                # per-point P/K grid dim and are unused at inference. Retaining them across the
+                # loop would accumulate all chunks' grids on-GPU (~full-N) and defeat chunking.
+                for _k in self._CHUNK_SKIP:
+                    r.pop(_k, None)
                 results.append(r); latents.append(lat)
             return self._concat_point_chunks(results), torch.cat(latents, dim=2)
         return self._decode_from_scene(

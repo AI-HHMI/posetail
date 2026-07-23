@@ -17,6 +17,10 @@ import os
 import subprocess
 import sys
 
+# Reduce CUDA fragmentation on dense point sets (point-odyssey, cmupanoptic) before torch is
+# imported anywhere (main() / pick_inference_caps import it lazily). Mirrors eval_testset_metrics.py.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
 import numpy as np
 import yaml
 
