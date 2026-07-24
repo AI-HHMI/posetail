@@ -9,6 +9,7 @@ Checks, in order:
   5. degenerate memory   -- a point never in frame gets the null entry, adds no new NaN
   6. gradients           -- out_proj learns at step 0; the whole encoder learns after
   6b. context selection  -- frames biased to visible; occluded cameras excluded
+  6c. memory ViT        -- small dedicated single-frame encoder; memory_prob gating
   7. kpt_chunk parity    -- chunked decode == full-N decode with memory on
 
 Run: pixi run python smoke_memory.py
@@ -20,7 +21,7 @@ from easydict import EasyDict as edict
 from posetail.posetail.tracker_encoder import TrackerEncoder
 from posetail.posetail.train_utils import sample_context_idx, frame_visibility_weight
 
-CFG = 'configs/config_encoder_finetune.toml'
+CFG = "configs/config_encoder_memory.toml"
 B, T, H, W, N = 1, 8, 256, 256, 4
 M_CTX = 3
 
@@ -60,6 +61,7 @@ def build(memory, **over):
     m['video_encoder_version'] = 'base'
     m['memory_attention'] = memory
     m['memory_num_context'] = M_CTX
+    m['memory_prob'] = 1.0
     m.update(over)
     return TrackerEncoder(**m)
 
@@ -215,6 +217,33 @@ def main():
     results.append(report('all-occluded entry falls back to the null token',
                           torch.allclose(b_none[0, 0, 1], mem.memory_encoder.null_entry,
                                          atol=1e-5)))
+
+    # ---- 6c. dedicated ViT + memory_prob ---------------------------------------------
+    print('6c. memory ViT and memory_prob')
+    vit = mem.memory_encoder.vit
+    n_vit = sum(p.numel() for p in vit.parameters())
+    n_scene = sum(p.numel() for p in mem.scene_encoder.parameters())
+    results.append(report(f'memory ViT is much smaller than the scene backbone '
+                          f'({n_vit/1e6:.1f}M vs {n_scene/1e6:.0f}M)', n_vit < n_scene / 10))
+    with torch.no_grad():
+        tok = vit(torch.randn(2, 3, 224, 320))     # non-native size -> interpolated pos-embed
+    results.append(report('ViT encodes a single frame at a non-native size',
+                          tuple(tok.shape) == (2, (224 // 16) * (320 // 16), vit.embed_dim)))
+
+    from posetail.posetail.train_utils import memory_kwargs
+    vis2d_full = torch.ones(B, T, N, len(cg), 1)
+    never = build(True, memory_prob=0.0)
+    never.train()
+    always = build(True, memory_prob=1.0)
+    always.train()
+    got_never = memory_kwargs(never, views, coords, cg, traj, None, vis2d_full, qt)
+    got_always = memory_kwargs(always, views, coords, cg, traj, None, vis2d_full, qt)
+    results.append(report('memory_prob=0 skips the bank while training', got_never == {}))
+    results.append(report('memory_prob=1 always builds the bank', 'memory_bank' in got_always))
+    never.eval()
+    results.append(report('memory_prob is ignored at eval (memory always on)',
+                          'memory_bank' in memory_kwargs(never, views, coords, cg, traj,
+                                                         None, vis2d_full, qt)))
 
     # ---- 7. kpt_chunk parity ---------------------------------------------------------
     print('7. kpt_chunk parity')

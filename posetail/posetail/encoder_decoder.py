@@ -1528,6 +1528,70 @@ class AttentionPooling(nn.Module):
         return rearrange(pooled[:, 0], '(b k) d -> b k d', b=b, k=k)
 
 
+class MemoryViTBlock(nn.Module):
+    """Standard pre-norm transformer block (self-attention + MLP)."""
+
+    def __init__(self, dim, num_heads, mlp_ratio=4.0, dropout=0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim))
+
+    def forward(self, x):
+        h = self.norm1(x)
+        x = x + self.attn(h, h, h, need_weights=False)[0]
+        return x + self.mlp(self.norm2(x))
+
+
+class MemoryViT(nn.Module):
+    """Small SINGLE-FRAME ViT that encodes memory context frames.
+
+    Deliberately independent of the V-JEPA scene backbone. That backbone is huge (the
+    'large' variant is ~305M params) and video-native: its tubelet_size=2 means a lone
+    frame has to be duplicated into a 2-frame clip, so every context frame costs as much
+    encoder work as two clip frames. Memory only needs enough appearance detail to
+    re-identify a point, so a compact image ViT (a few million params, one frame in, one
+    grid of tokens out) does the job at a small fraction of the cost.
+
+        x: [B, C, H, W]  ->  tokens [B, (H/patch)*(W/patch), embed_dim]
+    """
+
+    def __init__(self, image_size=256, patch_size=16, embed_dim=256, depth=6,
+                 num_heads=8, mlp_ratio=4.0, dropout=0.0, in_chans=3):
+        super().__init__()
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        self.image_size = image_size
+        self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size,
+                                     stride=patch_size)
+        grid = image_size // patch_size
+        self._pe_grid = (grid, grid)
+        self.pos_embed = nn.Parameter(torch.zeros(1, embed_dim, grid, grid))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        self.blocks = nn.ModuleList([
+            MemoryViTBlock(embed_dim, num_heads, mlp_ratio, dropout) for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def _pos_embed_for(self, gH, gW, dtype):
+        """Bicubically resize the learned grid so non-native input sizes still work
+        (mirrors SceneRepresentation's interpolating pos-embed)."""
+        pe = self.pos_embed.to(dtype)
+        if (gH, gW) != self._pe_grid:
+            pe = F.interpolate(pe, size=(gH, gW), mode='bicubic', align_corners=False)
+        return rearrange(pe, '1 d h w -> 1 (h w) d')
+
+    def forward(self, x):
+        x = self.patch_embed(x)                                  # [B, D, gH, gW]
+        gH, gW = x.shape[-2:]
+        x = rearrange(x, 'b d h w -> b (h w) d') + self._pos_embed_for(gH, gW, x.dtype)
+        for blk in self.blocks:
+            x = blk(x)
+        return self.norm(x)
+
+
 class MemoryEncoder(nn.Module):
     """Builds a small per-point appearance memory bank from a few CONTEXT frames.
 
@@ -1538,7 +1602,7 @@ class MemoryEncoder(nn.Module):
     (``Decoder.memory_cross_attns``) for identity / appearance history.
 
     Pipeline, per context frame m:
-      1. Encode the frame ONCE per camera with the (shared, usually frozen) scene ViT --
+      1. Encode the frame ONCE per camera with a small dedicated image ViT (MemoryViT) --
          one encode serves every point.
       2. Seed a per-point query with the existing ``QueryEncoder``, evaluated at the
          point's position *at frame m* (image patch + pixel position + depth + visibility
@@ -1556,25 +1620,31 @@ class MemoryEncoder(nn.Module):
     when every entry is invalid.
     """
 
-    def __init__(self, scene_encoder, query_encoder, dim, num_heads=8,
-                 cross_attn_dim=None, max_freq=10, dropout=0.0):
+    def __init__(self, query_encoder, dim, num_heads=8, cross_attn_dim=None,
+                 max_freq=10, dropout=0.0, image_size=256, vit_dim=256, vit_depth=6,
+                 vit_heads=8, vit_patch_size=16):
         super().__init__()
-        # Shared references -- NOT submodules we own. Assigning a module that is already a
+        # Shared reference -- NOT a submodule we own. Assigning a module that is already a
         # child of the parent model would double-register its parameters (breaking the
-        # optimizer's param grouping and the checkpoint), so hide them from nn.Module's
+        # optimizer's param grouping and the checkpoint), so hide it from nn.Module's
         # registration via object.__setattr__ and rely on the parent for ownership.
-        object.__setattr__(self, 'scene_encoder', scene_encoder)
         object.__setattr__(self, 'query_encoder', query_encoder)
 
         self.dim = dim
         self.max_freq = max_freq
         cross_attn_dim = cross_attn_dim or dim
 
+        # Dedicated small image ViT for the context frames (see MemoryViT): far cheaper
+        # than re-running the video backbone, and single-frame so there is no tubelet.
+        self.vit = MemoryViT(image_size=image_size, patch_size=vit_patch_size,
+                             embed_dim=vit_dim, depth=vit_depth, num_heads=vit_heads,
+                             dropout=dropout)
+
         # Per-point read of the context frame's ViT tokens. NOT zero-init: this is the only
         # path by which appearance enters a memory vector.
         self.read_norm_q = nn.LayerNorm(dim)
         self.read_attn = DecoupledCrossAttention(
-            latent_dim=dim, kv_dim=scene_encoder.embed_dim,
+            latent_dim=dim, kv_dim=vit_dim,
             cross_attn_dim=cross_attn_dim, num_heads=num_heads, dropout=dropout)
 
         # Cross-camera fusion (Set-Transformer PMA): permutation-invariant over a variable
@@ -1603,23 +1673,17 @@ class MemoryEncoder(nn.Module):
     def _encode_context(self, views_norm, ctx_idx):
         """ViT-encode the context frames once per (camera, context frame).
 
-        Returns [n_cams, B*M, n_tokens, encoder_dim].
-
-        NOTE the tubelet: the scene encoder consumes videos with tubelet_size=2, and
-        SceneRepresentation.forward computes its positional grid as T // tubelet_size --
-        a single frame (T=1) would give gT=0 and corrupt the pos-embed. So each context
-        frame is duplicated into a 2-frame clip, yielding gT=1 and reusing the whole
-        SceneRepresentation path (pos-embed, hierarchical levels, kv_proj/kv_norm)
-        unchanged, so memory tokens live in the same KV space the decoder already reads.
+        Returns [n_cams, B*M, n_tokens, vit_dim]. Every camera's context frames are
+        stacked into one batched ViT call, so this is n_cams forward passes total
+        regardless of how many context frames or points there are.
         """
         B, M = ctx_idx.shape
         bidx = torch.arange(B, device=ctx_idx.device)[:, None].expand(B, M)
-        clips = []
+        out = []
         for view in views_norm:                      # view: [B, T, C, H, W]
             ctx = view[bidx, ctx_idx]                # [B, M, C, H, W]
-            ctx = rearrange(ctx, 'b m c h w -> (b m) c h w')
-            clips.append(repeat(ctx, 'bm c h w -> bm t c h w', t=2))   # duplicate-to-2
-        return self.scene_encoder(clips)             # [cams, (B M), tokens, enc_dim]
+            out.append(self.vit(rearrange(ctx, 'b m c h w -> (b m) c h w')))
+        return torch.stack(out)                      # [cams, (B M), tokens, vit_dim]
 
     def forward(self, views_norm, camera_group, coords_traj, ctx_idx,
                 cube_scale, occlusion_ctx=None, visible_ctx=None):

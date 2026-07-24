@@ -692,6 +692,12 @@ def memory_kwargs(model, views, query_coords, cgroup, coords, p2d, vis_2d, query
     """
     if not getattr(model, 'memory_attention', False):
         return {}
+    # memory_prob < 1 drops the memory path on a fraction of TRAINING steps (dropout on
+    # memory: the tracker must stay accurate without it, and the average cost of the extra
+    # context encodes falls proportionally). Always on for eval/inference.
+    prob = getattr(model, 'memory_prob', 1.0)
+    if model.training and prob < 1.0 and torch.rand(()).item() >= prob:
+        return {}
     coords_traj = coords if p2d is None else p2d[:, 0]             # (b, t, n, R)
     T = coords_traj.shape[1]
     # Prefer context frames where the points are actually visible, so the bank holds real

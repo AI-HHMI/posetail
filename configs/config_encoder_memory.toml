@@ -82,8 +82,15 @@ soft_argmax_temperature_learnable = true
 # Per-point appearance memory: M context frames sampled from the clip are encoded into
 # one vector per point, which the decoder cross-attends to (identity / appearance history).
 memory_attention = true
-memory_num_context = 4
+memory_num_context = 2
 memory_context_sampling = 'random'
+# probability of using memory on a training step (dropout on the memory path)
+memory_prob = 0.4
+# the memory ViT is its own small single-frame encoder, not the video backbone
+memory_vit_dim = 256
+memory_vit_depth = 6
+memory_vit_heads = 8
+memory_vit_patch_size = 16
 
 # processing
 stride_length = 24

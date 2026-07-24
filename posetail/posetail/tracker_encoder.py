@@ -86,8 +86,13 @@ class TrackerEncoder(nn.Module):
                  scale_init = 1.0,
                  scale_delta = 2.0,
                  memory_attention = False,
-                 memory_num_context = 4,
-                 memory_context_sampling = 'random'):
+                 memory_num_context = 2,
+                 memory_context_sampling = 'random',
+                 memory_prob = 0.4,
+                 memory_vit_dim = 256,
+                 memory_vit_depth = 6,
+                 memory_vit_heads = 8,
+                 memory_vit_patch_size = 16):
         super().__init__()
 
         self.mode_3d = mode_3d
@@ -259,18 +264,26 @@ class TrackerEncoder(nn.Module):
         )
 
         # Per-point appearance memory over a few context frames sampled from the clip.
-        # Reuses the (frozen) scene encoder and the query encoder -- shared references, so
-        # no parameters are duplicated; only the read/pool/time modules are new.
+        # Uses its own small image ViT (MemoryViT) rather than the video backbone, and
+        # shares the query encoder by reference so no parameters are duplicated.
         self.memory_attention = memory_attention
         self.memory_num_context = memory_num_context
         assert memory_context_sampling in ('random', 'uniform'), \
             f"memory_context_sampling must be 'random'|'uniform', got {memory_context_sampling!r}"
         self.memory_context_sampling = memory_context_sampling
+        # Probability of building the memory bank on a given TRAINING step. Below 1 this
+        # acts like dropout on the memory path -- the model must stay accurate without
+        # memory, and the average cost of the extra context encodes drops proportionally.
+        # Always on at eval.
+        self.memory_prob = memory_prob
         if memory_attention:
             self.memory_encoder = MemoryEncoder(
-                self.scene_encoder, self.query_encoder,
+                self.query_encoder,
                 dim=latent_dim, num_heads=n_heads,
                 cross_attn_dim=cross_attn_dim, max_freq=max_freq,
+                image_size=self.image_size, vit_dim=memory_vit_dim,
+                vit_depth=memory_vit_depth, vit_heads=memory_vit_heads,
+                vit_patch_size=memory_vit_patch_size,
             )
 
     def _normalize_views(self, views, device):
