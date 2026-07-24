@@ -68,8 +68,8 @@ def parse_args():
     parser.add_argument('--max-kpts', type=int, default=None, help='Max keypoints per forward pass')
     parser.add_argument('--clip-len', type=int, default=None,
                         help='Frames fed to the model per forward (passed to inference_video). '
-                             'Defaults to model.n_frames; set > stride_length (e.g. 16) for '
-                             'windowed models so internal windowing + latent carry engage.')
+                             'Defaults to model.n_frames; the whole chunk is encoded in one '
+                             'pass.')
     parser.add_argument('--per-subject', action='store_true', default=False)
     parser.add_argument('--device', type=str, default=None)
 

@@ -73,7 +73,7 @@ video_encoder_hierarchical = true
 video_encoder_finetune_last_n_layers = 12
 
 # processing
-stride_length = 8
+stride_length = 16
 stride_overlap = 4
 unroll_windows = false
 image_size = 256

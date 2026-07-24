@@ -1088,19 +1088,6 @@ class Decoder(nn.Module):
             ])
             self.norm_ts = nn.ModuleList([AdaptiveLayerNorm(embed_dim) for _ in range(num_layers)])
 
-        # Sliding-window latent hand-off: fuse the previous window's final decoder
-        # latent (for the overlap frames) into this window's query tokens before the
-        # transformer stack. LayerNorm gives the carried latent unit scale; the Linear
-        # is zero-initialised so the hand-off is a no-op at load time -- a model
-        # warm-started from a non-windowed checkpoint behaves identically until this
-        # learns to use the carried state. No-op (and skipped) when prev_latent is None.
-        self.latent_carry = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, embed_dim),
-        )
-        nn.init.zeros_(self.latent_carry[1].weight)
-        nn.init.zeros_(self.latent_carry[1].bias)
-
         # Per-mode output heads: index 0 = 2D, index 1 = 3D.
         # In grid mode the heads emit per-axis bin logits (marginal soft-argmax):
         #   3D    -> 3*G logits,  depth -> G logits,  2D -> 2*P pixel logits.
@@ -1257,7 +1244,7 @@ class Decoder(nn.Module):
         probs = self._grid_softmax(logits)
         return (probs * grid_values.to(probs.dtype)).sum(dim=-1)
 
-    def forward(self, scene_features, query_embeds, rays, mode_idx, prev_latent=None,
+    def forward(self, scene_features, query_embeds, rays, mode_idx,
                 scene_frame_pos=None):
         """
         Args:
@@ -1265,17 +1252,13 @@ class Decoder(nn.Module):
             query_embeds: [B, T, K, N_cams, embed_dim]  T=frames, K=points
             rays: [B, T, K, N_cams, 4, 4]
             mode_idx: LongTensor of shape [1] — 0 for 2D queries, 1 for 3D queries
-            prev_latent: [B, T, K, N_cams, embed_dim] or None — the previous sliding
-                window's final decoder latent, frame-aligned to this window, fused into
-                the query tokens before the stack (sliding-window hand-off). None for the
-                first window / non-windowed pass.
             scene_frame_pos: [N_tokens] frame index (in query-frame units) of each scene
                 token, required when cross_attn_rope is on (the key positions for temporal
                 RoPE). Ignored otherwise.
         Returns:
             dict with per-head tensors [B, T, K, N_cams, ·]: 'out_3d','out_2d','out_vis',
             'out_conf','out_depth','out_conf_3d'; 'grid_logits' (dict or None); 'latent'
-            [B,T,K,N_cams,embed_dim] (carried into the next window); and 'scale_3d'/
+            [B,T,K,N_cams,embed_dim] (the per-point decoder latent); and 'scale_3d'/
             'scale_depth' [B,T,K,N_cams,1] when learnable_scale[_depth].
         """
         B, T, K, N_cams, embed_dim = query_embeds.shape
@@ -1293,12 +1276,6 @@ class Decoder(nn.Module):
                 "cross_attn_rope=True requires scene_frame_pos (scene-token frame indices)"
             q_pos = torch.arange(T, device=x.device).repeat_interleave(K)  # (T*K,)
             k_pos = scene_frame_pos.to(x.device)                           # (N_tokens,)
-
-        # Sliding-window hand-off: add the carried latent into the query tokens.
-        # Zero-init Linear -> no-op until trained (warm-start safe); see __init__.
-        if prev_latent is not None:
-            carry = rearrange(prev_latent, 'b t k cams dim -> (cams b) (t k) dim')
-            x = x + self.latent_carry(carry)
 
         for layer_idx in range(self.num_layers):
             if self.use_camera_self_attention:

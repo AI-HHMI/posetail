@@ -45,11 +45,6 @@ def parse_args():
     parser.add_argument('--no-motion-margin', dest='motion_margin', action='store_false', default=True,
                         help='disable the causal motion-margin crop expansion (default ON); with '
                              'this flag + --no-query-first the path is legacy-identical')
-    parser.add_argument('--carry-latent', action='store_true', default=False,
-                        help='thread the decoder latent across chunks (default OFF): the carried '
-                             'full-N latent (b,t,N,cams,D) is immune to --max-kpts chunking and '
-                             'roughly doubles peak memory on dense point sets, so it is off by '
-                             'default; query re-anchoring still provides cross-chunk continuity')
     parser.add_argument('--checkpoint', type=int, default=None,
                         help='Optional checkpoint step number; if omitted, use latest checkpoint')
     parser.add_argument('--device', type=str, default=None)
@@ -57,11 +52,10 @@ def parse_args():
                         help="Which 3D model output to use as the prediction "
                              "(e.g. 'coords_pred' or '3d_pred_triangulate')")
     parser.add_argument('--clip-len', type=int, default=None,
-                        help='Frames fed to the model per forward. Defaults to '
-                             'model.n_frames (= stride_length). For a windowed model set '
-                             'this > stride_length (e.g. 16) so internal windowing + the '
-                             'latent carry engage per chunk; the latent is also threaded '
-                             'across chunks.')
+                        help='Frames fed to the model per forward (the whole chunk is '
+                             'encoded in one pass). Defaults to model.n_frames '
+                             '(= stride_length); cross-chunk continuity comes from query '
+                             're-anchoring.')
     parser.add_argument('--outpath', type=str, default=None,
                         help='Optional output .npz path')
 
@@ -97,7 +91,6 @@ def main():
         clip_len=args.clip_len,
         query_first=args.query_first,
         motion_margin=args.motion_margin,
-        carry_latent=args.carry_latent,
     )
 
 
