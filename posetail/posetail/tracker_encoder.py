@@ -880,10 +880,12 @@ class TrackerEncoder(nn.Module):
 
                 # Ray-local anchor, kept only for the CE-target consumer in losses.py. It is
                 # NOT folded into p3d_cams: the world reconstruction below is anchor-relative.
+                # float64: forms ~6.5e5 ray-local anchor (far rigs) via rays_c's translation; must match the
+                # float64 guard on p_raylocal (losses.py) so the reduced-precision CE residual cancels exactly.
                 query_local = from_homogeneous(
-                    einsum(rays_c, to_homogeneous(query_world),
+                    einsum(rays_c.to(torch.float64), to_homogeneous(query_world.to(torch.float64)),
                            'cams x r, cams b t n r -> cams b t n x')
-                )
+                ).to(query_world.dtype)
 
         if add_residual:
             # Anchor-relative reconstruction (numerically robust):

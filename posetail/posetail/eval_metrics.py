@@ -30,9 +30,11 @@ def get_direct_depth_metrics(pred_cams_direct, tri_pred, rays_c, coords_true,
     from posetail.posetail.cube import to_homogeneous, from_homogeneous, is_point_visible
 
     with torch.no_grad():
-        rays_c = rays_c.to(torch.float32)                             # (cams,4,4)
+        # float64: far rigs (johnson-fly ~6.5e5 units) make these ray-local einsums form ~6.5e5 coords
+        # whose TF32 noise doesn't cancel in pred_rl-gt_rl -> spurious dir_depth_rms ~200. float64 = exact.
+        rays_c = rays_c.to(torch.float64)                            # (cams,4,4)
         n_cams = rays_c.shape[0]
-        ct = coords_true.to(torch.float32)                           # (b,t,n,3)
+        ct = coords_true.to(torch.float64)                          # (b,t,n,3)
         B, T, N = ct.shape[:3]
         gt_rl = from_homogeneous(torch.einsum(
             'cxr,btnr->cbtnx', rays_c, to_homogeneous(ct)))          # (cams,b,t,n,3)
@@ -44,7 +46,7 @@ def get_direct_depth_metrics(pred_cams_direct, tri_pred, rays_c, coords_true,
         if vis_true_cams is not None:
             vc = (vis_true_cams[..., 0].to(rays_c.device) > 0.5).permute(3, 0, 1, 2)
         elif cgroup is not None:
-            qflat = ct.reshape(-1, 3)
+            qflat = ct.reshape(-1, 3).to(torch.float32)  # visibility check runs in fp32 (extrinsics are fp32)
             vc = torch.stack([is_point_visible(cam, qflat, margin=2) for cam in cgroup])
             vc = vc.reshape(n_cams, B, T, N)
         else:
@@ -56,7 +58,7 @@ def get_direct_depth_metrics(pred_cams_direct, tri_pred, rays_c, coords_true,
         def rms(x):
             return float(torch.sqrt((x[mask] ** 2).mean()).item())
 
-        pw = pred_cams_direct.to(torch.float32)                       # (cams,b,t,n,3)
+        pw = pred_cams_direct.to(torch.float64)                       # (cams,b,t,n,3)
         pred_rl = from_homogeneous(torch.einsum(
             'cxr,cbtnr->cbtnx', rays_c, to_homogeneous(pw)))
         err = pred_rl - gt_rl
@@ -64,7 +66,7 @@ def get_direct_depth_metrics(pred_cams_direct, tri_pred, rays_c, coords_true,
         out[f'{prefix}dir_inplane_rms'] = rms(err[..., :2].norm(dim=-1))
 
         if tri_pred is not None:
-            tw = tri_pred.to(torch.float32)[None].expand(n_cams, *tri_pred.shape)
+            tw = tri_pred.to(torch.float64)[None].expand(n_cams, *tri_pred.shape)
             tri_rl = from_homogeneous(torch.einsum(
                 'cxr,cbtnr->cbtnx', rays_c, to_homogeneous(tw)))
             out[f'{prefix}tri_depth_rms'] = rms((tri_rl - gt_rl)[..., 2].abs())

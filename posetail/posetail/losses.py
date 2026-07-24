@@ -670,9 +670,13 @@ class TotalLoss(nn.Module):
                 feff = g['f_eff']                                      # (cams,) or None
                 # GT world -> ray-local (cams,b,t,n,3); divide out the metric scaling
                 # the forward multiplies back in (cube_scale [* f_eff]).
-                gt_h = to_homogeneous(coords_true.to(torch.float32))   # (b,t,n,4)
+                # float64: this einsum forms ~6.5e5 ray-local GT (far rigs) via rays_c's translation, feeding
+                # the depth/3d-softmax CE targets; reduced-precision float32 matmul corrupts them. Must match
+                # the query_local guard (tracker_encoder) so the gridresid residual cancels exactly.
+                gt_h = to_homogeneous(coords_true.to(torch.float64))   # (b,t,n,4)
                 p_raylocal = from_homogeneous(
-                    einsum(rays_c, gt_h, 'cams x r, b t n r -> cams b t n x'))
+                    einsum(rays_c.to(torch.float64), gt_h,
+                           'cams x r, b t n r -> cams b t n x')).to(torch.float32)
                 denom = rearrange(cs, 'cams b -> cams b 1 1 1')
                 denom_d = rearrange(cs, 'cams b -> cams b 1 1')
                 if feff is not None:
