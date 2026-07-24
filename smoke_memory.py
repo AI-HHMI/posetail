@@ -225,10 +225,11 @@ def main():
     n_scene = sum(p.numel() for p in mem.scene_encoder.parameters())
     results.append(report(f'memory ViT is much smaller than the scene backbone '
                           f'({n_vit/1e6:.1f}M vs {n_scene/1e6:.0f}M)', n_vit < n_scene / 10))
+    p = vit.patch_size
     with torch.no_grad():
         tok = vit(torch.randn(2, 3, 224, 320))     # non-native size -> interpolated pos-embed
-    results.append(report('ViT encodes a single frame at a non-native size',
-                          tuple(tok.shape) == (2, (224 // 16) * (320 // 16), vit.embed_dim)))
+    results.append(report(f'ViT encodes a single frame at a non-native size (patch {p})',
+                          tuple(tok.shape) == (2, (224 // p) * (320 // p), vit.embed_dim)))
 
     from posetail.posetail.train_utils import memory_kwargs
     vis2d_full = torch.ones(B, T, N, len(cg), 1)

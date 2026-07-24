@@ -90,7 +90,7 @@ memory_prob = 0.4
 memory_vit_dim = 256
 memory_vit_depth = 6
 memory_vit_heads = 8
-memory_vit_patch_size = 16
+memory_vit_patch_size = 8
 
 # processing
 stride_length = 24

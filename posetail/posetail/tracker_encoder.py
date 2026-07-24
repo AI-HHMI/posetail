@@ -92,7 +92,7 @@ class TrackerEncoder(nn.Module):
                  memory_vit_dim = 256,
                  memory_vit_depth = 6,
                  memory_vit_heads = 8,
-                 memory_vit_patch_size = 16):
+                 memory_vit_patch_size = 8):
         super().__init__()
 
         self.mode_3d = mode_3d
