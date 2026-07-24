@@ -13,6 +13,11 @@ prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-fi
 
 [dataset.train]
 split_dir = 'train'
+# memory: extra observations of the same points sampled from anywhere in the video.
+# A range means the count is drawn per sample, so the model tolerates a different
+# number of memory entries at inference than it saw in training.
+memory_num_context = [2, 8]
+memory_prob = 0.4
 n_frames = 24
 min_res = 256
 max_res = 256
@@ -82,10 +87,6 @@ soft_argmax_temperature_learnable = true
 # Per-point appearance memory: M context frames sampled from the clip are encoded into
 # one vector per point, which the decoder cross-attends to (identity / appearance history).
 memory_attention = true
-memory_num_context = 2
-memory_context_sampling = 'random'
-# probability of using memory on a training step (dropout on the memory path)
-memory_prob = 0.4
 # the memory ViT is its own small single-frame encoder, not the video backbone
 memory_vit_dim = 256
 memory_vit_depth = 6

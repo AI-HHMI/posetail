@@ -86,9 +86,6 @@ class TrackerEncoder(nn.Module):
                  scale_init = 1.0,
                  scale_delta = 2.0,
                  memory_attention = False,
-                 memory_num_context = 2,
-                 memory_context_sampling = 'random',
-                 memory_prob = 0.4,
                  memory_vit_dim = 256,
                  memory_vit_depth = 6,
                  memory_vit_heads = 8,
@@ -263,24 +260,15 @@ class TrackerEncoder(nn.Module):
             use_memory=memory_attention,
         )
 
-        # Per-point appearance memory over a few context frames sampled from the clip.
-        # Uses its own small image ViT (MemoryViT) rather than the video backbone, and
-        # shares the query encoder by reference so no parameters are duplicated.
+        # Per-point appearance memory over frames remembered from anywhere in the video.
+        # Which frames those are is decided by the data pipeline (dataset while training,
+        # the tracking loop at inference), not here -- this owns only the encoding.
         self.memory_attention = memory_attention
-        self.memory_num_context = memory_num_context
-        assert memory_context_sampling in ('random', 'uniform'), \
-            f"memory_context_sampling must be 'random'|'uniform', got {memory_context_sampling!r}"
-        self.memory_context_sampling = memory_context_sampling
-        # Probability of building the memory bank on a given TRAINING step. Below 1 this
-        # acts like dropout on the memory path -- the model must stay accurate without
-        # memory, and the average cost of the extra context encodes drops proportionally.
-        # Always on at eval.
-        self.memory_prob = memory_prob
         if memory_attention:
             self.memory_encoder = MemoryEncoder(
-                self.query_encoder,
                 dim=latent_dim, num_heads=n_heads,
                 cross_attn_dim=cross_attn_dim, max_freq=max_freq,
+                patch_size=query_patch_size,
                 image_size=self.image_size, vit_dim=memory_vit_dim,
                 vit_depth=memory_vit_depth, vit_heads=memory_vit_heads,
                 vit_patch_size=memory_vit_patch_size,
@@ -308,35 +296,23 @@ class TrackerEncoder(nn.Module):
             cube_scale = med[None, :].expand(n_cams, coords.shape[0]).contiguous()
         return cube_scale
 
-    def build_memory_bank(self, views, coords, camera_group, coords_traj, ctx_idx,
-                          occlusion_traj=None):
-        """Build the per-point memory bank for a clip -> (B, N, M, latent_dim).
+    def build_memory_bank(self, mem_views, mem_p2d, mem_valid, device=None):
+        """Encode a set of remembered observations into the bank -> (B, N, M, latent_dim).
 
-        Called by the training / inference loop (see train_utils.sample_context_idx), NOT
-        by forward(): the caller chooses the context frames, and forward() then just
-        consumes the finished bank. Handles the frame normalization and scene scale so the
-        caller can pass raw views.
+        Called by the data pipeline (dataset-fed while training, the tracking loop at
+        inference), NOT by forward(): the caller decides WHICH frames are remembered and
+        where the points are in them, and forward() then just consumes the finished bank.
+        Handles frame normalization so the caller can pass raw frames.
 
         Args:
-            views: list of [B, T, H, W, C] raw frames, one per camera (as for forward).
-            coords: [B, N, R] query positions (used only for the scene scale).
-            coords_traj: [B, T, N, R] per-frame point positions -- ground truth while
-                training, the predicted trajectory at inference.
-            ctx_idx: [B, M] frame indices of the context frames to remember.
-            occlusion_traj: [B, T, N, n_cams] per-frame occlusion state {0,1,-1} or None.
+            mem_views: list over cameras of [B, M, H, W, C] raw remembered frames.
+            mem_p2d:   [n_cams, B, M, N, 2] pixel position of each point in each frame.
+            mem_valid: [n_cams, B, M, N] bool -- point in frame AND not occluded there.
         """
         assert self.memory_attention, 'build_memory_bank requires memory_attention=True'
-        device = coords.device
-        B = coords.shape[0]
-        n_cams = len(views)
-        views_norm = self._normalize_views(views, device)
-        cube_scale = self._cube_scale(camera_group, coords, n_cams, device)
-        occ_ctx = None
-        if occlusion_traj is not None:
-            bidx = torch.arange(B, device=device)[:, None].expand_as(ctx_idx)
-            occ_ctx = occlusion_traj[bidx, ctx_idx]                 # (B, M, N, n_cams)
-        return self.memory_encoder(views_norm, camera_group, coords_traj, ctx_idx,
-                                   cube_scale, occlusion_ctx=occ_ctx)
+        device = device if device is not None else mem_p2d.device
+        views_norm = self._normalize_views(mem_views, device)
+        return self.memory_encoder(views_norm, mem_p2d.to(device), mem_valid.to(device))
 
     def unfreeze_video_encoder(self, iteration):
         """Unfreeze the video encoder once `iteration` reaches the configured

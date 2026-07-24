@@ -45,6 +45,15 @@ def parse_args():
     parser.add_argument('--no-motion-margin', dest='motion_margin', action='store_false', default=True,
                         help='disable the causal motion-margin crop expansion (default ON); with '
                              'this flag + --no-query-first the path is legacy-identical')
+    parser.add_argument('--memory-context', type=int, default=8,
+                        help='number of per-point memory slots at inference (slot 0 is the '
+                             'permanent query anchor, the rest a FIFO of recently-seen '
+                             'frames). Independent of the count used in training.')
+    parser.add_argument('--memory-score-thresh', type=float, default=0.5,
+                        help='min predicted visibility*confidence for a frame to enter '
+                             'memory; below this the existing memory is kept')
+    parser.add_argument('--no-memory', dest='use_memory', action='store_false', default=True,
+                        help='disable the memory path even on a memory-capable model')
     parser.add_argument('--checkpoint', type=int, default=None,
                         help='Optional checkpoint step number; if omitted, use latest checkpoint')
     parser.add_argument('--device', type=str, default=None)
@@ -91,6 +100,9 @@ def main():
         clip_len=args.clip_len,
         query_first=args.query_first,
         motion_margin=args.motion_margin,
+        memory_context=args.memory_context,
+        memory_score_thresh=args.memory_score_thresh,
+        use_memory=args.use_memory,
     )
 
 

@@ -607,106 +607,23 @@ def total_to_per_gpu(i, world_size):
     per_gpu = (i + world_size - 1) // world_size
     return per_gpu
     
-def frame_visibility_weight(vis_2d):
-    """Per-frame count of points visible in at least one camera -> (B, T) float.
 
-    Used to bias memory context-frame selection toward frames that actually show the
-    tracked points, so bank entries carry real appearance instead of the null token.
-    vis_2d: (b, t, n, cams, 1) float with NaN = unknown, or None.
-    """
-    if vis_2d is None:
-        return None
-    v = vis_2d[..., 0] if vis_2d.dim() == 5 else vis_2d            # (b, t, n, cams)
-    vis = torch.nan_to_num(v, nan=0.0) > 0.5
-    return vis.any(dim=-1).to(torch.float32).sum(dim=-1)           # (b, t)
+def memory_kwargs(model, batch, device):
+    """Encode this batch's remembered frames into the memory bank -> {'memory_bank': ...}.
 
-
-def sample_context_idx(model, query_times, T, random=None, weights=None):
-    """Pick the M memory context frames per batch element -> (B, M) int64.
-
-    Lives in the training loop rather than in the model so that model.forward stays a
-    pure function of its inputs (no hidden RNG): runs stay reproducible and a caller can
-    choose the context explicitly (a fixed set for eval, a streaming reservoir at
-    inference).
-
-    Slot 0 is ALWAYS the track's query frame -- the appearance anchor -- so an active
-    track always has at least one meaningful memory entry. The remaining M-1 frames are
-    drawn from the clip, PREFERRING frames where the points are actually visible
-    (`weights`, see frame_visibility_weight): a frame where nothing is visible would only
-    contribute null entries, so the bank would waste capacity on padding. Frames are
-    sampled without replacement while training (fresh context each step) and taken as the
-    highest-weight / evenly-spread set otherwise.
-
-    query_times is per-track; the batch's first track's query frame seeds the shared
-    anchor slot, which is exact in the common case where all tracks share a query frame.
-    """
-    if random is None:
-        random = model.training and getattr(model, 'memory_context_sampling', 'random') == 'random'
-    M = min(getattr(model, 'memory_num_context', 4), T)
-    query_times = query_times.to(torch.long)
-    B = query_times.shape[0]
-    device = query_times.device
-    anchor = query_times[:, 0].clamp(0, T - 1)                     # (B,)
-    if M == 1:
-        return anchor[:, None]
-    k = M - 1
-
-    if weights is None:
-        if random:
-            rest = torch.stack([torch.randperm(T, device=device)[:k] for _ in range(B)])
-        else:
-            rest = torch.linspace(0, T - 1, k, device=device).round().to(torch.long)
-            rest = rest[None].expand(B, k)
-        return torch.cat([anchor[:, None], rest], dim=1)
-
-    # Visibility-weighted choice. A small floor keeps every frame reachable (and keeps
-    # sampling well-defined when fewer than k frames have any visible point).
-    w = weights.to(device=device, dtype=torch.float32).clamp(min=0)
-    w = w + 1e-6
-    w.scatter_(1, anchor[:, None], 0.0)                            # don't redraw the anchor
-    if random:
-        rest = torch.multinomial(w, k, replacement=False)
-    else:
-        rest = w.topk(k, dim=1).indices.sort(dim=1).values
-    return torch.cat([anchor[:, None], rest], dim=1)               # (B, M)
-
-
-def _occlusion_traj(vis_2d):
-    """Per-frame per-camera visibility -> occlusion state {occluded=0, visible=1,
-    unknown=-1}, matching the dataset's query_occlusion convention.
-
-    vis_2d: (b, t, n, cams, 1) float with NaN = unknown, or None.
-    """
-    if vis_2d is None:
-        return None
-    v = vis_2d[..., 0] if vis_2d.dim() == 5 else vis_2d            # (b, t, n, cams)
-    return torch.where(torch.isnan(v), torch.full_like(v, -1.0), v).to(torch.long)
-
-
-def memory_kwargs(model, views, query_coords, cgroup, coords, p2d, vis_2d, query_times):
-    """Build the per-point memory bank for this batch -> {'memory_bank': ...}, or {}.
-
-    The bank needs each point's position at EVERY frame (a moving point must be
-    localized in the frame being remembered), which the dataset already provides as the
-    full trajectory: `coords` for 3D, `p2d[:, 0]` for the 2D path.
+    Which frames are remembered (and how many) is decided by the DATASET -- it samples them
+    from anywhere in the video and projects the points into them (see
+    PosetailDataset._sample_memory_frame_idx). Batches where the dataset chose not to
+    sample memory simply train without it, which is what memory_prob is for.
     """
     if not getattr(model, 'memory_attention', False):
         return {}
-    # memory_prob < 1 drops the memory path on a fraction of TRAINING steps (dropout on
-    # memory: the tracker must stay accurate without it, and the average cost of the extra
-    # context encodes falls proportionally). Always on for eval/inference.
-    prob = getattr(model, 'memory_prob', 1.0)
-    if model.training and prob < 1.0 and torch.rand(()).item() >= prob:
+    mem_views = getattr(batch, 'mem_views', None)
+    if mem_views is None:
         return {}
-    coords_traj = coords if p2d is None else p2d[:, 0]             # (b, t, n, R)
-    T = coords_traj.shape[1]
-    # Prefer context frames where the points are actually visible, so the bank holds real
-    # appearance rather than null padding.
-    ctx_idx = sample_context_idx(model, query_times.to(coords_traj.device), T,
-                                 weights=frame_visibility_weight(vis_2d))
     bank = model.build_memory_bank(
-        list(views), query_coords, cgroup, coords_traj, ctx_idx,
-        occlusion_traj=_occlusion_traj(vis_2d))
+        [v.to(device) for v in mem_views],
+        batch.mem_p2d.to(device), batch.mem_valid.to(device), device=device)
     return {'memory_bank': bank}
 
 
@@ -752,8 +669,7 @@ def train_iteration(config, model, fabric, batch,
         model_kwargs['occlusion'] = getattr(batch, 'query_occlusion', None)
     # Per-point appearance memory over a few context frames (memory_attention). Built
     # here, not inside forward, so the context choice (and its RNG) lives in the loop.
-    model_kwargs.update(memory_kwargs(
-        model, views, query_coords, cgroup, coords, p2d, vis_2d, query_times))
+    model_kwargs.update(memory_kwargs(model, batch, device))
 
     # with fabric.autocast():
     outputs = model(
@@ -919,8 +835,7 @@ def train_epoch(config, model, fabric, dataloader,
             coords = query_coords,
             query_times = query_times,
             camera_group = cgroup,
-            **memory_kwargs(model, views, query_coords, cgroup, coords, p2d,
-                            batch.vis_2d, query_times))
+            **memory_kwargs(model, batch, device))
 
         coords_pred = outputs['coords_pred']
         vis_pred = outputs['vis_pred']
@@ -1103,8 +1018,7 @@ def test_epoch(config, model, dataloader, loss = None,
                 coords = query_coords,
                 query_times = query_times,
                 camera_group = cgroup,
-                **memory_kwargs(model, views, query_coords, cgroup, coords, p2d,
-                                batch.vis_2d, query_times))
+                **memory_kwargs(model, batch, device))
         
         coords_pred = outputs['coords_pred']
         vis_pred = outputs['vis_pred']

@@ -399,6 +399,15 @@ def custom_collate(batch):
     if len(batch) > 9 and batch[9][0] is not None:
         query_occlusion = torch.stack(batch[9], axis=0)  # (b, n, cams)
 
+    # Memory observations (frames remembered from elsewhere in the video). Present only
+    # when the dataset sampled them for EVERY item in the batch; otherwise the batch just
+    # trains without memory, which is the point of memory_prob.
+    mem_views = mem_p2d = mem_valid = None
+    if len(batch) > 12 and all(v is not None for v in batch[10]):
+        mem_views = [torch.stack(v, dim=0) for v in zip(*list(batch[10]))]
+        mem_p2d = torch.stack(batch[11], axis=1)      # (cams, b, M, n, 2)
+        mem_valid = torch.stack(batch[12], axis=1)    # (cams, b, M, n)
+
     batch = edict({'views': views,
                    'coords': coords,
                    'p2d': p2d,
@@ -408,7 +417,10 @@ def custom_collate(batch):
                    'query_occlusion': query_occlusion,
                    'fnums': fnums,
                    'cgroup': cgroup,
-                   'sample_info': rows})
+                   'sample_info': rows,
+                   'mem_views': mem_views,
+                   'mem_p2d': mem_p2d,
+                   'mem_valid': mem_valid})
 
     return batch
 
@@ -466,6 +478,13 @@ class PosetailDataset(Dataset):
         self.per_image_aug_prob = config.dataset[split].get('per_image_aug_prob', self.aug_prob)
         self.should_augment_prob = config.dataset[split].get('should_augment_prob', 0.75)
         self.prob_2d_only = config.dataset[split].get('prob_2d_only', 0.0)
+
+        # --- memory frames: extra observations of the SAME points sampled from anywhere in
+        # the video, used by the model's memory cross-attention. memory_num_context is a
+        # scalar or a [lo, hi] range (drawn per sample, so the model sees a varying number
+        # of memory entries and generalizes to a different count at inference).
+        self.memory_num_context = config.dataset[split].get('memory_num_context', 0)
+        self.memory_prob = config.dataset[split].get('memory_prob', 0.0)
 
         self.crop_to_points = config.dataset[split].get('crop_to_points', True)
         self.min_crop_dim = config.dataset[split].get('min_crop_dim', 64)
@@ -645,15 +664,26 @@ class PosetailDataset(Dataset):
         coords = data['pose'][:, start_ix:end_ix:interval, :, :]
         coords = torch.tensor(coords, dtype=torch.float32, device='cpu')
 
+        # Whole-video trajectory, kept alongside the clip so memory frames can be sampled
+        # from ANYWHERE in this video (the clip slice above only spans start_ix..end_ix).
+        # It rides through the same subject/keypoint selection as `coords` (the `extra=`
+        # argument on the samplers) so it always describes the same points.
+        memory_on = self.memory_prob > 0 and not is_true_2d
+        coords_full = (torch.tensor(data['pose'], dtype=torch.float32, device='cpu')
+                       if memory_on else None)
+
         # load visibilities (if present; 2D datasets never have vis)
         vis = None
         vis_2d = None
+        vis_full = None
         if not is_true_2d and 'vis' in data:
             vis = data['vis'][:, start_ix:end_ix:interval, :, :]
             vis = torch.tensor(vis, dtype=torch.float32, device='cpu')
             vis_2d = vis.clone()
             vis[torch.isnan(vis)] = 1
             vis = vis.bool()
+            if memory_on:
+                vis_full = torch.tensor(data['vis'], dtype=torch.float32, device='cpu')
 
         # only augment some of the samples
         intensity = self.curriculum_intensity()
@@ -667,6 +697,17 @@ class PosetailDataset(Dataset):
             if vis is not None:
                 vis = vis[ix_sample, None]
                 vis_2d = vis_2d[ix_sample, None]
+            if coords_full is not None:
+                coords_full = coords_full[ix_sample, None]
+                if vis_full is not None:
+                    vis_full = vis_full[ix_sample, None]
+
+        mem_extra = None
+        mem_has_vis = False
+        if coords_full is not None:
+            coords_full = rearrange(coords_full, 's t n r -> t (s n) r')
+            if vis_full is not None:
+                vis_full = rearrange(vis_full, 's t n c -> t (s n) c')
 
         coords = rearrange(coords, 's t n r -> t (s n) r')  # (time, n_kpts, r)
         if vis is not None:
@@ -675,7 +716,15 @@ class PosetailDataset(Dataset):
 
         img_path = row['img_path']
         cam_names = get_dirs(img_path)
-        img_fnames = sorted(os.listdir(os.path.join(img_path, cam_names[0])))[start_ix:end_ix:interval]
+        # Full frame listing for THIS video; the clip is a slice of it. Memory frames index
+        # the unsliced list, so they can come from anywhere in the video but never from a
+        # different one.
+        all_img_fnames = sorted(os.listdir(os.path.join(img_path, cam_names[0])))
+        img_fnames = all_img_fnames[start_ix:end_ix:interval]
+
+        # Memory-frame state, filled in by the 3D path when memory is enabled (native-2D
+        # datasets have no world coords / multi-camera geometry, so they carry no memory).
+        mem_idx = mem_coords = mem_cgroups = mem_crops = None
 
         # ── 2D-only path ──────────────────────────────────────────────────────
         if is_true_2d:
@@ -726,8 +775,8 @@ class PosetailDataset(Dataset):
                 return None
 
             if self.kpts_to_sample:
-                coords, vis, vis_2d = self.sample_keypoints(coords, vis, vis_2d,
-                                                             total_movement, avg_speed)
+                coords, vis, vis_2d, _ = self.sample_keypoints(coords, vis, vis_2d,
+                                                               total_movement, avg_speed)
 
             if coords.shape[1] < 2:
                 return None
@@ -795,8 +844,21 @@ class PosetailDataset(Dataset):
                 if vis is not None:
                     vis = vis[:, :, ix_cams]
                     vis_2d = vis_2d[:, :, ix_cams]
+                if vis_full is not None:
+                    vis_full = vis_full[:, :, ix_cams]
             elif self.cams_to_sample:
-                coords, vis, vis_2d, cam_names = self.sample_cameras(coords, vis, vis_2d, cam_names)
+                coords, vis, vis_2d, cam_names, vis_full = self.sample_cameras(
+                    coords, vis, vis_2d, cam_names, extra=vis_full)
+
+            # The whole-video visibility must follow the SAME camera subset as the clip
+            # (above), then ride with the trajectory through the keypoint selection below:
+            # a single packed tensor carries both so they stay describing the same points.
+            if coords_full is not None:
+                if vis_full is not None:
+                    mem_extra = torch.cat([coords_full, vis_full], dim=-1)
+                    mem_has_vis = True
+                else:
+                    mem_extra = coords_full
 
             if vis is not None:
                 vis = vis.sum(dim=-1) >= self.cam_thresh_for_vis  # (time, n_kpts)
@@ -845,6 +907,8 @@ class PosetailDataset(Dataset):
             if vis is not None:
                 vis = vis[:, mask]
                 vis_2d = vis_2d[:, mask]
+            if mem_extra is not None:
+                mem_extra = mem_extra[:, mask]
 
             if self.no_nan_coords:
                 mask = torch.all(torch.isfinite(coords), dim=(0, 2))
@@ -852,15 +916,20 @@ class PosetailDataset(Dataset):
                 if vis is not None:
                     vis = vis[:, mask]
                     vis_2d = vis_2d[:, mask]
+                if mem_extra is not None:
+                    mem_extra = mem_extra[:, mask]
             elif self.min_valid_frames > 1:
                 mask = torch.isfinite(coords).all(dim=2).sum(dim=0) >= self.min_valid_frames
                 coords = coords[:, mask]
                 if vis is not None:
                     vis = vis[:, mask]
                     vis_2d = vis_2d[:, mask]
+                if mem_extra is not None:
+                    mem_extra = mem_extra[:, mask]
 
             if self.enable_kpt_filtering:
-                coords, vis, vis_2d = self.filter_keypoints(coords, vis, vis_2d, cgroup)
+                coords, vis, vis_2d, mem_extra = self.filter_keypoints(
+                    coords, vis, vis_2d, cgroup, extra=mem_extra)
 
             if coords.shape[1] < 2:
                 return None
@@ -878,15 +947,34 @@ class PosetailDataset(Dataset):
 
             fire_3d = self.crop_3d_enabled and (np.random.rand() < self.crop_3d_prob * intensity)
             if fire_3d:
-                coords, vis, vis_2d = self.sample_keypoints_sphere(
-                    coords, vis, vis_2d, total_movement, avg_speed)
+                coords, vis, vis_2d, mem_extra = self.sample_keypoints_sphere(
+                    coords, vis, vis_2d, total_movement, avg_speed, extra=mem_extra)
                 if coords.shape[1] < self.crop_3d_min_kpts:
                     return None
             elif self.kpts_to_sample:
-                coords, vis, vis_2d = self.sample_keypoints(coords, vis, vis_2d, total_movement, avg_speed)
+                coords, vis, vis_2d, mem_extra = self.sample_keypoints(
+                    coords, vis, vis_2d, total_movement, avg_speed, extra=mem_extra)
 
             if coords.shape[1] < 2:
                 return None
+
+            # Unpack the whole-video trajectory / visibility now that the keypoint set is
+            # final -- they must be split before the world rotation below, which applies a
+            # 3x3 matrix to the coordinates only.
+            if mem_extra is not None:
+                # If this ever trips, some keypoint filter above dropped points from
+                # `coords` without dropping them from the packed whole-video tensor, and
+                # the memory frames would silently describe the WRONG points.
+                assert mem_extra.shape[1] == coords.shape[1], (
+                    f'memory trajectory has {mem_extra.shape[1]} keypoints but the clip has '
+                    f'{coords.shape[1]}; a keypoint filter is missing an `extra` update')
+                coords_full = mem_extra[..., :3]
+                vis_full = mem_extra[..., 3:] if mem_has_vis else None
+
+            # Uncropped cameras, kept for the memory frames: each remembered frame gets its
+            # OWN crop around the points at that frame, so it cannot reuse the clip's crop
+            # (the subject has usually moved elsewhere by then).
+            cgroup_uncropped = [dict(c) for c in cgroup] if coords_full is not None else None
 
             if self.crop_to_points:
                 cgroup, crops = self.crop_cgroup_to_points(cgroup, coords)
@@ -894,7 +982,35 @@ class PosetailDataset(Dataset):
             if self.max_res != -1:
                 cgroup = self.resize_camera_group(cgroup)
 
-            cgroup, coords = self.rotate_camera_group(cgroup, coords)
+            cgroup, coords, coords_full, cgroup_uncropped = self.rotate_camera_group(
+                cgroup, coords, extra=coords_full, extra_cgroup=cgroup_uncropped)
+
+            # --- memory frames: extra observations of these same points from anywhere in
+            # this video. Each gets its own square crop around the points AT THAT FRAME.
+            if coords_full is not None:
+                n_avail = min(coords_full.shape[0], len(all_img_fnames))
+                mem_idx = self._sample_memory_frame_idx(
+                    coords_full, vis_full, n_avail, exclude=fnums)
+                if mem_idx is not None:
+                    mem_size = self.max_res if self.max_res != -1 else self.min_crop_dim
+                    keep, mem_cgroups, mem_crops = [], [], []
+                    for f in mem_idx.tolist():
+                        cams_f, crops_f = [], []
+                        for cam in cgroup_uncropped:
+                            cam_m, crop = self._memory_camera(cam, coords_full[f], mem_size)
+                            if cam_m is None:      # points miss this camera entirely
+                                break
+                            cams_f.append(cam_m)
+                            crops_f.append(crop)
+                        if len(cams_f) == len(cgroup_uncropped):
+                            keep.append(f)
+                            mem_cgroups.append(cams_f)
+                            mem_crops.append(crops_f)
+                    if keep:
+                        mem_idx = torch.tensor(keep, dtype=torch.long)
+                        mem_coords = coords_full[mem_idx]        # (M, n_kpts, 3)
+                    else:
+                        mem_idx = mem_cgroups = mem_crops = None
 
             if self.query_anytime:
                 query_times = []
@@ -943,6 +1059,7 @@ class PosetailDataset(Dataset):
         # apply augmentation
         with ThreadPoolExecutor(max_workers=24) as executor:
             views_unloaded = []
+            mem_unloaded = []
             for cnum, cam_name in enumerate(cam_names):
 
                 # we apply the same augmentation per camera
@@ -970,15 +1087,49 @@ class PosetailDataset(Dataset):
                     futures.append(future)
                 views_unloaded.append(futures)
 
+                # Memory frames for this camera: same camera, same rotation, but each with
+                # its OWN square crop around the points at that frame.
+                if mem_idx is not None:
+                    mem_futures = []
+                    for mnum, f in enumerate(mem_idx.tolist()):
+                        cam_img_path = os.path.join(img_path, cam_name, all_img_fnames[f])
+                        mem_futures.append(executor.submit(
+                            load_image, cam_img_path, mem_crops[mnum][cnum],
+                            mem_cgroups[mnum][cnum]['size'].tolist(), rotation))
+                    mem_unloaded.append(mem_futures)
+
             views = []
+            mem_views = [] if mem_idx is not None else None
             for cnum, futures in enumerate(views_unloaded):
                 imgs = [f.result() for f in futures]
                 if any(img is None for img in imgs):
                     return None
+                mem_imgs = None
+                if mem_idx is not None:
+                    mem_imgs = [f.result() for f in mem_unloaded[cnum]]
+                    if any(img is None for img in mem_imgs):
+                        mem_imgs = None
+                # The memory frames go through the SAME per-camera augmentation instance as
+                # this camera's clip frames, so a remembered frame is photometrically
+                # consistent with the scene the model sees (otherwise memory would be
+                # trivially distinguishable from the clip).
                 if should_augment:
                     aug_cam_det = self.aug_per_camera.to_deterministic()
                     imgs = [aug_cam_det(image=img) for img in imgs]
                     imgs = [self.aug_per_image(image=img) for img in imgs]
+                    if mem_imgs is not None:
+                        mem_imgs = [aug_cam_det(image=img) for img in mem_imgs]
+                        mem_imgs = [self.aug_per_image(image=img) for img in mem_imgs]
+                if mem_views is not None:
+                    if mem_imgs is None:
+                        mem_views = None                      # a load failed; drop memory
+                    else:
+                        if should_grayscale:
+                            mem_imgs = [np.stack([cv2.cvtColor(im, cv2.COLOR_RGB2GRAY)] * 3,
+                                                 axis=-1) for im in mem_imgs]
+                        mem_views.append(
+                            torch.tensor(np.array(mem_imgs), dtype=torch.float32,
+                                         device='cpu') / 255.0)
 
                 for rect in cutout_rects[cnum]:
                     rx1, ry1, rx2, ry2, fill_color = rect
@@ -1033,8 +1184,33 @@ class PosetailDataset(Dataset):
             query_occlusion = torch.full((n_kpts_out, n_cams_out), -1.0)
         query_occlusion = query_occlusion.to(torch.int64)                    # (N, cams)
 
+        # --- memory observations: where each point sits in each remembered frame, and
+        # whether that camera can actually see it there. The model consumes pixels, so the
+        # per-memory-frame cameras are resolved here and never leave the dataset.
+        mem_p2d = mem_valid = None
+        if mem_views is not None and mem_coords is not None:
+            p2d_list, valid_list = [], []
+            for mnum in range(len(mem_cgroups)):
+                cams_m = mem_cgroups[mnum]
+                c_f = mem_coords[mnum]                                    # (n_kpts, 3)
+                p = project_points_torch(cams_m, c_f[None])[:, 0]         # (cams, n_kpts, 2)
+                size_m = torch.stack([c['size'].to(p.dtype) for c in cams_m])  # (cams, 2)
+                inside = ((p >= 0) & (p < size_m[:, None, :])).all(dim=-1)
+                inside = inside & torch.isfinite(p).all(dim=-1)
+                if vis_full is not None:
+                    # visible in that camera at that frame (NaN = unknown -> treat as seen)
+                    v = vis_full[mem_idx[mnum]]                           # (n_kpts, cams)
+                    seen = torch.nan_to_num(v, nan=1.0).t() > 0.5         # (cams, n_kpts)
+                    inside = inside & seen
+                p2d_list.append(p)
+                valid_list.append(inside)
+            mem_p2d = torch.stack(p2d_list, dim=1)                        # (cams, M, n, 2)
+            mem_valid = torch.stack(valid_list, dim=1)                    # (cams, M, n)
+            mem_p2d = torch.nan_to_num(mem_p2d, nan=0.0, posinf=0.0, neginf=0.0)
+            mem_views = [v for v in mem_views]                            # list per camera
+
         return (views, coords, vis, fnums, cgroup, row, query_times, vis_2d, p2d,
-                query_occlusion)
+                query_occlusion, mem_views, mem_p2d, mem_valid)
 
 
     def _build_2d_cgroup(self, row, img_path, cam_names):
@@ -1171,7 +1347,7 @@ class PosetailDataset(Dataset):
         return camera_group_cropped, crops
 
 
-    def filter_keypoints(self, coords, vis, vis_2d, cgroup): 
+    def filter_keypoints(self, coords, vis, vis_2d, cgroup, extra=None): 
 
         # filter keypoints that are not visible from enough views 
         s, n, _ = coords.shape
@@ -1188,10 +1364,15 @@ class PosetailDataset(Dataset):
             vis = vis[:, good]
             vis_2d = vis_2d[:, good]
 
-        return coords, vis, vis_2d
+        # `extra` rides along through the same keypoint selection (used to carry the
+        # WHOLE-video trajectory so memory frames describe the same points as the clip).
+        if extra is not None:
+            extra = extra[:, good]
+
+        return coords, vis, vis_2d, extra
 
 
-    def sample_cameras(self, coords, vis, vis_2d, cam_names): 
+    def sample_cameras(self, coords, vis, vis_2d, cam_names, extra=None):
 
         # sample a number of camera views from a set of calibrated cameras
         if isinstance(self.cams_to_sample, int): 
@@ -1205,14 +1386,19 @@ class PosetailDataset(Dataset):
             cam_names = [cam_names[i] for i in ix_cams]
 
             # determine visibilities only from the sampled cameras
-            if vis is not None: 
+            if vis is not None:
                 vis = vis[:, :, ix_cams]
                 vis_2d = vis_2d[:, :, ix_cams]
 
-        return coords, vis, vis_2d, cam_names
+            # `extra` (whole-video visibility, for the memory frames) follows the same
+            # camera subset so its camera axis keeps matching cam_names / cgroup.
+            if extra is not None:
+                extra = extra[:, :, ix_cams]
+
+        return coords, vis, vis_2d, cam_names, extra
 
 
-    def sample_keypoints(self, coords, vis, vis_2d, total_movement, avg_speed): 
+    def sample_keypoints(self, coords, vis, vis_2d, total_movement, avg_speed, extra=None): 
 
         if isinstance(self.kpts_to_sample, int): 
             num_kpts_to_sample = self.kpts_to_sample
@@ -1255,29 +1441,33 @@ class PosetailDataset(Dataset):
                 coords = coords[:, ix_p]
 
             # otherwise, default to sampling probabilities based on total movement
-            else: 
+            else:
                 prob = (total_movement + 2) / torch.sum(total_movement + 2)
                 prob = prob.numpy()
-                
+
                 ix_p = np.random.choice(coords.shape[1], size = num_kpts_to_sample,
                                         replace = False, p = prob)
                 coords = coords[:, ix_p]
 
             # sample corresponding visibilities
-            if vis is not None: 
+            if vis is not None:
                 vis = vis[:, ix_p]
                 vis_2d = vis_2d[:, ix_p]
 
-        return coords, vis, vis_2d
+            # `extra` rides along (whole-video trajectory for the memory frames)
+            if extra is not None:
+                extra = extra[:, ix_p]
+
+        return coords, vis, vis_2d, extra
 
 
-    def sample_keypoints_sphere(self, coords, vis, vis_2d, total_movement, avg_speed):
+    def sample_keypoints_sphere(self, coords, vis, vis_2d, total_movement, avg_speed, extra=None):
         T, N, _ = coords.shape
 
         valid = torch.isfinite(coords).all(dim=-1)   # (T, N)
         has_any = valid.any(dim=0)                   # (N,)
         if has_any.sum() < 2:
-            return coords, vis, vis_2d
+            return coords, vis, vis_2d, extra
 
         first_valid_t = valid.float().argmax(dim=0)              # (N,)
         kpt_coords = coords[first_valid_t, torch.arange(N)]     # (N, 3)
@@ -1306,7 +1496,7 @@ class PosetailDataset(Dataset):
         dists = torch.where(has_any, dists, torch.full_like(dists, float('inf')))
         finite_d = dists[torch.isfinite(dists)]
         if finite_d.numel() < 2 or finite_d.max() == 0:
-            return coords, vis, vis_2d
+            return coords, vis, vis_2d, extra
 
         f_lo, f_hi = self.crop_3d_fraction
         fraction = float(np.exp(np.random.uniform(np.log(f_lo), np.log(f_hi))))
@@ -1317,13 +1507,16 @@ class PosetailDataset(Dataset):
         if vis is not None:
             vis = vis[:, in_sphere]
             vis_2d = vis_2d[:, in_sphere]
+        if extra is not None:
+            extra = extra[:, in_sphere]
         tm_s = total_movement[in_sphere]
         sp_s = avg_speed[in_sphere]
 
         if self.kpts_to_sample:
-            coords, vis, vis_2d = self.sample_keypoints(coords, vis, vis_2d, tm_s, sp_s)
+            coords, vis, vis_2d, extra = self.sample_keypoints(
+                coords, vis, vis_2d, tm_s, sp_s, extra=extra)
 
-        return coords, vis, vis_2d
+        return coords, vis, vis_2d, extra
 
 
     def sample_query_time(self, valid_times, n_frames):
@@ -1401,31 +1594,112 @@ class PosetailDataset(Dataset):
         return [cam_rot], [rot], coords_rot
 
 
-    def rotate_camera_group(self, cgroup, coords):
-                
-        rvec = np.random.uniform(-2*np.pi, 2*np.pi, size=3)
-        rotmat, _ = cv2.Rodrigues(np.array(rvec))
-        rotmat = torch.as_tensor(rotmat, device=coords.device, dtype=coords.dtype)
-        coords = torch.matmul(coords, rotmat)
+    def _sample_memory_frame_idx(self, coords_full, vis_full, n_avail, exclude=None):
+        """Pick which frames of the video to remember -> LongTensor [M] (or None).
 
-        rmat = torch.eye(4, device=coords.device, dtype=coords.dtype)
-        rmat[:3,:3] = rotmat
-        camera_group_rotated = list()
+        Frames are drawn from the WHOLE video, not just the loaded clip -- that is the
+        point of memory. Only this row's video is ever considered: every metadata row
+        carries its own trial's pose_path/img_path/n_total_frames, so a frame index here
+        can never land in another video.
 
+        Frames where none of the tracked points are visible would only contribute null
+        padding, so selection is weighted by how many points are visible in each frame.
+        """
+        if self.memory_num_context is None or self.memory_prob <= 0:
+            return None
+        if np.random.random() >= self.memory_prob:
+            return None
+
+        if isinstance(self.memory_num_context, int):
+            M = self.memory_num_context
+        else:                                    # [lo, hi] -> draw per sample
+            lo, hi = self.memory_num_context
+            M = int(np.random.randint(int(lo), int(hi) + 1))
+        if M <= 0 or n_avail <= 0:
+            return None
+        M = min(M, n_avail)
+
+        # weight = number of points visible in that frame (>=1 camera)
+        if vis_full is not None:
+            w = torch.nan_to_num(vis_full[:n_avail].to(torch.float32), nan=0.0)
+            w = (w > 0.5).any(dim=-1).sum(dim=-1).to(torch.float32)      # (n_avail,)
+        else:
+            w = torch.isfinite(coords_full[:n_avail]).all(dim=-1).sum(dim=-1).to(torch.float32)
+        w = w + 1e-6                              # keep every frame reachable
+        if exclude is not None:
+            keep = (exclude >= 0) & (exclude < n_avail)
+            w[exclude[keep]] = 1e-6               # de-emphasize the clip's own frames
+        return torch.multinomial(w, M, replacement=False)
+
+    def _memory_camera(self, cam, coords_f, size):
+        """Square crop of one camera around the points at ONE frame, resized to size x size.
+
+        Returns (cam_cropped, crop_box) or (None, None) when the points do not project into
+        this camera at that frame. Square + fixed output size is what lets memory frames
+        from different parts of the video stack into a single tensor.
+        """
+        p2d = project_points_torch([cam], coords_f[None])[0, 0]          # (n_kpts, 2)
+        good = torch.isfinite(p2d).all(dim=-1)
+        if not bool(good.any()):
+            return None, None
+        p = p2d[good]
+        cam_size = cam['size'].to(torch.float32)
+        lo = torch.clamp(p.min(dim=0).values - 20, torch.zeros(2), cam_size)
+        hi = torch.clamp(p.max(dim=0).values + 20, torch.zeros(2), cam_size)
+        side = float(torch.clamp(torch.max(hi - lo), min=float(self.min_crop_dim)))
+        side = min(side, float(cam_size.min()))                          # must fit the frame
+        centre = (lo + hi) / 2
+        x1 = float(torch.clamp(centre[0] - side / 2, 0, float(cam_size[0]) - side))
+        y1 = float(torch.clamp(centre[1] - side / 2, 0, float(cam_size[1]) - side))
+        crop = torch.tensor([int(x1), int(y1), int(x1 + side), int(y1 + side)],
+                            dtype=torch.int32)
+
+        scale = float(size) / float(crop[2] - crop[0])
+        cam_m = dict(cam)
+        cam_m['offset'] = (cam['offset'] + crop[:2].to(cam['offset'].dtype)) * scale
+        cam_m['size'] = torch.tensor([size, size], dtype=torch.int32)
+        cam_m['mat'] = cam['mat'] * scale
+        cam_m['mat'][2, 2] = 1
+        return cam_m, crop
+
+    @staticmethod
+    def _rotate_cgroup(cgroup, rmat):
+        """Apply a 4x4 world rotation to every camera's extrinsics."""
+        out = []
         for cam in cgroup:
             cam_rot = dict(cam)
             cam_rot['ext'] = torch.matmul(cam['ext'], rmat)
             cam_rot['ext_inv'] = torch.linalg.inv(cam_rot['ext'])
-
-            R = cam_rot['ext'][:3,:3]
+            R = cam_rot['ext'][:3, :3]
             t = cam_rot['ext'][:3, 3]
             cam_rot['center'] = -R.T @ t
+            out.append(cam_rot)
+        return out
 
-            camera_group_rotated.append(cam_rot)
+    def rotate_camera_group(self, cgroup, coords, extra=None, extra_cgroup=None):
+        """Random world-frame rotation applied to BOTH the points and the cameras (a gauge
+        change -- projections are unchanged).
 
-        cgroup = camera_group_rotated 
+        `extra` / `extra_cgroup` are additional point / camera sets that must end up in the
+        SAME frame (the whole-video trajectory and the uncropped cameras behind the memory
+        frames). They must be rotated by this same matrix, not by a second random draw.
+        Returns (cgroup, coords, extra, extra_cgroup).
+        """
+        rvec = np.random.uniform(-2*np.pi, 2*np.pi, size=3)
+        rotmat, _ = cv2.Rodrigues(np.array(rvec))
+        rotmat = torch.as_tensor(rotmat, device=coords.device, dtype=coords.dtype)
+        coords = torch.matmul(coords, rotmat)
+        if extra is not None:
+            extra = torch.matmul(extra, rotmat)
 
-        return cgroup, coords
+        rmat = torch.eye(4, device=coords.device, dtype=coords.dtype)
+        rmat[:3, :3] = rotmat
+
+        cgroup = self._rotate_cgroup(cgroup, rmat)
+        if extra_cgroup is not None:
+            extra_cgroup = self._rotate_cgroup(extra_cgroup, rmat)
+
+        return cgroup, coords, extra, extra_cgroup
 
 
     def set_progress(self, fraction):

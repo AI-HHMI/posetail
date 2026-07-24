@@ -367,6 +367,38 @@ def load_multiview_clip(readers, start_frame, n_frames, crop_boxes=None, target_
     return views, end_frame - start_frame
 
 
+def build_chunk_memory(model, views, camera_group, frame_idx, coords_at, is_2d):
+    """Encode remembered frames taken from the CURRENT chunk -> bank slice (B, N, K, dim).
+
+    The chunk's frames are already cropped and resized around the tracked points, so a
+    remembered frame reuses that crop rather than re-reading and re-cropping the video.
+
+    Args:
+        views: list per camera of (B, T, H, W, C) chunk frames (as passed to the model).
+        frame_idx: (K,) which frames of the chunk to remember.
+        coords_at: (B, K, N, R) each point's position at those frames, in MODEL space
+            (world coords for 3D; model-input pixels for 2D).
+    """
+    K = int(frame_idx.numel())
+    mem_views = [v[:, frame_idx] for v in views]                    # (B, K, H, W, C)
+    p2d_l, ok_l = [], []
+    for k in range(K):
+        c = coords_at[:, k]                                         # (B, N, R)
+        if is_2d:
+            p = c[None]                                             # (1, B, N, 2)
+        else:
+            p = project_points_torch(camera_group, c)               # (cams, B, N, 2)
+        sizes = torch.stack([cam['size'].to(p.dtype).to(p.device)
+                             for cam in camera_group])              # (cams, 2)
+        inside = (((p >= 0) & (p < sizes[:, None, None, :])).all(dim=-1)
+                  & torch.isfinite(p).all(dim=-1))
+        p2d_l.append(torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0))
+        ok_l.append(inside)
+    return model.build_memory_bank(mem_views,
+                                   torch.stack(p2d_l, dim=2),       # (cams, B, K, N, 2)
+                                   torch.stack(ok_l, dim=2))        # (cams, B, K, N)
+
+
 def crop_camera_group_to_queries(camera_group, query_coords, min_crop_dim, padding=20, is_2d=False):
     if is_2d:
         # 2D queries are already pixel coords in the (single) camera frame; no
@@ -605,6 +637,9 @@ def run_tracker_encoder_on_videos(
     query_times=None,
     motion_margin=True,
     conf_crop_thresh=0.1,
+    memory_context=8,
+    memory_score_thresh=0.5,
+    use_memory=True,
 ):
     """Windowed multi-view tracking whose per-chunk crop FOLLOWS the subject.
 
@@ -695,6 +730,23 @@ def run_tracker_encoder_on_videos(
     # Cross-chunk continuity is provided by query re-anchoring (current_queries below):
     # each chunk re-seeds its query on the previous chunk's prediction.
     clip_len = clip_len if clip_len is not None else model.n_frames
+
+    # --- per-point appearance memory carried across chunks.
+    # Slot 0 is a PERMANENT anchor built from the point's original query coordinate at its
+    # query frame -- never overwritten, so a point can still be re-identified thousands of
+    # frames later. The remaining slots are a FIFO of recently-seen frames, admitted only
+    # when the model is confident the point was actually visible there (feeding back a
+    # bad frame would poison the memory during an occlusion).
+    mem_on = use_memory and getattr(model, 'memory_attention', False)
+    mem_anchor = mem_recent = None
+    n_recent = 0
+    if mem_on:
+        _dim = model.latent_dim
+        _null = model.memory_encoder.null_entry.detach().to(device).view(1, 1, 1, _dim)
+        mem_anchor = _null.expand(1, N, 1, _dim).clone()
+        n_recent = max(int(memory_context) - 1, 0)
+        if n_recent:
+            mem_recent = _null.expand(1, N, n_recent, _dim).clone()
 
     # Cross-chunk crop-robustness state: per-point velocity (world/pixel per frame) and
     # per-point predicted visibility at the previous chunk's last frame.
@@ -850,6 +902,26 @@ def run_tracker_encoder_on_videos(
             # dummy point (index 0) so the model still returns correctly-shaped outputs; its
             # result is discarded by the fill-only scatter below (M==0 -> no index_copy_).
             run_idx = active_idx if M > 0 else active_idx.new_zeros(1)
+
+            # Permanent anchor: remember each point as it looked at its OWN query frame,
+            # from the ORIGINAL query coordinate (not a prediction). Built BEFORE the
+            # forward so even the very first chunk reads a real memory entry. Points
+            # usually share a query frame, so this is normally one extra encode, once.
+            if mem_on and bool(seeded.any()):
+                sidx = seeded.nonzero(as_tuple=True)[0]
+                for f in torch.unique(times_chunk[0, sidx]):
+                    pts = sidx[times_chunk[0, sidx] == f]
+                    mem_anchor[:, pts] = build_chunk_memory(
+                        model, views, camera_group_chunk,
+                        f.reshape(1).to(torch.long),
+                        queries_model[:, pts][:, None], is_2d)
+
+            mem_kwargs = {}
+            if mem_on:
+                bank = (mem_anchor if mem_recent is None
+                        else torch.cat([mem_anchor, mem_recent], dim=2))
+                mem_kwargs['memory_bank'] = bank[:, run_idx]
+
             outputs = model(
                 views=views,
                 coords=queries_model[:, run_idx],
@@ -857,6 +929,7 @@ def run_tracker_encoder_on_videos(
                 camera_group=camera_group_chunk,
                 kpt_chunk=max_kpts,
                 occlusion=(occ_chunk[:, run_idx] if occ_chunk is not None else None),
+                **mem_kwargs,
             )
 
             if is_2d:
@@ -875,6 +948,26 @@ def run_tracker_encoder_on_videos(
 
             if coords_pred.shape[1] == 0:
                 break
+
+            # --- refresh the recent-memory FIFO from this chunk.
+            # Pick the frame(s) the model is most confident it actually saw the points in
+            # (visibility x confidence). If nothing clears the threshold -- a long
+            # occlusion, say -- keep the existing memory rather than overwriting it with
+            # frames where the points were not really visible.
+            if mem_on and n_recent > 0 and M > 0:
+                score = (torch.sigmoid(vis_pred[..., 0]) * torch.sigmoid(conf_pred))
+                score = score.mean(dim=(0, 2))                      # (t,)
+                k = int(min(2, n_recent, score.numel()))
+                top = torch.topk(score, k).indices
+                top = top[score[top] >= memory_score_thresh]
+                if top.numel():
+                    traj = (outputs['2d_pred'][0] if is_2d
+                            else outputs[pred_key_3d])[:, :keep_len]
+                    blk = build_chunk_memory(model, views, camera_group_chunk,
+                                             top.to(torch.long), traj[:, top], is_2d)
+                    full = _null.expand(1, N, blk.shape[2], _dim).clone()
+                    full[:, active_idx] = blk
+                    mem_recent = torch.cat([mem_recent[:, :, blk.shape[2]:], full], dim=2)
 
             # Scatter the appeared points' outputs back to full N, filling not-yet-appeared
             # points with NaN coords / invisible logits. Keypoint axis is dim 2 for
@@ -1248,6 +1341,9 @@ def run_inference(
     query_first=True,
     motion_margin=True,
     max_points=None,
+    memory_context=8,
+    memory_score_thresh=0.5,
+    use_memory=True,
 ):
     """Run inference on one trial with an already-loaded model.
 
@@ -1345,6 +1441,9 @@ def run_inference(
                 occlusion_gt=subj_occlusion,
                 query_times=per_subject_query_times[subj_idx] if use_query_first else None,
                 motion_margin=motion_margin,
+                memory_context=memory_context,
+                memory_score_thresh=memory_score_thresh,
+                use_memory=use_memory,
             )
             subj_out['subject_idx'] = subj_idx
             all_subject_outputs.append(subj_out)
@@ -1418,6 +1517,9 @@ def run_inference(
             occlusion_gt=occlusion_flat,
             query_times=query_times_flat if use_query_first else None,
             motion_margin=motion_margin,
+            memory_context=memory_context,
+            memory_score_thresh=memory_score_thresh,
+            use_memory=use_memory,
         )
 
     # --- Ground-truth extraction ---
