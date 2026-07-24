@@ -192,8 +192,12 @@ def main():
                          'point\'s recent path so a still frame conveys tracking. '
                          'Uses render_video.py defaults (length 30, thickness 2).')
     ap.add_argument('--view-seed', type=int, default=0,
-                    help='seed for camera subsampling when a trial has more than '
-                         f'{MAX_VIEWS} cameras (default 0, reproducible across --force reruns)')
+                    help='seed for camera + point subsampling (default 0, reproducible '
+                         'across --force reruns)')
+    ap.add_argument('--max-points', type=int, default=600,
+                    help='cap tracked query points PER SUBJECT (default 600); subjects with '
+                         'more are random-subsampled. Bounds memory/time on dense sets '
+                         '(point-odyssey has ~40k-76k pts/subject). 0 disables the cap.')
     ap.add_argument('--force', action='store_true', default=False,
                     help='re-run inference and re-render even when outputs already '
                          'exist. By default a dataset whose tracks npz + video are both '
@@ -268,6 +272,10 @@ def main():
                 # MAX_VIEWS and size the keypoint chunk to fit a conservative memory budget.
                 pose_name = 'pose2d.npz' if is_2d else 'pose3d.npz'
                 n_kpts = int(np.load(os.path.join(trial_dir, pose_name))['pose'].shape[2])
+                # Points are subsampled to max_points/subject before tracking, so size the chunk
+                # to the count actually tracked (n_kpts is per-subject: pose is (S,T,K,R)).
+                if args.max_points:
+                    n_kpts = min(n_kpts, args.max_points)
                 n_cams = count_cameras(trial_dir, is_2d)
                 dev = device if device is not None else next(model.parameters()).device
                 n_views, max_kpts = pick_inference_caps(n_cams, n_kpts, dev)
@@ -284,8 +292,9 @@ def main():
                     n_frames=n_eff,
                     n_overlap=8,
                     n_views=n_views,
-                    view_seed=args.view_seed,
+                    seed=args.view_seed,
                     max_kpts=max_kpts,
+                    max_points=(args.max_points or None),  # 0 -> None (disable cap)
                     per_subject=True,
                     device=device,
                     outpath=tracks_path,

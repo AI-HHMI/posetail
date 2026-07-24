@@ -214,7 +214,7 @@ def main():
                     checkpoint_path=ms['checkpoint_path'], trial_path=w['tp'], start_frame=0,
                     n_frames=args.n_frames, n_overlap=args.n_overlap, per_subject=True,
                     device=ms['device'], max_kpts=w['max_kpts'], n_views=w['n_views'],
-                    view_seed=args.view_seed, outpath=w['npz'], query_first=True,
+                    seed=args.view_seed, outpath=w['npz'], query_first=True,
                     motion_margin=args.motion_margin)
                 torch.cuda.empty_cache()
                 m = eval_outputs(out, cfg['thresholds'], cfg['survival'])

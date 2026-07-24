@@ -1046,7 +1046,8 @@ def occlusion_at_query(vis_used_s, query_time_valid, valid_mask, start_frame):
     return torch.as_tensor(occ, dtype=torch.int64)
 
 
-def load_trial(trial_path, start_frame=0, n_frames=None, query_first=True):
+def load_trial(trial_path, start_frame=0, n_frames=None, query_first=True,
+               max_points=None, seed=0):
     """Load metadata, video/image paths, and query points from a trial directory,
     following the PosetailDataset convention.
 
@@ -1056,6 +1057,13 @@ def load_trial(trial_path, start_frame=0, n_frames=None, query_first=True):
 
     query_first (3D only): anchor each point at its first valid+visible frame (mvtracker /
     training convention) instead of all points at start_frame. Returns per-point query_times.
+
+    max_points (per subject): if set and a subject has more than this many valid query points,
+    randomly subsample its valid mask down to max_points (seeded by `seed`). This genuinely
+    shrinks N fed to the tracker -- unlike max_kpts chunking, which retains full-N latent/grid --
+    so it bounds memory/time on dense sets (e.g. point-odyssey, ~40k-76k pts/subject). The cull
+    lands on the valid mask before queries/query_times are built, so every downstream consumer
+    (GT extraction, occlusion_at_query) stays consistent automatically.
 
     Returns a dict with keys: 'mode', 'metadata_path', 'cam_names', 'video_paths',
     'query_points', 'per_subject_queries', 'coords', 'vis_gt', 'valid_flat',
@@ -1132,6 +1140,7 @@ def load_trial(trial_path, start_frame=0, n_frames=None, query_first=True):
     per_subject_queries = []
     per_subject_valid_masks = []
     per_subject_query_times = []
+    subsample_rng = np.random.default_rng(seed) if max_points is not None else None
     for s in range(n_subjects):
         if use_query_first:
             qt_s, qc_s, valid = compute_query_first(
@@ -1140,6 +1149,13 @@ def load_trial(trial_path, start_frame=0, n_frames=None, query_first=True):
             qc_s = coords[:, start_frame, :, :][s]              # (n_kpts, R)
             valid = np.all(np.isfinite(qc_s), axis=1)
             qt_s = np.zeros(qc_s.shape[0], dtype=np.int32)
+        # Optionally cap this subject's tracked points (random, one shared seeded RNG). Applied
+        # to the valid mask before slicing so queries/query_times/GT all stay aligned.
+        if subsample_rng is not None and int(valid.sum()) > max_points:
+            on = np.flatnonzero(valid)
+            drop = subsample_rng.choice(on, on.size - max_points, replace=False)
+            valid = valid.copy()
+            valid[drop] = False
         per_subject_valid_masks.append(valid)
         per_subject_queries.append(torch.as_tensor(qc_s[valid], dtype=torch.float32))
         per_subject_query_times.append(torch.as_tensor(qt_s[valid], dtype=torch.int32))
@@ -1180,7 +1196,7 @@ def run_inference(
     n_frames=128,
     n_overlap=2,
     n_views=None,
-    view_seed=None,
+    seed=None,
     max_kpts=None,
     per_subject=False,
     device=None,
@@ -1190,6 +1206,7 @@ def run_inference(
     query_first=True,
     motion_margin=True,
     carry_latent=False,
+    max_points=None,
 ):
     """Run inference on one trial with an already-loaded model.
 
@@ -1201,12 +1218,16 @@ def run_inference(
     training convention) within the windowed, per-chunk re-cropping tracker, instead of all
     points at start_frame. motion_margin: expand each chunk's crop by the previous chunk's
     per-point velocity so fast subjects stay in-frame (disable for the legacy-identical path).
+
+    max_points (per subject): random-subsample each subject's tracked points to this cap
+    (seeded by `seed`, shared with camera subsampling) -- bounds memory/time on dense sets.
+    See load_trial for details.
     """
     if device is None:
         device = next(model.parameters()).device
 
     trial = load_trial(trial_path, start_frame=start_frame, n_frames=n_frames,
-                       query_first=query_first)
+                       query_first=query_first, max_points=max_points, seed=seed)
     mode                    = trial['mode']
     metadata_path           = trial['metadata_path']
     cam_names               = trial['cam_names']
@@ -1239,7 +1260,7 @@ def run_inference(
     cam_indices_used = list(range(n_cams_total))
 
     if n_views is not None and n_views < n_cams_total:
-        rng = np.random.default_rng(view_seed)
+        rng = np.random.default_rng(seed)
         cam_indices_used = sorted(rng.choice(n_cams_total, n_views, replace=False).tolist())
         print(f'Subsampling {n_views}/{n_cams_total} cameras: indices {cam_indices_used}')
         camera_group = [camera_group[i] for i in cam_indices_used]

@@ -88,7 +88,7 @@ def main():
         n_frames=args.n_frames,
         n_overlap=args.n_overlap,
         n_views=args.n_views,
-        view_seed=args.view_seed,
+        seed=args.view_seed,
         max_kpts=args.max_kpts,
         per_subject=args.per_subject,
         device=device,
