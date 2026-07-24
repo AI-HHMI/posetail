@@ -875,13 +875,17 @@ class DecoupledCrossAttention(nn.Module):
             nn.init.xavier_uniform_(proj.weight)
             nn.init.zeros_(proj.bias)
 
-    def forward(self, query, kv):
-        """query: (B, Lq, latent_dim); kv: (B, Lk, kv_dim) -> (B, Lq, latent_dim)."""
+    def forward(self, query, kv, attn_mask=None):
+        """query: (B, Lq, latent_dim); kv: (B, Lk, kv_dim) -> (B, Lq, latent_dim).
+
+        attn_mask: optional (B, 1|num_heads, Lq, Lk) additive float or bool mask
+        (True = keep, matching F.scaled_dot_product_attention); None = unmasked.
+        """
         q = rearrange(self.q_proj(query), 'b l (h d) -> b h l d', h=self.num_heads)
         k = rearrange(self.k_proj(kv),    'b l (h d) -> b h l d', h=self.num_heads)
         v = rearrange(self.v_proj(kv),    'b l (h d) -> b h l d', h=self.num_heads)
         dropout_p = self.dropout if self.training else 0.0
-        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
         attn = rearrange(attn, 'b h l d -> b l (h d)')
         return self.out_proj(attn)
 
@@ -914,7 +918,8 @@ class Decoder(nn.Module):
                  learnable_scale=False,
                  learnable_scale_depth=False,
                  scale_init=1.0,
-                 scale_delta=2.0):
+                 scale_delta=2.0,
+                 use_memory=False):
         super().__init__()
 
         self.embed_dim = embed_dim
@@ -1088,6 +1093,26 @@ class Decoder(nn.Module):
             ])
             self.norm_ts = nn.ModuleList([AdaptiveLayerNorm(embed_dim) for _ in range(num_layers)])
 
+        # Per-point memory cross-attention: each query token attends to its OWN point's
+        # small bank of context-frame memory vectors (see MemoryEncoder). The bank has
+        # M+1 keys (M context entries + a learned null), independent of clip length, so
+        # this block is much cheaper than the scene cross-attention.
+        self.use_memory = use_memory
+        if self.use_memory:
+            self.memory_cross_attns = nn.ModuleList([
+                DecoupledCrossAttention(embed_dim, embed_dim, self.cross_attn_dim,
+                                        num_heads, dropout)
+                for _ in range(num_layers)
+            ])
+            self.norm_mems = nn.ModuleList([AdaptiveLayerNorm(embed_dim)
+                                            for _ in range(num_layers)])
+            # Zero-init the output projections so the memory path starts as an exact
+            # no-op: a checkpoint warm-started into a memory-enabled model reproduces its
+            # predictions until this learns to use the bank.
+            for mca in self.memory_cross_attns:
+                nn.init.zeros_(mca.out_proj.weight)
+                nn.init.zeros_(mca.out_proj.bias)
+
         # Per-mode output heads: index 0 = 2D, index 1 = 3D.
         # In grid mode the heads emit per-axis bin logits (marginal soft-argmax):
         #   3D    -> 3*G logits,  depth -> G logits,  2D -> 2*P pixel logits.
@@ -1244,8 +1269,27 @@ class Decoder(nn.Module):
         probs = self._grid_softmax(logits)
         return (probs * grid_values.to(probs.dtype)).sum(dim=-1)
 
+    def _memory_read(self, layer_idx, x_normed, memory_bank, T, N_cams):
+        """Each query token attends to its OWN point's memory entries.
+
+        x_normed: ((cams b), (t k), dim) normalized decoder stream.
+        memory_bank: (B, K, M, dim) -- entries with nothing to remember already carry
+        MemoryEncoder's learned null token, so no validity mask is needed here.
+        Returns the residual, same shape as x_normed.
+        """
+        bank = memory_bank.to(x_normed.dtype)
+        # Each token (cam, b, t, k) reads bank[b, k]; expand over cams and frames to match
+        # the flattened (cams b) (t k) query layout (t-major, so (t k) pairs with k tiled).
+        keys = repeat(bank, 'b k m d -> (cams b) (t k) m d', cams=N_cams, t=T)
+
+        # Flatten every query token into its own attention problem: 1 query, M keys.
+        q = rearrange(x_normed, 'cb tk d -> (cb tk) 1 d')
+        kv = rearrange(keys, 'cb tk m d -> (cb tk) m d')
+        out = self.memory_cross_attns[layer_idx](q, kv)                   # (BQ, 1, dim)
+        return rearrange(out[:, 0], '(cb tk) d -> cb tk d', cb=x_normed.shape[0])
+
     def forward(self, scene_features, query_embeds, rays, mode_idx,
-                scene_frame_pos=None):
+                scene_frame_pos=None, memory_bank=None):
         """
         Args:
             scene_features: [N_cams, B, N_tokens, encoder_dim] from SceneRepresentation
@@ -1255,6 +1299,9 @@ class Decoder(nn.Module):
             scene_frame_pos: [N_tokens] frame index (in query-frame units) of each scene
                 token, required when cross_attn_rope is on (the key positions for temporal
                 RoPE). Ignored otherwise.
+            memory_bank: [B, K, M, embed_dim] per-point context-frame memory (see
+                MemoryEncoder), or None -> the memory cross-attention is skipped.
+
         Returns:
             dict with per-head tensors [B, T, K, N_cams, ·]: 'out_3d','out_2d','out_vis',
             'out_conf','out_depth','out_conf_3d'; 'grid_logits' (dict or None); 'latent'
@@ -1300,6 +1347,13 @@ class Decoder(nn.Module):
             else:
                 attn_out = self.cross_attns[layer_idx](x_normed, kv)
             x = x + attn_out
+
+            # Per-point memory: what this point looked like at the context frames.
+            # (scene cross-attn above = where it is now; this = what it has been.)
+            if self.use_memory and memory_bank is not None:
+                x = x + self._memory_read(
+                    layer_idx, self.norm_mems[layer_idx](x, mode_idx),
+                    memory_bank, T, N_cams)
 
             x = x + self.mlps[layer_idx](self.norm2s[layer_idx](x, mode_idx))
 
@@ -1472,3 +1526,198 @@ class AttentionPooling(nn.Module):
         pooled, _ = self.attn(q, kv, kv, key_padding_mask=kpm, need_weights=False)
         pooled = pooled + self.ff(self.norm_out(pooled))         # [(b k), 1, dim]
         return rearrange(pooled[:, 0], '(b k) d -> b k d', b=b, k=k)
+
+
+class MemoryEncoder(nn.Module):
+    """Builds a small per-point appearance memory bank from a few CONTEXT frames.
+
+    Motivation: the decoder reads the scene per frame, which tells it *where a point is
+    now* but carries no history of *what it looked like before*. This module encodes a
+    handful of context frames sampled from anywhere in the clip (non-causal) into ONE
+    vector per (point, context frame); the decoder then cross-attends to that bank
+    (``Decoder.memory_cross_attns``) for identity / appearance history.
+
+    Pipeline, per context frame m:
+      1. Encode the frame ONCE per camera with the (shared, usually frozen) scene ViT --
+         one encode serves every point.
+      2. Seed a per-point query with the existing ``QueryEncoder``, evaluated at the
+         point's position *at frame m* (image patch + pixel position + depth + visibility
+         + occlusion). Cheap and reuses trained machinery -- no new query encoder.
+      3. Cross-attend that seed to the frame's ViT tokens -> one vector per (point, cam).
+      4. Pool over cameras into a SINGLE vector per point (permutation-invariant), so the
+         memory is viewpoint-robust rather than tied to one camera.
+      5. Add a Fourier embedding of the context frame index so the decoder can tell the
+         entries apart / know how far away in time each one is.
+
+    Returns ``memory_bank [B, N, M, dim]``. An entry whose point was out of frame in
+    EVERY camera at that context frame carries no information, so it is replaced by a
+    learned ``null_entry`` -- a uniform "nothing remembered here" token. That keeps the
+    bank a single dense tensor (no companion mask) and keeps attention well-defined even
+    when every entry is invalid.
+    """
+
+    def __init__(self, scene_encoder, query_encoder, dim, num_heads=8,
+                 cross_attn_dim=None, max_freq=10, dropout=0.0):
+        super().__init__()
+        # Shared references -- NOT submodules we own. Assigning a module that is already a
+        # child of the parent model would double-register its parameters (breaking the
+        # optimizer's param grouping and the checkpoint), so hide them from nn.Module's
+        # registration via object.__setattr__ and rely on the parent for ownership.
+        object.__setattr__(self, 'scene_encoder', scene_encoder)
+        object.__setattr__(self, 'query_encoder', query_encoder)
+
+        self.dim = dim
+        self.max_freq = max_freq
+        cross_attn_dim = cross_attn_dim or dim
+
+        # Per-point read of the context frame's ViT tokens. NOT zero-init: this is the only
+        # path by which appearance enters a memory vector.
+        self.read_norm_q = nn.LayerNorm(dim)
+        self.read_attn = DecoupledCrossAttention(
+            latent_dim=dim, kv_dim=scene_encoder.embed_dim,
+            cross_attn_dim=cross_attn_dim, num_heads=num_heads, dropout=dropout)
+
+        # Cross-camera fusion (Set-Transformer PMA): permutation-invariant over a variable
+        # number of visible cameras. t=1 here -- we pool over cameras only, not time.
+        self.camera_pool = AttentionPooling(dim, num_heads=num_heads,
+                                            use_time_embedding=False)
+
+        # Absolute context-frame index -> embedding, added to the pooled vector so each
+        # bank entry is tagged with its frame. Fixed normalizer (matches QueryEncoder's
+        # _fourier_time) so a given frame index maps identically at any clip length.
+        self.time_norm = float(getattr(query_encoder, 'time_norm', 16.0))
+        self.temporal_embed = nn.Linear(2 * max_freq + 1, dim)
+
+        # Substituted for entries whose point is out of frame in every camera: a learned
+        # "nothing remembered at this frame" token, so the bank needs no validity mask.
+        self.null_entry = nn.Parameter(torch.zeros(dim))
+        nn.init.trunc_normal_(self.null_entry, std=0.02)
+
+    def _frame_embed(self, ctx_idx):
+        """ctx_idx: (B, M) int -> (B, M, dim)."""
+        s = (ctx_idx.to(torch.float32) / self.time_norm)[..., None, None]   # (B, M, 1, 1)
+        feat = torch.cat([s, get_fourier_encoding(s, min_freq=0, max_freq=self.max_freq)],
+                         dim=-1)
+        return self.temporal_embed(feat)[..., 0, :]                         # (B, M, dim)
+
+    def _encode_context(self, views_norm, ctx_idx):
+        """ViT-encode the context frames once per (camera, context frame).
+
+        Returns [n_cams, B*M, n_tokens, encoder_dim].
+
+        NOTE the tubelet: the scene encoder consumes videos with tubelet_size=2, and
+        SceneRepresentation.forward computes its positional grid as T // tubelet_size --
+        a single frame (T=1) would give gT=0 and corrupt the pos-embed. So each context
+        frame is duplicated into a 2-frame clip, yielding gT=1 and reusing the whole
+        SceneRepresentation path (pos-embed, hierarchical levels, kv_proj/kv_norm)
+        unchanged, so memory tokens live in the same KV space the decoder already reads.
+        """
+        B, M = ctx_idx.shape
+        bidx = torch.arange(B, device=ctx_idx.device)[:, None].expand(B, M)
+        clips = []
+        for view in views_norm:                      # view: [B, T, C, H, W]
+            ctx = view[bidx, ctx_idx]                # [B, M, C, H, W]
+            ctx = rearrange(ctx, 'b m c h w -> (b m) c h w')
+            clips.append(repeat(ctx, 'bm c h w -> bm t c h w', t=2))   # duplicate-to-2
+        return self.scene_encoder(clips)             # [cams, (B M), tokens, enc_dim]
+
+    def forward(self, views_norm, camera_group, coords_traj, ctx_idx,
+                cube_scale, occlusion_ctx=None, visible_ctx=None):
+        """
+        Args:
+            views_norm: list of [B, T, C, H, W] normalized clips (one per camera).
+            camera_group: list of camera dicts.
+            coords_traj: [B, T, N, R] the points' positions at EVERY frame (R=3 world or
+                R=2 pixel). Ground truth at training; predicted trajectory at inference.
+                A moving point must be localized at its position *at each context frame*,
+                which is why the full trajectory (not the query position) is required.
+            ctx_idx: [B, M] absolute frame indices of the context frames.
+            cube_scale: [n_cams, B] scene scale, as in TrackerEncoder.
+            occlusion_ctx: [B, M, N, n_cams] per-camera occlusion state
+                {occluded=0, visible=1, unknown=-1} at each context frame, or None
+                (all-unknown). Cameras that are KNOWN occluded are excluded from the
+                camera pool: their image patch shows the occluder, not the point, so
+                folding them in would poison the appearance memory. Unknown (-1) is kept.
+            visible_ctx: [B, M, N, n_cams] bool, True where the point is geometrically in
+                frame in that camera at that context frame. None -> computed from the
+                projection.
+
+        Returns:
+            memory_bank: [B, N, M, dim] -- entries with no valid camera are the learned
+            null token.
+        """
+        B, M = ctx_idx.shape
+        N = coords_traj.shape[2]
+        R = coords_traj.shape[3]
+        n_cams = len(views_norm)
+        device = coords_traj.device
+
+        # --- 1. scene tokens for each context frame (one encode per (cam, ctx)) ---
+        mem_tokens = self._encode_context(views_norm, ctx_idx)      # [cams,(B M),tok,enc]
+
+        # --- 2. per-point seed at the point's position IN that context frame ---
+        bidx = torch.arange(B, device=device)[:, None].expand(B, M)
+        ctx_coords = coords_traj[bidx, ctx_idx]                     # [B, M, N, R]
+        ctx_coords_flat = rearrange(ctx_coords, 'b m n r -> b (m n) r')
+        # query_time == target_time == the context frame: QueryEncoder samples its image
+        # patch at `query_time`, so this reads the point's appearance AT frame m (gap 0).
+        ctx_t_flat = repeat(ctx_idx, 'b m -> b (m n)', n=N).to(torch.int32)
+        occ_flat = (rearrange(occlusion_ctx, 'b m n c -> b (m n) c')
+                    if occlusion_ctx is not None else None)
+
+        seed = self.query_encoder(
+            views_norm, camera_group, ctx_coords_flat, ctx_t_flat, ctx_t_flat,
+            cube_scale, occlusion=occ_flat)                         # [B,(M N),cams,dim]
+        seed = rearrange(seed, 'b (m n) cams d -> cams (b m) n d', m=M, n=N)
+
+        # --- 3. read the frame's tokens, per point ---
+        q = rearrange(self.read_norm_q(seed), 'cams bm n d -> (cams bm) n d')
+        kv = rearrange(mem_tokens, 'cams bm tok d -> (cams bm) tok d')
+        read = self.read_attn(q, kv)                                # [(cams B M), N, dim]
+        read = rearrange(read, '(cams bm) n d -> cams bm n d', cams=n_cams)
+        mem_cam = seed + read                                       # residual on the seed
+
+        # --- 4. which cameras actually SHOW the point at this context frame ---
+        # Geometrically in frame, and not known to be occluded there: an occluded view's
+        # patch is the occluder's appearance, which would corrupt the pooled memory.
+        if visible_ctx is None:
+            visible_ctx = self._compute_visible(camera_group, ctx_coords, R)
+        if occlusion_ctx is not None:
+            visible_ctx = visible_ctx & (occlusion_ctx != 0)
+        vis_c = rearrange(visible_ctx, 'b m n cams -> (b m) n cams')   # [(B M), N, cams]
+
+        # --- 5. fuse across cameras -> one vector per (point, ctx) ---
+        x = rearrange(mem_cam, 'cams bm n d -> bm 1 n cams d')      # t=1: pool cams only
+        kpm = rearrange(~vis_c, 'bm n cams -> bm n 1 cams')         # True = drop
+        # A point out of frame in EVERY camera would give an all-masked attention row
+        # (NaN). Unmask it so the pool stays finite; the entry is replaced by null_entry
+        # below anyway.
+        all_masked = kpm.all(dim=-1, keepdim=True)
+        kpm = kpm & ~all_masked
+        fused = self.camera_pool(x, key_padding_mask=kpm)           # [(B M), N, dim]
+        fused = rearrange(fused, '(b m) n d -> b m n d', b=B, m=M)
+
+        # --- 6. tag each entry with its frame, null out the empty ones ---
+        fused = fused + self._frame_embed(ctx_idx)[:, :, None, :]
+        valid = rearrange(vis_c.any(dim=-1), '(b m) n -> b m n', b=B, m=M)
+        fused = torch.where(valid[..., None],
+                            fused,
+                            self.null_entry.to(fused.dtype).expand_as(fused))
+        return rearrange(fused, 'b m n d -> b n m d')
+
+    @staticmethod
+    def _compute_visible(camera_group, ctx_coords, R):
+        """[B,M,N,R] -> [B,M,N,n_cams] bool: point geometrically inside the frame."""
+        B, M, N, _ = ctx_coords.shape
+        flat = rearrange(ctx_coords, 'b m n r -> (b m n) r')
+        if R == 3:
+            vis = torch.stack([is_point_visible(cam, flat, margin=2)
+                               for cam in camera_group])            # [cams, (B M N)]
+            vis = rearrange(vis, 'cams (b m n) -> b m n cams', b=B, m=M, n=N)
+        else:
+            # 2D: single camera, coords are already pixels -- in-frame test against size.
+            cam = camera_group[0]
+            size = cam['size'].to(flat.dtype).to(flat.device)
+            inside = ((flat >= 0) & (flat < size)).all(dim=-1)
+            vis = rearrange(inside, '(b m n) -> b m n 1', b=B, m=M, n=N)
+        return vis & torch.isfinite(ctx_coords).all(dim=-1, keepdim=True)

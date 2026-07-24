@@ -244,7 +244,8 @@ def run(config_path, fabric):
         muon_scale = config.training.optimizer.get('muon_lr_scale', 1.0)
         wd = config.training.optimizer.weight_decay
         dec_substr = ('decoder.cross_attns', 'decoder.mlps', 'decoder.camera_attns',
-                      'decoder.temporal_attns')
+                      'decoder.temporal_attns', 'decoder.memory_cross_attns',
+                      'memory_encoder')
         scene_ids = {id(p) for p in model.scene_encoder.parameters()} \
             if hasattr(model, 'scene_encoder') else set()
         muon_dec, muon_enc, adamw_slow, adamw_base = [], [], [], []

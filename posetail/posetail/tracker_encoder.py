@@ -12,7 +12,8 @@ from posetail.posetail.cube import undistort_points, triangulate_simple_batch, t
 from posetail.posetail.cube import points_to_rays, _invert_SE3, solve_scale_offset
 from posetail.posetail.cube import noisy_or_logit
 from posetail.posetail.utils import PadToMultiple, PadToSize, count_parameters
-from posetail.posetail.encoder_decoder import SceneRepresentation, QueryEncoder, Decoder
+from posetail.posetail.encoder_decoder import (SceneRepresentation, QueryEncoder, Decoder,
+                                               MemoryEncoder)
 
 from torchvision import transforms
 
@@ -83,7 +84,10 @@ class TrackerEncoder(nn.Module):
                  learnable_scale = False,
                  learnable_scale_depth = False,
                  scale_init = 1.0,
-                 scale_delta = 2.0):
+                 scale_delta = 2.0,
+                 memory_attention = False,
+                 memory_num_context = 4,
+                 memory_context_sampling = 'random'):
         super().__init__()
 
         self.mode_3d = mode_3d
@@ -251,7 +255,75 @@ class TrackerEncoder(nn.Module):
             learnable_scale_depth=learnable_scale_depth,
             scale_init=scale_init,
             scale_delta=scale_delta,
+            use_memory=memory_attention,
         )
+
+        # Per-point appearance memory over a few context frames sampled from the clip.
+        # Reuses the (frozen) scene encoder and the query encoder -- shared references, so
+        # no parameters are duplicated; only the read/pool/time modules are new.
+        self.memory_attention = memory_attention
+        self.memory_num_context = memory_num_context
+        assert memory_context_sampling in ('random', 'uniform'), \
+            f"memory_context_sampling must be 'random'|'uniform', got {memory_context_sampling!r}"
+        self.memory_context_sampling = memory_context_sampling
+        if memory_attention:
+            self.memory_encoder = MemoryEncoder(
+                self.scene_encoder, self.query_encoder,
+                dim=latent_dim, num_heads=n_heads,
+                cross_attn_dim=cross_attn_dim, max_freq=max_freq,
+            )
+
+    def _normalize_views(self, views, device):
+        """Raw (b t h w c) uint8-ish frames -> list of normalized (b t c h w) tensors."""
+        out = []
+        for frames in views:
+            frames = frames.to(device)
+            frames = rearrange(frames, 'b t h w c -> b t c h w')
+            out.append(self.transform_norm(frames))
+        return out
+
+    def _cube_scale(self, camera_group, coords, n_cams, device):
+        """Per-camera scene scale (n_cams, B), shared across cameras unless configured
+        per-camera. Extracted so build_memory_bank uses exactly the same scale as forward."""
+        R = coords.shape[-1]
+        if R == 3:
+            cube_scale = get_camera_scale(camera_group, coords)     # (n_cams, B)
+        else:
+            cube_scale = torch.ones((n_cams, coords.shape[0]), device=device)
+        if not self.per_camera_cube_scale:
+            med = torch.median(cube_scale, dim=0).values            # (B,)
+            cube_scale = med[None, :].expand(n_cams, coords.shape[0]).contiguous()
+        return cube_scale
+
+    def build_memory_bank(self, views, coords, camera_group, coords_traj, ctx_idx,
+                          occlusion_traj=None):
+        """Build the per-point memory bank for a clip -> (B, N, M, latent_dim).
+
+        Called by the training / inference loop (see train_utils.sample_context_idx), NOT
+        by forward(): the caller chooses the context frames, and forward() then just
+        consumes the finished bank. Handles the frame normalization and scene scale so the
+        caller can pass raw views.
+
+        Args:
+            views: list of [B, T, H, W, C] raw frames, one per camera (as for forward).
+            coords: [B, N, R] query positions (used only for the scene scale).
+            coords_traj: [B, T, N, R] per-frame point positions -- ground truth while
+                training, the predicted trajectory at inference.
+            ctx_idx: [B, M] frame indices of the context frames to remember.
+            occlusion_traj: [B, T, N, n_cams] per-frame occlusion state {0,1,-1} or None.
+        """
+        assert self.memory_attention, 'build_memory_bank requires memory_attention=True'
+        device = coords.device
+        B = coords.shape[0]
+        n_cams = len(views)
+        views_norm = self._normalize_views(views, device)
+        cube_scale = self._cube_scale(camera_group, coords, n_cams, device)
+        occ_ctx = None
+        if occlusion_traj is not None:
+            bidx = torch.arange(B, device=device)[:, None].expand_as(ctx_idx)
+            occ_ctx = occlusion_traj[bidx, ctx_idx]                 # (B, M, N, n_cams)
+        return self.memory_encoder(views_norm, camera_group, coords_traj, ctx_idx,
+                                   cube_scale, occlusion_ctx=occ_ctx)
 
     def unfreeze_video_encoder(self, iteration):
         """Unfreeze the video encoder once `iteration` reaches the configured
@@ -280,14 +352,18 @@ class TrackerEncoder(nn.Module):
         print("  decoder params: {:,d}".format(count_parameters(self.decoder)))
         
     def forward(self, views, coords, camera_group, query_times=None,
-                kpt_chunk=None, occlusion=None):
+                kpt_chunk=None, occlusion=None, memory_bank=None):
         '''
         B: batch size
         T: number of frames in video
-        C: number of channels 
+        C: number of channels
         H: height of image
         W: width of image
         D: latent dimension
+
+        memory_bank: (B, N, M, D) per-point appearance memory over M context frames,
+            produced by build_memory_bank(). None -> the memory cross-attention is
+            skipped entirely.
         '''
         
         device = coords.device
@@ -311,13 +387,7 @@ class TrackerEncoder(nn.Module):
         
         # assert self.n_frames == T
 
-        if R == 3:
-            cube_scale = get_camera_scale(camera_group, coords)  # (n_cams, B)
-        else:
-            cube_scale = torch.ones((n_cams, B), device=device)
-        if not self.per_camera_cube_scale:
-            med = torch.median(cube_scale, dim=0).values  # (B,)
-            cube_scale = med[None, :].expand(n_cams, B).contiguous()
+        cube_scale = self._cube_scale(camera_group, coords, n_cams, device)
 
         # Effective focal per camera (cropped+resized intrinsics). cube_scale only converts
         # world->pixels, leaving a leftover f_eff factor in the absolute-depth outputs; scaling
@@ -362,24 +432,17 @@ class TrackerEncoder(nn.Module):
         assert query_times.shape[0] == B
         assert query_times.shape[1] == N
             
-        # normalize frames
-        views_norm = []
-        for i, frames in enumerate(views): 
-            # frames = 2 * (frames / 255.0) - 1
-            frames = frames.to(device)
-            frames = rearrange(frames, 'b t h w c -> b t c h w')
-            frames = self.transform_norm(frames)
-            views_norm.append(frames)
+        views_norm = self._normalize_views(views, device)
 
         return self._forward_window(
             views_norm, coords, query_times, camera_group,
             cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
-            kpt_chunk=kpt_chunk, occlusion=occlusion)
+            kpt_chunk=kpt_chunk, occlusion=occlusion, memory_bank=memory_bank)
 
     def _forward_window(self, views_norm, coords, query_times, camera_group,
                         cube_scale, cube_scale_shared, f_eff,
                         scene_center, scene_radius, kpt_chunk=None,
-                        occlusion=None):
+                        occlusion=None, memory_bank=None):
         """Single encoder/decoder pass over the whole clip.
 
         views_norm frames are already normalized ('b t c h w'); coords are the query
@@ -402,10 +465,13 @@ class TrackerEncoder(nn.Module):
             for k0 in range(0, N, kpt_chunk):
                 k1 = min(k0 + kpt_chunk, N)
                 occ = occlusion[:, k0:k1] if occlusion is not None else None
+                # The bank is per-point, so slice it on the point axis like occlusion.
+                mb = memory_bank[:, k0:k1] if memory_bank is not None else None
                 r = self._decode_from_scene(
                     scene_features, views_norm, coords[:, k0:k1], query_times[:, k0:k1],
                     camera_group, cube_scale, cube_scale_shared, f_eff,
-                    scene_center, scene_radius, occlusion=occ)
+                    scene_center, scene_radius, occlusion=occ,
+                    memory_bank=mb)
                 # Drop the loss-only grid tensors NOW (not at concat): they carry the huge
                 # per-point P/K grid dim and are unused at inference. Retaining them across the
                 # loop would accumulate all chunks' grids on-GPU (~full-N) and defeat chunking.
@@ -416,7 +482,7 @@ class TrackerEncoder(nn.Module):
         return self._decode_from_scene(
             scene_features, views_norm, coords, query_times, camera_group,
             cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
-            occlusion=occlusion)
+            occlusion=occlusion, memory_bank=memory_bank)
 
     # Loss-only, per-point grid logits: huge (they carry the P/K grid dim) and unused at
     # inference. kpt_chunk is inference-only, so we DON'T reassemble them to full-N -- that
@@ -441,7 +507,8 @@ class TrackerEncoder(nn.Module):
 
     def _decode_from_scene(self, scene_features, views_norm, coords, query_times, camera_group,
                            cube_scale, cube_scale_shared, f_eff,
-                           scene_center, scene_radius, occlusion=None):
+                           scene_center, scene_radius, occlusion=None,
+                           memory_bank=None):
         """Per-point decode from precomputed scene_features (the body of the forward pass
         after scene encoding). Returns the result dict. See _forward_window."""
         device = coords.device
@@ -508,7 +575,8 @@ class TrackerEncoder(nn.Module):
 
         dec = self.decoder(
             scene_features, query_embeds, query_rays, mode_idx,
-            scene_frame_pos=scene_frame_pos)
+            scene_frame_pos=scene_frame_pos,
+            memory_bank=memory_bank)
         grid_logits = dec['grid_logits']
 
         def _to_cams(t):
