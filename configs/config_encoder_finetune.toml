@@ -163,7 +163,10 @@ finetune = true
 # checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260712_124515-t8ulpbro/files/checkpoints/checkpoint_01187840.pth'
 
 # finetuned 2
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260716_220801-066k6c9u/files/checkpoints/checkpoint_01177600.pth'
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260716_220801-066k6c9u/files/checkpoints/checkpoint_01177600.pth'
+
+# finetuned 3
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260721_172745-zbkyq75r/files/checkpoints/checkpoint_00256000.pth'
 
 
 
@@ -179,7 +182,7 @@ debug_ix = -1 # only works for val
 [training.optimizer]
 # Decoder trains from scratch on the frozen backbone -> 5e-4 base LR (6i8ryveg). encoder_lr_scale
 # moot (encoder frozen).
-learning_rate = 9e-5
+learning_rate = 6e-5
 muon_schedulefree = true
 weight_decay = 0.002
 warmup_steps = 2000

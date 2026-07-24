@@ -100,15 +100,15 @@ def parse_args():
 def run(config_path, fabric):
 
     # mp.set_start_method('spawn', force = True)
-    # 'medium' is safe now that the far-camera geometry is precision-robust: the direct head
-    # reconstructs anchor-relative (tracker_encoder) and triangulation runs in float64
-    # (cube.triangulate_simple_batch_reg), so neither carries the ~6.5e5 camera-distance
-    # magnitude through a reduced-precision matmul. Previously 'medium'/'high' (bf16/TF32,
-    # esp. on Blackwell) rounded away the pixel-scale signal and the 3D reconstruction
-    # collapsed on far-camera datasets like johnson-fly. Set 'highest' if a far-camera run
-    # ever looks off. (The rays head separately mispredicts absolute ~6.5e5 depth for far
+    # 'highest' (true fp32 matmul): reduced-precision 'medium'/'high' (bf16/TF32) rounds away
+    # the pixel-scale signal against the ~6.5e5 camera-distance magnitude and the 3D
+    # reconstruction collapses on far-camera datasets like johnson-fly. This is worse/less
+    # predictable across GPU generations (A100 vs H100, esp. Blackwell), so pin true fp32.
+    # The direct head reconstructs anchor-relative (tracker_encoder) and triangulation runs
+    # in float64 (cube.triangulate_simple_batch_reg), so the accuracy cost of full precision
+    # here is small. (The rays head separately mispredicts absolute ~6.5e5 depth for far
     # cameras under ANY precision — a pre-existing modeling issue, not matmul precision.)
-    torch.set_float32_matmul_precision('medium')
+    torch.set_float32_matmul_precision('highest')
 
     config = load_config(config_path)
     seed = fabric.broadcast(resolve_seed(config.training.seed), src=0)
