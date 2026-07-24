@@ -174,7 +174,7 @@ def _build_scorer_dataset(config, split, corruption_cfg):
 
 
 def run(config_path, fabric):
-    torch.set_float32_matmul_precision('medium')
+    torch.set_float32_matmul_precision('high')
     config = load_config(config_path)
     seed = fabric.broadcast(resolve_seed(config.training.seed), src=0)
     set_seeds(seed)
