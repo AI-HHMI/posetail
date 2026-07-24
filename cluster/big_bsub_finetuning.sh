@@ -40,5 +40,5 @@ d=$(date +d%dh%H)
 #     /bin/bash cluster/train_script.sh configs/config_ft_muonsf_8gpu_5b.toml
 
 bsub -J enf8-$d -e ~/logs/posetail/enm8-$d.err -o ~/logs/posetail/enf8-$d.out \
-    -n 72 -q gpu_h100 -R "span[hosts=1]" -gpu "num=6" -W 96:00 \
+    -n 48 -q gpu_h100 -R "span[hosts=1]" -gpu "num=4" -W 96:00 \
     /bin/bash cluster/train_script.sh configs/config_encoder_finetune.toml

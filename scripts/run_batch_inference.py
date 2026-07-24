@@ -26,7 +26,7 @@ import yaml
 
 from posetail.inference.inference_utils import load_model_from_base_folder, run_inference
 
-DEFAULT_PREFIX = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v3'
+DEFAULT_PREFIX = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v4'
 DEFAULT_OUT_ROOT = '~/ghome/results/posetail-inference/2026-06-11'
 
 HERE = os.path.dirname(os.path.abspath(__file__))

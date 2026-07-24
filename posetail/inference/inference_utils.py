@@ -683,6 +683,9 @@ def run_tracker_encoder_on_videos(
     else:
         qt_abs = start_frame + query_times.to(device=device, dtype=torch.int64).view(-1)
 
+    # Logit written for not-yet-appeared / absent points so sigmoid() -> ~0 (invisible, no conf).
+    LOGIT_INVISIBLE = -30.0
+
     coords_pred_all = []
     vis_pred_all = []
     conf_pred_all = []
@@ -830,32 +833,68 @@ def run_tracker_encoder_on_videos(
                     occ_chunk[:, seeded] = (occ_gt_dev[:, seeded] if occ_gt_dev is not None
                                             else -1)
 
+            # Query-first: run the model on ONLY the points that have appeared by this
+            # window (before | seeded). A not-yet-appeared point is neither fed to the model
+            # -- so it cannot perturb the scene encoding / cross-point attention -- nor
+            # stored; it is scattered back below as NaN coords / invisible logits. With every
+            # query_time == 0 (legacy) every point is 'appeared' every window, so active_idx
+            # == arange(N) and this is bit-for-bit identical to feeding the full set.
+            active_idx = appeared.nonzero(as_tuple=True)[0]          # (M,)
+            M = int(active_idx.numel())
+
+            def _scatter(sub, kdim, fill):
+                """Scatter a subset tensor (keypoint axis of length M at kdim) into a full-N
+                tensor, filling the not-yet-appeared points with `fill`."""
+                shape = list(sub.shape)
+                shape[kdim] = N
+                full = sub.new_full(shape, fill)
+                if M > 0:
+                    full.index_copy_(kdim, active_idx, sub)
+                return full
+
+            # Points fed to the model this window: the appeared set, or -- when nothing has
+            # appeared yet (only possible if no point is visible at start_frame) -- a single
+            # dummy point (index 0) so the model still returns correctly-shaped outputs; its
+            # result is discarded by the fill-only scatter below (M==0 -> no index_copy_).
+            run_idx = active_idx if M > 0 else active_idx.new_zeros(1)
+            latent_in = (init_latent.index_select(2, run_idx)
+                         if init_latent is not None else None)
             outputs = model(
                 views=views,
-                coords=queries_model,
-                query_times=times_chunk,
+                coords=queries_model[:, run_idx],
+                query_times=times_chunk[:, run_idx],
                 camera_group=camera_group_chunk,
-                init_latent=init_latent,
+                init_latent=latent_in,
                 kpt_chunk=max_kpts,
-                occlusion=occ_chunk,
+                occlusion=(occ_chunk[:, run_idx] if occ_chunk is not None else None),
             )
 
             if is_2d:
                 # 2D predictions live in model-input pixel space; map back to the
                 # original full-image frame so outputs and the recurrence stay there.
-                coords_pred = outputs['2d_pred'][0]  # single cam: (b, t, n, 2)
+                coords_pred = outputs['2d_pred'][0]  # single cam: (b, t, m, 2)
                 coords_pred = crop_low + coords_pred / model_scale
                 coords_pred = coords_pred[:, :keep_len]
             else:
                 coords_pred = outputs[pred_key_3d][:, :keep_len]
             vis_pred = outputs['vis_pred'][:, :keep_len]
             conf_pred = outputs['conf_pred'][:, :keep_len]
-            # Per-camera visibility logits (cams,b,t,n); time axis is dim 2, not dim 1.
+            # Per-camera visibility logits (cams,b,t,m); time axis is dim 2, not dim 1.
             vis_pred_2d = (outputs['vis_pred_2d'][:, :, :keep_len]
                            if 'vis_pred_2d' in outputs else None)
 
             if coords_pred.shape[1] == 0:
                 break
+
+            # Scatter the appeared points' outputs back to full N, filling not-yet-appeared
+            # points with NaN coords / invisible logits. Keypoint axis is dim 2 for
+            # coords/vis/conf and dim 3 for the per-camera vis_pred_2d. `_scatter` copies only
+            # when M>0, so the M==0 dummy output is dropped and every point is filled.
+            coords_pred = _scatter(coords_pred, 2, float('nan'))
+            vis_pred = _scatter(vis_pred, 2, LOGIT_INVISIBLE)
+            conf_pred = _scatter(conf_pred, 2, LOGIT_INVISIBLE)
+            if vis_pred_2d is not None:
+                vis_pred_2d = _scatter(vis_pred_2d, 3, LOGIT_INVISIBLE)
 
             # Drop the overlap frames already emitted by the previous chunk (temporal
             # dedup); the first chunk keeps everything from its start.
@@ -884,18 +923,33 @@ def run_tracker_encoder_on_videos(
             # re-anchor query comes from). visible(sigmoid>=0.5)->1, occluded->0 (no -1 from
             # a prediction). Only fed forward when the model uses the occlusion term.
             if getattr(model, 'occlusion_embedding', False) and 'vis_pred_2d' in outputs:
-                vp2d = outputs['vis_pred_2d']                    # (cams, b, t, n) logits
-                vp2d_last = vp2d[:, :, keep_len - 1]             # (cams, b, n)
+                vp2d = outputs['vis_pred_2d']                    # (cams, b, t, M) logits
+                vp2d_last = vp2d[:, :, keep_len - 1]             # (cams, b, M)
                 occ_p = (torch.sigmoid(vp2d_last) >= 0.5).to(torch.int64)
-                occ_pred = occ_p.permute(1, 2, 0).contiguous()  # (cams,b,n) -> (b,n,cams)
+                occ_p = occ_p.permute(1, 2, 0).contiguous()      # (cams,b,M) -> (b,M,cams)
+                # Scatter to full N; not-yet points -> -1 (unknown). They are never read as
+                # active occlusion (a point is 'before' only after its real seed chunk).
+                occ_full = occ_p.new_full((occ_p.shape[0], N, occ_p.shape[2]), -1)
+                if M > 0:
+                    occ_full.index_copy_(1, active_idx, occ_p)
+                occ_pred = occ_full
             else:
                 occ_pred = None
 
             # Thread the decoder latent into the next chunk so the carry spans the whole video
             # (not just within a chunk) -- only when carry_latent. Left None otherwise (the
             # default) to avoid the full-N latent's ~2x peak on dense point sets; None also for
-            # non-windowed models / single-pass.
-            init_latent = outputs.get('final_latent', None) if carry_latent else None
+            # non-windowed models / single-pass. The model ran on the M appeared points, so the
+            # latent is (b,s,M,cams,D); scatter to full N (fill 0) so the next chunk can
+            # index_select its own (superset) active_idx -- appeared grows monotonically.
+            if carry_latent and outputs.get('final_latent') is not None:
+                fl = outputs['final_latent']                     # (b, s, M, cams, D)
+                fl_full = fl.new_zeros((fl.shape[0], fl.shape[1], N, fl.shape[3], fl.shape[4]))
+                if M > 0:
+                    fl_full.index_copy_(2, active_idx, fl)
+                init_latent = fl_full
+            else:
+                init_latent = None
 
             current_frame += keep_len - n_overlap
             pbar.update(keep_len - discard)
@@ -938,6 +992,21 @@ def run_tracker_encoder_on_videos(
     if len(vis_pred_2d_all) > 0:
         # (cams, b, t, n) -> concat over the time axis (dim 2)
         result['vis_pred_2d'] = torch.cat(vis_pred_2d_all, dim=2)
+
+    # A point exists only from its query frame forward (query-first). The per-window subselect
+    # above already drops it from windows before it appears, but the window that SEEDS it is
+    # 'appeared' for its whole span, so the frames in that window before the point's actual
+    # query offset survive as backward extrapolation. Mask every frame strictly before each
+    # point's absolute query frame. No-op for the legacy path (qt_abs == start_frame <= every
+    # frame_number), so all-zero-query runs are unchanged.
+    fn = result['frame_numbers']                                  # (T,) absolute, CPU
+    pre = fn[:, None] < qt_abs.cpu()[None, :]                     # (T, N) bool
+    if bool(pre.any()):
+        result['coords_pred'][0][pre] = float('nan')
+        result['vis_pred'][0][pre] = LOGIT_INVISIBLE
+        result['conf_pred'][0][pre] = LOGIT_INVISIBLE
+        if 'vis_pred_2d' in result:
+            result['vis_pred_2d'][:, 0][:, pre] = LOGIT_INVISIBLE
     return result
 
 
