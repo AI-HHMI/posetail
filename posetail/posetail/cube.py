@@ -83,9 +83,23 @@ def project_cam(cam, p3d_t, downsample_factor = 1, max_normalized = 3.0):
     # p3d_t = torch.as_tensor(p3d)
     # ext_t = torch.as_tensor(cam.get_extrinsics_mat(), dtype=p3d_t.dtype, device=p3d_t.device)
     # mat_t = torch.as_tensor(cam.get_camera_matrix(), dtype=p3d_t.dtype, device=p3d_t.device)
-    ext_t = cam['ext']
-    mat_t = cam['mat']
-    dist = cam['dist']
+    # Run the projection geometry in float64. The extrinsic matmul below forms camera-frame /
+    # projective coordinates whose magnitude is the camera-to-scene distance (~6.5e5 for far,
+    # near-orthographic rigs like johnson-fly). Under reduced-precision float32 matmul
+    # (set_float32_matmul_precision('medium'/'high'), esp. on Blackwell) the operands are rounded
+    # to 10 (TF32) / 7 (bf16) mantissa bits BEFORE the multiply -> ulp ~635 / ~5000 units at 6.5e5,
+    # which annihilates the ~pixel-scale signal (animal position ~200 units, motion ~few px, a
+    # ~1e-4 relative modulation). The reprojection loss (coords_loss_direct_reproj, weight 1.0) then
+    # trains 3d_pred_direct on a ~12% wrong gradient on every far-camera batch and diverges. float64
+    # GEMMs have no bf16/TF32 tensor-core path, so this stays exact regardless of the global setting.
+    # Cost is negligible for a per-point (.,4)@(4,4) projection. Mirrors triangulate_simple_batch_reg;
+    # see scripts/precision_isolate_grad.py. This is the third far-camera precision guard, after
+    # triangulation (float64) and the direct-head anchor-relative reform (tracker_encoder.py).
+    in_dtype = p3d_t.dtype
+    ext_t = cam['ext'].to(torch.float64)
+    mat_t = cam['mat'].to(torch.float64)
+    dist = cam['dist'].to(torch.float64)
+    p3d_t = p3d_t.to(torch.float64)
     cam_type = cam['type'] # pinhole, fisheye # TODO: implement functionality for different camera types
 
     p2d_proj_cam = torch.matmul(to_homogeneous(p3d_t), ext_t.T)[..., :3]
@@ -123,14 +137,14 @@ def project_cam(cam, p3d_t, downsample_factor = 1, max_normalized = 3.0):
     # p2d = from_homogeneous(p2d_raw)
 
     # handle camera offset
-    if 'offset' in cam: 
-        offset = cam['offset']
+    if 'offset' in cam:
+        offset = cam['offset'].to(torch.float64)
         p2d = p2d - offset[None, :]
 
     # account for downsampling
     p2d = p2d / downsample_factor
-    
-    return p2d
+
+    return p2d.to(in_dtype)
 
 # @torch.compile
 def project_points_torch(camera_group, coords_3d, downsample_factor = 1):
