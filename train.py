@@ -100,7 +100,7 @@ def parse_args():
 def run(config_path, fabric):
 
     # mp.set_start_method('spawn', force = True)
-    torch.set_float32_matmul_precision('medium')
+    torch.set_float32_matmul_precision('high')
 
     config = load_config(config_path)
     seed = fabric.broadcast(resolve_seed(config.training.seed), src=0)
