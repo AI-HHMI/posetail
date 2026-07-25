@@ -5,6 +5,7 @@ import json
 import yaml
 
 import torch
+from einops import repeat
 
 import numpy as np
 from tqdm import tqdm
@@ -15,7 +16,7 @@ from decord import VideoReader, cpu
 from aniposelib.cameras import CameraGroup, Camera
 
 from posetail.datasets.utils import get_dirs, disassemble_extrinsics
-from posetail.posetail.cube import project_points_torch
+from posetail.posetail.cube import project_points_torch, compute_cube_scale
 from posetail.posetail.tracker_encoder import TrackerEncoder
 from posetail.posetail.train_utils import *
 
@@ -367,8 +368,12 @@ def load_multiview_clip(readers, start_frame, n_frames, crop_boxes=None, target_
     return views, end_frame - start_frame
 
 
-def build_chunk_memory(model, views, camera_group, frame_idx, coords_at, is_2d):
-    """Encode remembered frames taken from the CURRENT chunk -> bank slice (B, N, K, dim).
+def build_chunk_memory(model, views, camera_group, frame_idx, coords_at, is_2d,
+                       cube_scale=None):
+    """Encode remembered frames taken from the CURRENT chunk.
+
+    Returns a bank slice of (B, N, K*n_cams, dim): one entry per (remembered frame,
+    camera), frame-major, matching what the dataset feeds during training.
 
     The chunk's frames are already cropped and resized around the tracked points, so a
     remembered frame reuses that crop rather than re-reading and re-cropping the video.
@@ -378,25 +383,43 @@ def build_chunk_memory(model, views, camera_group, frame_idx, coords_at, is_2d):
         frame_idx: (K,) which frames of the chunk to remember.
         coords_at: (B, K, N, R) each point's position at those frames, in MODEL space
             (world coords for 3D; model-input pixels for 2D).
+        cube_scale: (n_cams, B) scene scale, or None in 2D where there are no world
+            coordinates -- the depth term is then dropped, exactly as in training.
     """
     K = int(frame_idx.numel())
     mem_views = [v[:, frame_idx] for v in views]                    # (B, K, H, W, C)
-    p2d_l, ok_l = [], []
+    sizes = torch.stack([cam['size'].to(coords_at.dtype).to(coords_at.device)
+                         for cam in camera_group])                  # (cams, 2)
+    p2d_l, ok_l, depth_l = [], [], []
     for k in range(K):
         c = coords_at[:, k]                                         # (B, N, R)
         if is_2d:
             p = c[None]                                             # (1, B, N, 2)
         else:
             p = project_points_torch(camera_group, c)               # (cams, B, N, 2)
-        sizes = torch.stack([cam['size'].to(p.dtype).to(p.device)
-                             for cam in camera_group])              # (cams, 2)
+            centres = torch.stack([cam['center'].to(c.dtype).to(c.device)
+                                   for cam in camera_group])        # (cams, 3)
+            depth_l.append(torch.linalg.norm(c[None] - centres[:, None, None], dim=-1))
         inside = (((p >= 0) & (p < sizes[:, None, None, :])).all(dim=-1)
                   & torch.isfinite(p).all(dim=-1))
         p2d_l.append(torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0))
         ok_l.append(inside)
-    return model.build_memory_bank(mem_views,
-                                   torch.stack(p2d_l, dim=2),       # (cams, B, K, N, 2)
-                                   torch.stack(ok_l, dim=2))        # (cams, B, K, N)
+
+    # Camera params, normalized exactly as QueryEncoder/the dataset do them, then
+    # broadcast over the K remembered frames (the chunk's cameras are the same for all).
+    intr = torch.stack([
+        torch.cat([torch.stack([cam['mat'][0, 0], cam['mat'][1, 1]]) / cam['size'],
+                   (cam['mat'][:2, 2] - cam['offset']) / cam['size'] * 2.0 - 1.0])
+        .to(coords_at.dtype).to(coords_at.device)
+        for cam in camera_group])                                   # (cams, 4)
+    intr = repeat(intr, 'cams r -> cams b k r', b=coords_at.shape[0], k=K)
+
+    mem_depth = torch.stack(depth_l, dim=2) if depth_l else None    # (cams, B, K, N)
+    return model.build_memory_bank(
+        mem_views,
+        torch.stack(p2d_l, dim=2),                                  # (cams, B, K, N, 2)
+        torch.stack(ok_l, dim=2),                                   # (cams, B, K, N)
+        mem_depth=mem_depth, mem_intrinsics=intr, cube_scale=cube_scale)
 
 
 def crop_camera_group_to_queries(camera_group, query_coords, min_crop_dim, padding=20, is_2d=False):
@@ -737,14 +760,18 @@ def run_tracker_encoder_on_videos(
     # frames later. The remaining slots are a FIFO of recently-seen frames, admitted only
     # when the model is confident the point was actually visible there (feeding back a
     # bad frame would poison the memory during an occlusion).
+    # The reservoir is counted in ENTRIES, and each remembered frame contributes one entry
+    # PER CAMERA (the encoder no longer pools views). memory_context stays in frames -- the
+    # unit the caller thinks in -- so the buffers are frames * n_cams wide.
     mem_on = use_memory and getattr(model, 'memory_attention', False)
     mem_anchor = mem_recent = None
     n_recent = 0
     if mem_on:
         _dim = model.latent_dim
+        _ecam = 1 if is_2d else len(camera_group)      # entries contributed per frame
         _null = model.memory_encoder.null_entry.detach().to(device).view(1, 1, 1, _dim)
-        mem_anchor = _null.expand(1, N, 1, _dim).clone()
-        n_recent = max(int(memory_context) - 1, 0)
+        mem_anchor = _null.expand(1, N, _ecam, _dim).clone()
+        n_recent = max(int(memory_context) - 1, 0) * _ecam
         if n_recent:
             mem_recent = _null.expand(1, N, n_recent, _dim).clone()
 
@@ -824,6 +851,15 @@ def run_tracker_encoder_on_videos(
                 queries_model = (coords_chunk - crop_low) * model_scale
             else:
                 queries_model = coords_chunk
+
+            # Scene scale for the memory depth term, from THIS chunk's cameras. None in 2D,
+            # where there are no world coordinates -- the encoder then drops the depth term,
+            # matching how training handles 2D-mode.
+            mem_cube_scale = None
+            if mem_on and not is_2d:
+                mem_cube_scale = compute_cube_scale(
+                    camera_group_chunk, queries_model, len(camera_group_chunk), device,
+                    per_camera=getattr(model, 'per_camera_cube_scale', False))
 
             target_sizes = [
                 tuple(cam['size'].tolist())
@@ -914,7 +950,8 @@ def run_tracker_encoder_on_videos(
                     mem_anchor[:, pts] = build_chunk_memory(
                         model, views, camera_group_chunk,
                         f.reshape(1).to(torch.long),
-                        queries_model[:, pts][:, None], is_2d)
+                        queries_model[:, pts][:, None], is_2d,
+                        cube_scale=mem_cube_scale)
 
             mem_kwargs = {}
             if mem_on:
@@ -964,7 +1001,8 @@ def run_tracker_encoder_on_videos(
                     traj = (outputs['2d_pred'][0] if is_2d
                             else outputs[pred_key_3d])[:, :keep_len]
                     blk = build_chunk_memory(model, views, camera_group_chunk,
-                                             top.to(torch.long), traj[:, top], is_2d)
+                                             top.to(torch.long), traj[:, top], is_2d,
+                                             cube_scale=mem_cube_scale)
                     full = _null.expand(1, N, blk.shape[2], _dim).clone()
                     full[:, active_idx] = blk
                     mem_recent = torch.cat([mem_recent[:, :, blk.shape[2]:], full], dim=2)

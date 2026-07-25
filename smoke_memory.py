@@ -61,7 +61,9 @@ def make_memory(n_cams=2, M=M_CTX, valid=True):
     mem_views = [torch.rand(B, M, H, W, 3) for _ in range(n_cams)]
     mem_p2d = torch.rand(n_cams, B, M, N, 2) * (W - 1)
     mem_valid = torch.full((n_cams, B, M, N), bool(valid))
-    return mem_views, mem_p2d, mem_valid
+    mem_depth = torch.rand(n_cams, B, M, N) * 3 + 1
+    mem_intrinsics = torch.rand(n_cams, B, M, 4)
+    return mem_views, mem_p2d, mem_valid, mem_depth, mem_intrinsics
 
 
 def build(memory, **over):
@@ -99,10 +101,11 @@ def main():
     with torch.no_grad():
         bank = mem.build_memory_bank(*make_memory(M=M_CTX))
         bank8 = mem.build_memory_bank(*make_memory(M=8))
-    results.append(report(f'bank {tuple(bank.shape)} == (B,N,M,dim)',
-                          tuple(bank.shape[:3]) == (B, N, M_CTX)))
+    n_cams = 2
+    results.append(report(f'bank {tuple(bank.shape)} == (B,N,M*n_cams,dim)',
+                          tuple(bank.shape[:3]) == (B, N, M_CTX * n_cams)))
     results.append(report(f'a different memory count works unchanged (M=8 -> '
-                          f'{tuple(bank8.shape[:3])})', bank8.shape[2] == 8))
+                          f'{tuple(bank8.shape[:3])})', bank8.shape[2] == 8 * n_cams))
 
     # ---- 3 & 4. parity ---------------------------------------------------------------
     print('3-4. parity')
@@ -167,8 +170,8 @@ def main():
             mca.out_proj.weight.normal_(0, 0.02)
     have1 = grads_of(warmed)
     for w in ['memory_encoder.vit', 'memory_encoder.patch_processor',
-              'memory_encoder.read_attn', 'memory_encoder.camera_pool',
-              'decoder.memory_cross_attns']:
+              'memory_encoder.read_blocks', 'memory_encoder.query_gate',
+              'memory_encoder.query_mlp', 'decoder.memory_cross_attns']:
         results.append(report(f'trained regime: grad reaches {w}',
                               any(n.startswith(w) for n in have1)))
 

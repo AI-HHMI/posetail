@@ -657,9 +657,15 @@ def memory_kwargs(model, batch, device):
     mem_views = getattr(batch, 'mem_views', None)
     if mem_views is None:
         return {}
-    return {'mem_views': [v.to(device) for v in mem_views],
-            'mem_p2d': batch.mem_p2d.to(device),
-            'mem_valid': batch.mem_valid.to(device)}
+    kw = {'mem_views': [v.to(device) for v in mem_views],
+          'mem_p2d': batch.mem_p2d.to(device),
+          'mem_valid': batch.mem_valid.to(device)}
+    # depth / intrinsics of each remembered observation, for the seed's depth and camera
+    # terms. forward() drops the depth term in 2D-mode, where there is no meaningful scale.
+    if getattr(batch, 'mem_depth', None) is not None:
+        kw['mem_depth'] = batch.mem_depth.to(device)
+        kw['mem_intrinsics'] = batch.mem_intrinsics.to(device)
+    return kw
 
 
 def train_iteration(config, model, fabric, batch,

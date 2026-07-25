@@ -89,7 +89,9 @@ class TrackerEncoder(nn.Module):
                  memory_vit_dim = 256,
                  memory_vit_depth = 6,
                  memory_vit_heads = 8,
-                 memory_vit_patch_size = 8):
+                 memory_vit_patch_size = 8,
+                 memory_pool_seeds = 1,
+                 memory_read_depth = 3):
         super().__init__()
 
         self.mode_3d = mode_3d
@@ -271,7 +273,7 @@ class TrackerEncoder(nn.Module):
                 patch_size=query_patch_size,
                 image_size=self.image_size, vit_dim=memory_vit_dim,
                 vit_depth=memory_vit_depth, vit_heads=memory_vit_heads,
-                vit_patch_size=memory_vit_patch_size,
+                vit_patch_size=memory_vit_patch_size, read_depth=memory_read_depth,
             )
             # Builds the query token for points given NO position (memory-only queries):
             # it reads the point's own memory instead of its image patch.
@@ -281,6 +283,7 @@ class TrackerEncoder(nn.Module):
                 n_frames=self.n_frames, time_embed_mode=time_embed_mode,
                 principal_point_embedding=principal_point_embedding,
                 intrinsic_embedding=intrinsic_embedding,
+                num_seeds=memory_pool_seeds,
             )
 
     def _normalize_views(self, views, device):
@@ -299,23 +302,34 @@ class TrackerEncoder(nn.Module):
         return compute_cube_scale(camera_group, coords, n_cams, device,
                                   per_camera=self.per_camera_cube_scale)
 
-    def build_memory_bank(self, mem_views, mem_p2d, mem_valid, device=None):
-        """Encode a set of remembered observations into the bank -> (B, N, M, latent_dim).
+    def build_memory_bank(self, mem_views, mem_p2d, mem_valid, mem_depth=None,
+                          mem_intrinsics=None, device=None, cube_scale=None):
+        """Encode remembered observations -> (B, N, M*n_cams, latent_dim), one entry per
+        (memory frame, camera), frame-major.
 
-        Called by the data pipeline (dataset-fed while training, the tracking loop at
-        inference), NOT by forward(): the caller decides WHICH frames are remembered and
-        where the points are in them, and forward() then just consumes the finished bank.
-        Handles frame normalization so the caller can pass raw frames.
+        The caller decides WHICH frames are remembered and where the points are in them;
+        this only encodes them. Handles frame normalization so raw frames can be passed.
 
         Args:
             mem_views: list over cameras of [B, M, H, W, C] raw remembered frames.
             mem_p2d:   [n_cams, B, M, N, 2] pixel position of each point in each frame.
             mem_valid: [n_cams, B, M, N] bool -- point in frame AND not occluded there.
+            mem_depth: [n_cams, B, M, N] METRIC distance to that camera, or None. Divided
+                by cube_scale here so the encoder sees the same normalized quantity the
+                QueryEncoder does; pass cube_scale=None (2D-mode) to drop the term instead.
+            mem_intrinsics: [n_cams, B, M, 4] = (fx/W, fy/H, cx/W, cy/H), or None.
         """
         assert self.memory_attention, 'build_memory_bank requires memory_attention=True'
         device = device if device is not None else mem_p2d.device
         views_norm = self._normalize_views(mem_views, device)
-        return self.memory_encoder(views_norm, mem_p2d.to(device), mem_valid.to(device))
+        depth = None
+        if mem_depth is not None and cube_scale is not None:
+            # cube_scale is (n_cams, B); broadcast over the (M, N) axes.
+            cs = cube_scale.to(device)[:, :, None, None]
+            depth = mem_depth.to(device) / cs.clamp(min=1e-6)
+        return self.memory_encoder(
+            views_norm, mem_p2d.to(device), mem_valid.to(device), mem_depth=depth,
+            mem_intrinsics=(mem_intrinsics.to(device) if mem_intrinsics is not None else None))
 
     def unfreeze_video_encoder(self, iteration):
         """Unfreeze the video encoder once `iteration` reaches the configured
@@ -345,7 +359,8 @@ class TrackerEncoder(nn.Module):
         
     def forward(self, views, coords, camera_group, query_times=None,
                 kpt_chunk=None, occlusion=None, memory_bank=None, cube_scale=None,
-                mem_views=None, mem_p2d=None, mem_valid=None):
+                mem_views=None, mem_p2d=None, mem_valid=None,
+                mem_depth=None, mem_intrinsics=None):
         '''
         B: batch size
         T: number of frames in video
@@ -385,12 +400,8 @@ class TrackerEncoder(nn.Module):
 
         assert len(views) == len(camera_group), "views should match number of cameras"
 
-        # Encode the remembered observations, ahead of everything else so the bank is ready
-        # for the query encoder and the decoder's per-layer memory reads.
         assert memory_bank is None or mem_views is None, \
             'pass either memory_bank or the raw mem_views/mem_p2d/mem_valid triple, not both'
-        if mem_views is not None:
-            memory_bank = self.build_memory_bank(mem_views, mem_p2d, mem_valid, device=device)
 
         # Memory-only points: no query position. Detected here so a NaN query is safe from
         # ANY caller. The coords are zeroed for them -- a finite, position-free value that
@@ -419,6 +430,17 @@ class TrackerEncoder(nn.Module):
             cube_scale = self._cube_scale(camera_group, coords, n_cams, device)
         else:
             cube_scale = cube_scale.to(device)
+
+        # Encode the remembered observations. Must come AFTER cube_scale: the memory depth
+        # term is normalized by it, exactly as the QueryEncoder's depth term is. In 2D-mode
+        # cube_scale is all ones and there are no world coords, so the depth term is dropped
+        # (the encoder substitutes its missing_depth token) rather than encoding a raw metric
+        # distance that would be out of distribution against the 3D case.
+        if mem_views is not None:
+            memory_bank = self.build_memory_bank(
+                mem_views, mem_p2d, mem_valid, device=device,
+                mem_depth=mem_depth, mem_intrinsics=mem_intrinsics,
+                cube_scale=(cube_scale if R == 3 else None))
 
         # Effective focal per camera (cropped+resized intrinsics). cube_scale only converts
         # world->pixels, leaving a leftover f_eff factor in the absolute-depth outputs; scaling

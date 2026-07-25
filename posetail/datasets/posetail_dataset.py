@@ -402,11 +402,14 @@ def custom_collate(batch):
     # Memory observations (frames remembered from elsewhere in the video). Present only
     # when the dataset sampled them for EVERY item in the batch; otherwise the batch just
     # trains without memory, which is the point of memory_prob.
-    mem_views = mem_p2d = mem_valid = None
+    mem_views = mem_p2d = mem_valid = mem_depth = mem_intrinsics = None
     if len(batch) > 12 and all(v is not None for v in batch[10]):
         mem_views = [torch.stack(v, dim=0) for v in zip(*list(batch[10]))]
         mem_p2d = torch.stack(batch[11], axis=1)      # (cams, b, M, n, 2)
         mem_valid = torch.stack(batch[12], axis=1)    # (cams, b, M, n)
+        if len(batch) > 15 and batch[14][0] is not None:
+            mem_depth = torch.stack(batch[14], axis=1)        # (cams, b, M, n)
+            mem_intrinsics = torch.stack(batch[15], axis=1)   # (cams, b, M, 4)
 
     # Points whose query position is withheld (memory-only). Only present when every item
     # in the batch has one, so the mask stays rectangular.
@@ -427,6 +430,8 @@ def custom_collate(batch):
                    'mem_views': mem_views,
                    'mem_p2d': mem_p2d,
                    'mem_valid': mem_valid,
+                   'mem_depth': mem_depth,
+                   'mem_intrinsics': mem_intrinsics,
                    'memory_only': memory_only})
 
     return batch
@@ -1220,9 +1225,9 @@ class PosetailDataset(Dataset):
         # --- memory observations: where each point sits in each remembered frame, and
         # whether that camera can actually see it there. The model consumes pixels, so the
         # per-memory-frame cameras are resolved here and never leave the dataset.
-        mem_p2d = mem_valid = None
+        mem_p2d = mem_valid = mem_depth = mem_intrinsics = None
         if mem_views is not None and mem_coords is not None:
-            p2d_list, valid_list = [], []
+            p2d_list, valid_list, depth_list, intr_list = [], [], [], []
             for mnum in range(len(mem_cgroups)):
                 cams_m = mem_cgroups[mnum]
                 c_f = mem_coords[mnum]                                    # (n_kpts, 3)
@@ -1235,15 +1240,33 @@ class PosetailDataset(Dataset):
                     v = vis_full[mem_idx[mnum]]                           # (n_kpts, cams)
                     seen = torch.nan_to_num(v, nan=1.0).t() > 0.5         # (cams, n_kpts)
                     inside = inside & seen
+                # metric distance to each camera centre (the model divides by cube_scale,
+                # matching how QueryEncoder normalizes its own depth term)
+                centres = torch.stack([c['center'].to(c_f.dtype) for c in cams_m])  # (cams,3)
+                depth_list.append(torch.linalg.norm(c_f[None] - centres[:, None], dim=-1))
+                # Camera params, normalized EXACTLY as QueryEncoder does them so the memory
+                # seed's terms are on the same footing as the query token's:
+                #   focal scale    = focal / size                (encoder_decoder.py:398)
+                #   principal pt   = (pp - offset) / size * 2 - 1        (:381)
+                intr_list.append(torch.stack([
+                    torch.cat([
+                        torch.stack([c['mat'][0, 0], c['mat'][1, 1]]) / c['size'],
+                        (c['mat'][:2, 2] - c['offset']) / c['size'] * 2.0 - 1.0,
+                    ]).to(c_f.dtype)
+                    for c in cams_m]))                                    # (cams, 4)
                 p2d_list.append(p)
                 valid_list.append(inside)
             mem_p2d = torch.stack(p2d_list, dim=1)                        # (cams, M, n, 2)
             mem_valid = torch.stack(valid_list, dim=1)                    # (cams, M, n)
+            mem_depth = torch.stack(depth_list, dim=1)                    # (cams, M, n)
+            mem_intrinsics = torch.stack(intr_list, dim=1)                # (cams, M, 4)
             mem_p2d = torch.nan_to_num(mem_p2d, nan=0.0, posinf=0.0, neginf=0.0)
+            mem_depth = torch.nan_to_num(mem_depth, nan=0.0, posinf=0.0, neginf=0.0)
             mem_views = [v for v in mem_views]                            # list per camera
 
         return (views, coords, vis, fnums, cgroup, row, query_times, vis_2d, p2d,
-                query_occlusion, mem_views, mem_p2d, mem_valid, memory_only)
+                query_occlusion, mem_views, mem_p2d, mem_valid, memory_only,
+                mem_depth, mem_intrinsics)
 
 
     def _build_2d_cgroup(self, row, img_path, cam_names):

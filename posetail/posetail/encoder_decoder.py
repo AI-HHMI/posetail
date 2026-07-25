@@ -1277,16 +1277,19 @@ class Decoder(nn.Module):
         MemoryEncoder's learned null token, so no validity mask is needed here.
         Returns the residual, same shape as x_normed.
         """
+        B, K = memory_bank.shape[:2]
         bank = memory_bank.to(x_normed.dtype)
-        # Each token (cam, b, t, k) reads bank[b, k]; expand over cams and frames to match
-        # the flattened (cams b) (t k) query layout (t-major, so (t k) pairs with k tiled).
-        keys = repeat(bank, 'b k m d -> (cams b) (t k) m d', cams=N_cams, t=T)
 
-        # Flatten every query token into its own attention problem: 1 query, M keys.
-        q = rearrange(x_normed, 'cb tk d -> (cb tk) 1 d')
-        kv = rearrange(keys, 'cb tk m d -> (cb tk) m d')
-        out = self.memory_cross_attns[layer_idx](q, kv)                   # (BQ, 1, dim)
-        return rearrange(out[:, 0], '(cb tk) d -> cb tk d', cb=x_normed.shape[0])
+        # A point's T frame-tokens all read the SAME M entries, so group the attention by
+        # point rather than materializing one copy of the bank per (frame, point) token.
+        # The naive layout costs cams*B*T*K*M*dim; this costs cams*B*K*M*dim -- a factor of
+        # T (24x here), which is what makes per-camera entries (M x n_cams) affordable.
+        q = rearrange(x_normed, '(cams b) (t k) d -> (cams b k) t d',
+                      cams=N_cams, b=B, t=T, k=K)
+        kv = repeat(bank, 'b k m d -> (cams b k) m d', cams=N_cams)
+        out = self.memory_cross_attns[layer_idx](q, kv)          # ((cams b k), T, dim)
+        return rearrange(out, '(cams b k) t d -> (cams b) (t k) d',
+                         cams=N_cams, b=B, t=T, k=K)
 
     def forward(self, scene_features, query_embeds, rays, mode_idx,
                 scene_frame_pos=None, memory_bank=None):
@@ -1604,11 +1607,11 @@ class MemoryEncoder(nn.Module):
     Per (camera, memory frame):
       1. Encode the frame ONCE with a small image ViT (MemoryViT) -- one encode serves
          every point in that frame.
-      2. Build a per-point seed from the local appearance (a patch at the point's pixel)
+      2. Build a per-point query from the local appearance (a patch at the point's pixel)
          plus where in the frame it sits, and whether it is actually visible there.
-      3. Cross-attend that seed to the frame's ViT tokens for wider context.
-    Then pool across cameras into ONE vector per (point, memory frame), so the memory is
-    viewpoint-robust rather than tied to a single camera.
+      3. Cross-attend that query to the frame's ViT tokens for wider context.
+    Then each (point, memory frame, camera) becomes its own bank entry -- no cross-camera
+    pooling, so the decoder can learn viewpoint selection instead of seeing an average.
 
     There is deliberately NO time/recency encoding: entries are an order-free appearance
     set. Encoding absolute frame indices would go out of distribution as soon as memory
@@ -1623,7 +1626,7 @@ class MemoryEncoder(nn.Module):
 
     def __init__(self, dim, num_heads=8, cross_attn_dim=None, max_freq=10, dropout=0.0,
                  patch_size=9, image_size=256, vit_dim=256, vit_depth=6, vit_heads=8,
-                 vit_patch_size=8):
+                 vit_patch_size=8, read_depth=3):
         super().__init__()
         self.dim = dim
         self.max_freq = max_freq
@@ -1636,67 +1639,138 @@ class MemoryEncoder(nn.Module):
                              embed_dim=vit_dim, depth=vit_depth, num_heads=vit_heads,
                              dropout=dropout)
 
-        # --- per-point seed: local appearance + where it is + whether it is visible ---
+        # --- per-point query: a query encoder in its own right -----------------------------
+        # Built like QueryEncoder (per-term encodings -> learned gate -> norm -> MLP) rather
+        # than as a plain sum. The sum was measurably harmful: valid_embed carries <=1
+        # dimension of information but had 2.3x the magnitude of the position term (which
+        # carries ~13), and LayerNorm cannot remove a shared offset -- it only compresses the
+        # between-point variance. The gate lets the model weight the terms instead.
+        # Weights are its own: this encoder identifies an UNKNOWN point, which is a different
+        # problem from describing a known one, and sharing would perturb a trained module.
         self.patch_processor = PatchProcessor(
             in_channels=3, patch_size=patch_size, embed_dim=dim,
             conv_channels=[32, 64, 128])
         self.linear_pos = nn.Linear(4 * max_freq + 2, dim)
+        self.linear_depth = nn.Linear(2 * max_freq + 1, dim)
+        self.linear_pp = nn.Linear(4 * max_freq + 2, dim)
+        self.linear_intrinsic = nn.Linear(4 * max_freq + 2, dim)
         self.valid_embed = nn.Embedding(2, dim)          # 0 = not visible here, 1 = visible
-        self.seed_norm = nn.LayerNorm(dim)
+        self.depth_norm_scale = nn.Parameter(torch.tensor([1.0]))
+        # 2D-mode queries have no world coordinates, so no depth exists to encode (mirrors
+        # QueryEncoder.missing_depth). cube_scale is all ones there, so a "real" depth term
+        # would be log(raw metric depth) -- a different scale from the 3D case and out of
+        # distribution for the Fourier encoding.
+        self.missing_depth = nn.Parameter(torch.zeros(dim))
+        nn.init.normal_(self.missing_depth, std=0.02)
+        self.missing_intrinsic = nn.Parameter(torch.zeros(dim))
+        nn.init.normal_(self.missing_intrinsic, std=0.02)
+
+        self.n_query_terms = 6                    # patch, pos, depth, valid, pp, intrinsic
+        self.query_gate = nn.Sequential(
+            nn.Linear(dim * self.n_query_terms, self.n_query_terms), nn.Sigmoid())
+        nn.init.normal_(self.query_gate[0].weight, std=0.01)
+        nn.init.constant_(self.query_gate[0].bias, 0.0)
+        self.query_norm = nn.LayerNorm(dim)
+        self.query_mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4), nn.GELU(), nn.Dropout(0.05), nn.Linear(dim * 4, dim))
 
         # Per-point read of the frame's ViT tokens. NOT zero-init: this is the main path by
-        # which appearance beyond the local patch enters a memory vector.
+        # which appearance beyond the local patch enters a memory vector. A single layer was
+        # measured to collapse rank (13.3 -> 2.9), hence the stack.
         self.read_norm_q = nn.LayerNorm(dim)
-        self.read_attn = DecoupledCrossAttention(
-            latent_dim=dim, kv_dim=vit_dim, cross_attn_dim=cross_attn_dim,
-            num_heads=num_heads, dropout=dropout)
+        self.read_blocks = nn.ModuleList([
+            nn.ModuleDict({
+                'norm_q': nn.LayerNorm(dim),
+                'attn': DecoupledCrossAttention(
+                    latent_dim=dim, kv_dim=vit_dim, cross_attn_dim=cross_attn_dim,
+                    num_heads=num_heads, dropout=dropout),
+                'norm_m': nn.LayerNorm(dim),
+                'mlp': nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(),
+                                     nn.Linear(dim * 4, dim)),
+            }) for _ in range(max(1, read_depth))
+        ])
 
-        # Cross-camera fusion (Set-Transformer PMA): permutation-invariant over a variable
-        # number of cameras that can see the point. t=1 -- we pool over cameras only.
-        self.camera_pool = AttentionPooling(dim, num_heads=num_heads,
-                                            use_time_embedding=False)
-
-        # Substituted for entries no camera can see: a learned "nothing remembered here"
-        # token, so the bank needs no validity mask.
+        # Substituted for entries whose camera cannot see the point: a learned "nothing
+        # remembered here" token, so the bank needs no validity mask.
         self.null_entry = nn.Parameter(torch.zeros(dim))
         nn.init.trunc_normal_(self.null_entry, std=0.02)
 
-    def _seed(self, views, p2d, valid):
-        """Per-point seed for one camera's memory frames.
+    @staticmethod
+    def _fourier(x, max_freq):
+        """Fourier-encode a (B, N, R) quantity -> (B, N, R + 2*R*max_freq).
+        get_fourier_encoding wants a (b, s, n, r) layout, so borrow an axis and drop it."""
+        x4 = x[:, None]
+        return torch.cat([x4, get_fourier_encoding(x4, min_freq=0, max_freq=max_freq)],
+                         dim=-1)[:, 0]
 
-        views: [B*M, C, H, W]; p2d: [B*M, N, 2]; valid: [B*M, N] -> [B*M, N, dim]
+    def _query(self, views, p2d, valid, depth=None, intrinsics=None):
+        """Per-point QUERY for one camera's memory frames -- a query encoder in miniature.
+
+        views: [B*M, C, H, W]; p2d: [B*M, N, 2]; valid: [B*M, N];
+        depth: [B*M, N] already normalized by cube_scale, or None for 2D-mode;
+        intrinsics: [B*M, 4] = (fx/W, fy/H, cx/W, cy/H)  ->  [B*M, N, dim]
         """
         BM, C, H, W = views.shape
         N = p2d.shape[1]
-        # sample_patches works on a (B, T, C, H, W) clip; each memory frame is its own
-        # 1-frame "clip", so time index 0 for every point.
+
+        # local appearance: the patch at the point's pixel in this remembered frame
+        # (sample_patches takes a (B, T, C, H, W) clip; each memory frame is a 1-frame clip)
         patches = sample_patches(views[:, None], p2d,
                                  torch.zeros(BM, N, dtype=torch.long, device=p2d.device),
                                  self.patch_size)                    # [B*M, N, C, P, P]
-        embed_patch = self.patch_processor(
-            rearrange(patches, 'bm n c p q -> (bm n) c p q'))
-        embed_patch = rearrange(embed_patch, '(bm n) d -> bm n d', bm=BM, n=N)
+        embed_patch = rearrange(
+            self.patch_processor(rearrange(patches, 'bm n c p q -> (bm n) c p q')),
+            '(bm n) d -> bm n d', bm=BM, n=N)
 
+        # where in this frame the point sits -- the term that carries most of the identity
         size = torch.tensor([W, H], dtype=p2d.dtype, device=p2d.device)
-        pp = (p2d / size) * 2.0 - 1.0                                # [-1, 1] normalized
-        pp = torch.nan_to_num(pp, nan=0.0, posinf=0.0, neginf=0.0)
-        # get_fourier_encoding is written for a (b, s, n, r) layout; give it the extra axis.
-        pp4 = pp[:, None]                                            # [B*M, 1, N, 2]
-        fourier_pos = torch.cat(
-            [pp4, get_fourier_encoding(pp4, min_freq=0, max_freq=self.max_freq)], dim=-1)
-        embed_pos = self.linear_pos(fourier_pos)[:, 0]                # [B*M, N, dim]
+        pp = torch.nan_to_num((p2d / size) * 2.0 - 1.0, nan=0.0, posinf=0.0, neginf=0.0)
+        embed_pos = self.linear_pos(self._fourier(pp, self.max_freq))
 
-        return self.seed_norm(embed_patch + embed_pos
-                              + self.valid_embed(valid.to(torch.long)))
+        # how far away it was; absent in 2D-mode (no world coords -> no meaningful scale)
+        if depth is None:
+            embed_depth = repeat(self.missing_depth, 'd -> bm n d', bm=BM, n=N)
+        else:
+            dl = torch.log(depth.clamp(min=0) + 1e-6) * self.depth_norm_scale
+            embed_depth = self.linear_depth(self._fourier(dl[..., None], self.max_freq))
 
-    def forward(self, mem_views, mem_p2d, mem_valid):
+        embed_valid = self.valid_embed(valid.to(torch.long))
+
+        # Camera terms, kept as two separate gate slots exactly like QueryEncoder: the focal
+        # SCALE (3D only -- 2D-mode gets missing_intrinsic, mirroring `:404`) and the
+        # principal point (always present, `:376-385`). intrinsics arrives pre-normalized by
+        # the data pipeline in QueryEncoder's own convention.
+        if intrinsics is None:
+            embed_intrinsic = repeat(self.missing_intrinsic, 'd -> bm n d', bm=BM, n=N)
+            embed_pp = torch.zeros_like(embed_pos)
+        else:
+            it = repeat(intrinsics, 'bm r -> bm n r', n=N)
+            embed_pp = self.linear_pp(self._fourier(it[..., 2:], self.max_freq))
+            if depth is None:                     # 2D-mode: no metric scale to speak of
+                embed_intrinsic = repeat(self.missing_intrinsic, 'd -> bm n d', bm=BM, n=N)
+            else:
+                embed_intrinsic = self.linear_intrinsic(
+                    self._fourier(it[..., :2], self.max_freq))
+
+        terms = torch.stack([embed_patch, embed_pos, embed_depth, embed_valid,
+                             embed_pp, embed_intrinsic],
+                            dim=-2)                                  # [B*M, N, n_terms, dim]
+        w = self.query_gate(rearrange(terms, 'bm n t d -> bm n (t d)'))
+        fused = einsum(w, terms, 'bm n t, bm n t d -> bm n d')
+        return self.query_mlp(self.query_norm(fused))
+
+    def forward(self, mem_views, mem_p2d, mem_valid, mem_depth=None, mem_intrinsics=None):
         """
         Args:
             mem_views: list over cameras of [B, M, C, H, W] normalized memory frames.
             mem_p2d:   [n_cams, B, M, N, 2] pixel position of each point in each frame.
             mem_valid: [n_cams, B, M, N] bool -- point is in frame AND not occluded there.
+            mem_depth: [n_cams, B, M, N] distance to that camera, already divided by
+                cube_scale, or None in 2D-mode (no world coords -> no meaningful scale).
+            mem_intrinsics: [n_cams, B, M, 4] = (fx/W, fy/H, cx/W, cy/H), or None.
         Returns:
-            memory_bank: [B, N, M, dim]
+            memory_bank: [B, N, M*n_cams, dim] -- one entry per (memory frame, camera),
+            ordered FRAME-MAJOR so that "the first k remembered frames" is [:, :, :k*n_cams].
         """
         n_cams = len(mem_views)
         B, M = mem_views[0].shape[:2]
@@ -1707,25 +1781,25 @@ class MemoryEncoder(nn.Module):
             v = rearrange(mem_views[c], 'b m c h w -> (b m) c h w')
             p = rearrange(mem_p2d[c], 'b m n r -> (b m) n r')
             ok = rearrange(mem_valid[c], 'b m n -> (b m) n')
-            seed = self._seed(v, p, ok)                              # [(B M), N, dim]
+            dp = rearrange(mem_depth[c], 'b m n -> (b m) n') if mem_depth is not None else None
+            it = (rearrange(mem_intrinsics[c], 'b m r -> (b m) r')
+                  if mem_intrinsics is not None else None)
+            x = self._query(v, p, ok, depth=dp, intrinsics=it)        # [(B M), N, dim]
             tokens = self.vit(v)                                     # [(B M), tok, vit_dim]
-            per_cam.append(seed + self.read_attn(self.read_norm_q(seed), tokens))
+            for blk in self.read_blocks:
+                x = x + blk['attn'](blk['norm_q'](x), tokens)
+                x = x + blk['mlp'](blk['norm_m'](x))
+            per_cam.append(x)
         mem_cam = torch.stack(per_cam)                               # [cams,(B M),N,dim]
 
-        # Pool across cameras, ignoring the ones that cannot see the point.
-        x = rearrange(mem_cam, 'cams bm n d -> bm 1 n cams d')       # t=1: pool cams only
-        vis_c = rearrange(mem_valid, 'cams b m n -> (b m) n cams')
-        kpm = ~vis_c                                                 # True = drop
-        # A point no camera can see would give an all-masked attention row (NaN). Unmask it
-        # so the pool stays finite; the entry is replaced by null_entry below anyway.
-        kpm = kpm & ~kpm.all(dim=-1, keepdim=True)
-        fused = self.camera_pool(x, key_padding_mask=kpm[:, :, None, :])   # [(B M), N, dim]
-        fused = rearrange(fused, '(b m) n d -> b m n d', b=B, m=M)
-
-        seen = rearrange(vis_c.any(dim=-1), '(b m) n -> b m n', b=B, m=M)
-        fused = torch.where(seen[..., None], fused,
-                            self.null_entry.to(fused.dtype).expand_as(fused))
-        return rearrange(fused, 'b m n d -> b n m d')
+        # One entry per (frame, camera): no cross-camera pooling. Averaging the views was
+        # measured to cost most of the per-point structure (rank 8.8 -> 3.1); the decoder's
+        # memory cross-attention can learn viewpoint selection for itself.
+        vis = rearrange(mem_valid, 'cams b m n -> cams (b m) n')
+        mem_cam = torch.where(vis[..., None], mem_cam,
+                              self.null_entry.to(mem_cam.dtype).expand_as(mem_cam))
+        # frame-major, camera-minor -- downstream slices k frames as [:, :, :k*n_cams]
+        return rearrange(mem_cam, 'cams (b m) n d -> b n (m cams) d', b=B, m=M)
 
 
 class MemoryQueryEncoder(nn.Module):
@@ -1751,7 +1825,7 @@ class MemoryQueryEncoder(nn.Module):
 
     def __init__(self, dim, decoder_dim, num_heads=8, cross_attn_dim=None, max_freq=10,
                  n_frames=16, time_embed_mode='learned', principal_point_embedding=False,
-                 intrinsic_embedding=False, dropout=0.0):
+                 intrinsic_embedding=False, dropout=0.0, num_seeds=1):
         super().__init__()
         self.dim = dim
         self.max_freq = max_freq
@@ -1762,12 +1836,21 @@ class MemoryQueryEncoder(nn.Module):
         cross_attn_dim = cross_attn_dim or dim
 
         # --- appearance: read this point's memory ---
-        self.seed = nn.Parameter(torch.zeros(1, 1, dim))
+        # num_seeds defaults to 1, and measurement says that is the right default: with a
+        # bank of known rank r, the pooled token comes out at rank ~r for K = 1, 8 and 32
+        # alike (2.0/7.2/20.9 -> 2.0/7.1/20.8). A single seed does NOT collapse rank -- its
+        # attention weights already vary per point -- so the earlier "bank 3.0 -> token 2.4"
+        # was rank preservation, not a seed bottleneck. Kept configurable, but K>1 only buys
+        # a Linear(K*dim, dim) worth of parameters for no measured gain.
+        self.num_seeds = max(1, num_seeds)
+        self.seed = nn.Parameter(torch.zeros(1, self.num_seeds, dim))
         nn.init.trunc_normal_(self.seed, std=0.02)
         self.mem_norm = nn.LayerNorm(dim)
         self.read_attn = DecoupledCrossAttention(
             latent_dim=dim, kv_dim=dim, cross_attn_dim=cross_attn_dim,
             num_heads=num_heads, dropout=dropout)
+        self.seed_merge = (nn.Linear(self.num_seeds * dim, dim)
+                           if self.num_seeds > 1 else nn.Identity())
 
         # --- time (same conventions as QueryEncoder) ---
         self.time_norm = float(n_frames)
@@ -1827,8 +1910,10 @@ class MemoryQueryEncoder(nn.Module):
 
         # --- appearance: one vector per point, from its own memory ---
         kv = rearrange(self.mem_norm(memory_bank), 'b n m d -> (b n) m d')
-        q = self.seed.to(kv.dtype).expand(kv.shape[0], -1, -1)          # [(b n), 1, dim]
-        app = self.read_attn(q, kv)[:, 0]                               # [(b n), dim]
+        q = self.seed.to(kv.dtype).expand(kv.shape[0], -1, -1)          # [(b n), K, dim]
+        app = self.read_attn(q, kv)                                     # [(b n), K, dim]
+        app = self.seed_merge(rearrange(app, 'bn k d -> bn (k d)')
+                              if self.num_seeds > 1 else app[:, 0])     # [(b n), dim]
         app = rearrange(app, '(b n) d -> b n d', b=B, n=N)
         # broadcast over target frames (t-major, matching QueryEncoder's (t n) flatten)
         embed_app = repeat(app, 'b n d -> b (t n) cams d', t=T, cams=n_cams)

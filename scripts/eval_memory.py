@@ -10,9 +10,10 @@ anything.
 This is clip-level (straight through the dataloader), not full-video windowed inference, so
 it is cheap enough to run against a training checkpoint while a run is in flight.
 
-The memory bank is built ONCE per batch and sliced (`bank[:, :, :k]`) for each arm, so the
-memory ViT encode is not repeated -- nothing in the model is sized by M, it is read from the
-tensor shape.
+The memory bank is built ONCE per batch and sliced for each arm, so the memory ViT encode is
+not repeated. Each remembered frame contributes one entry PER CAMERA, so k frames is
+`bank[:, :, :k*n_cams]` -- nothing in the model is sized by the entry count, it is read from
+the tensor shape.
 
 Usage:
     # the two arms that answer "does memory help at all"
@@ -40,6 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from posetail.datasets.posetail_dataset import PosetailDataset, custom_collate  # noqa: E402
 from posetail.inference.inference_utils import load_model_from_base_folder      # noqa: E402
+from posetail.posetail.cube import compute_cube_scale                            # noqa: E402
 from posetail.posetail.eval_metrics import get_eval_metrics                     # noqa: E402
 from posetail.posetail.train_utils import (_eval_cube_scale, dict_to_device,    # noqa: E402
                                            memory_only_kwargs)
@@ -73,7 +75,7 @@ def parse_args():
     return p.parse_args()
 
 
-def build_bank(model, batch, device):
+def build_bank(model, batch, device, cube_scale=None):
     """Encode this batch's remembered observations once, so the M sweep can slice the result.
 
     Training hands the RAW observations to forward() and lets it encode the bank internally,
@@ -88,9 +90,14 @@ def build_bank(model, batch, device):
     mem_views = getattr(batch, 'mem_views', None)
     if mem_views is None:
         return None
-    return model.build_memory_bank([v.to(device) for v in mem_views],
-                                   batch.mem_p2d.to(device), batch.mem_valid.to(device),
-                                   device=device)
+    md = getattr(batch, 'mem_depth', None)
+    mi = getattr(batch, 'mem_intrinsics', None)
+    return model.build_memory_bank(
+        [v.to(device) for v in mem_views],
+        batch.mem_p2d.to(device), batch.mem_valid.to(device),
+        mem_depth=(md.to(device) if md is not None else None),
+        mem_intrinsics=(mi.to(device) if mi is not None else None),
+        device=device, cube_scale=cube_scale)
 
 
 def build_dataset(config, args):
@@ -190,7 +197,11 @@ def main():
                 query_coords = p2d[:, 0, query_times[0], torch.arange(len(query_times[0]))]
 
             # Build the memory bank ONCE; each arm just slices it.
-            bank = build_bank(model, batch, device)
+            n_cams = len(batch.mem_views) if batch.mem_views is not None else 1
+            bank = build_bank(model, batch, device,
+                              cube_scale=(None if p2d is not None else compute_cube_scale(
+                                  cgroup, query_coords, len(cgroup), device,
+                                  per_camera=getattr(model, 'per_camera_cube_scale', False))))
             if bank is None:                 # dataset sampled no memory (e.g. 2D-only trial)
                 n_skipped += 1
                 skipped_ds[ds_name] += 1
@@ -216,7 +227,7 @@ def main():
                     else:
                         coords_in, mem = qc, None
                 else:
-                    coords_in, mem = qc, bank[:, :, :k]
+                    coords_in, mem = qc, bank[:, :, :k * n_cams]
 
                 out = model(coords=coords_in, memory_bank=mem, **base_kwargs)
                 cp, vp = out['coords_pred'], out['vis_pred']
