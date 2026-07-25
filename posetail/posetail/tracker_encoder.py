@@ -13,7 +13,7 @@ from posetail.posetail.cube import points_to_rays, _invert_SE3, solve_scale_offs
 from posetail.posetail.cube import noisy_or_logit
 from posetail.posetail.utils import PadToMultiple, PadToSize, count_parameters
 from posetail.posetail.encoder_decoder import (SceneRepresentation, QueryEncoder, Decoder,
-                                               MemoryEncoder)
+                                               MemoryEncoder, MemoryQueryEncoder)
 
 from torchvision import transforms
 
@@ -273,6 +273,15 @@ class TrackerEncoder(nn.Module):
                 vit_depth=memory_vit_depth, vit_heads=memory_vit_heads,
                 vit_patch_size=memory_vit_patch_size,
             )
+            # Builds the query token for points given NO position (memory-only queries):
+            # it reads the point's own memory instead of its image patch.
+            self.memory_query_encoder = MemoryQueryEncoder(
+                dim=latent_dim, decoder_dim=latent_dim, num_heads=n_heads,
+                cross_attn_dim=cross_attn_dim, max_freq=max_freq,
+                n_frames=self.n_frames, time_embed_mode=time_embed_mode,
+                principal_point_embedding=principal_point_embedding,
+                intrinsic_embedding=intrinsic_embedding,
+            )
 
     def _normalize_views(self, views, device):
         """Raw (b t h w c) uint8-ish frames -> list of normalized (b t c h w) tensors."""
@@ -340,8 +349,14 @@ class TrackerEncoder(nn.Module):
         print("  scene representation params: {:,d}".format(count_parameters(self.scene_encoder)))
         print("  decoder params: {:,d}".format(count_parameters(self.decoder)))
         
+    def compute_cube_scale(self, camera_group, coords):
+        """Public wrapper so a caller can compute the scene scale itself and pass it to
+        forward(). Used to compute it from the COMPLETE query set before any memory-only
+        points have their query removed -- see forward()'s `cube_scale` argument."""
+        return self._cube_scale(camera_group, coords, len(camera_group), coords.device)
+
     def forward(self, views, coords, camera_group, query_times=None,
-                kpt_chunk=None, occlusion=None, memory_bank=None):
+                kpt_chunk=None, occlusion=None, memory_bank=None, cube_scale=None):
         '''
         B: batch size
         T: number of frames in video
@@ -353,8 +368,15 @@ class TrackerEncoder(nn.Module):
         memory_bank: (B, N, M, D) per-point appearance memory over M context frames,
             produced by build_memory_bank(). None -> the memory cross-attention is
             skipped entirely.
+        cube_scale: (n_cams, B) precomputed scene scale, or None to compute it here.
+            Pass it when some queries are memory-only: computed from the COMPLETE query
+            set (see compute_cube_scale) the scale is then identical whether or not the
+            memory-only branch fired, instead of quietly shifting with the mask.
+
+        A point whose `coords` row is non-finite is MEMORY-ONLY: its position is not given
+        and must be recovered from its memory bank alone.
         '''
-        
+
         device = coords.device
 
         B, N, R = coords.shape
@@ -363,6 +385,17 @@ class TrackerEncoder(nn.Module):
         n_cams = len(views)
 
         assert len(views) == len(camera_group), "views should match number of cameras"
+
+        # Memory-only points: no query position. Detected here so a NaN query is safe from
+        # ANY caller. The coords are zeroed for them -- a finite, position-free value that
+        # keeps the query-ray math out of NaN (their rays are replaced by the image-centre
+        # ray downstream, and their query token comes from memory, so this value is never
+        # read as information).
+        unknown = ~torch.isfinite(coords).all(dim=-1)                   # (B, N)
+        if bool(unknown.any()):
+            coords = torch.where(unknown[..., None], torch.zeros_like(coords), coords)
+        else:
+            unknown = None
 
         # Per-camera occlusion state {0,1,-1} for the occlusion_embedding query term.
         # (B, N, n_cams); a query-anchored property.
@@ -376,7 +409,10 @@ class TrackerEncoder(nn.Module):
         
         # assert self.n_frames == T
 
-        cube_scale = self._cube_scale(camera_group, coords, n_cams, device)
+        if cube_scale is None:
+            cube_scale = self._cube_scale(camera_group, coords, n_cams, device)
+        else:
+            cube_scale = cube_scale.to(device)
 
         # Effective focal per camera (cropped+resized intrinsics). cube_scale only converts
         # world->pixels, leaving a leftover f_eff factor in the absolute-depth outputs; scaling
@@ -426,12 +462,13 @@ class TrackerEncoder(nn.Module):
         return self._forward_window(
             views_norm, coords, query_times, camera_group,
             cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
-            kpt_chunk=kpt_chunk, occlusion=occlusion, memory_bank=memory_bank)
+            kpt_chunk=kpt_chunk, occlusion=occlusion, memory_bank=memory_bank,
+            unknown=unknown)
 
     def _forward_window(self, views_norm, coords, query_times, camera_group,
                         cube_scale, cube_scale_shared, f_eff,
                         scene_center, scene_radius, kpt_chunk=None,
-                        occlusion=None, memory_bank=None):
+                        occlusion=None, memory_bank=None, unknown=None):
         """Single encoder/decoder pass over the whole clip.
 
         views_norm frames are already normalized ('b t c h w'); coords are the query
@@ -456,11 +493,12 @@ class TrackerEncoder(nn.Module):
                 occ = occlusion[:, k0:k1] if occlusion is not None else None
                 # The bank is per-point, so slice it on the point axis like occlusion.
                 mb = memory_bank[:, k0:k1] if memory_bank is not None else None
+                unk = unknown[:, k0:k1] if unknown is not None else None
                 r = self._decode_from_scene(
                     scene_features, views_norm, coords[:, k0:k1], query_times[:, k0:k1],
                     camera_group, cube_scale, cube_scale_shared, f_eff,
                     scene_center, scene_radius, occlusion=occ,
-                    memory_bank=mb)
+                    memory_bank=mb, unknown=unk)
                 # Drop the loss-only grid tensors NOW (not at concat): they carry the huge
                 # per-point P/K grid dim and are unused at inference. Retaining them across the
                 # loop would accumulate all chunks' grids on-GPU (~full-N) and defeat chunking.
@@ -471,7 +509,7 @@ class TrackerEncoder(nn.Module):
         return self._decode_from_scene(
             scene_features, views_norm, coords, query_times, camera_group,
             cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
-            occlusion=occlusion, memory_bank=memory_bank)
+            occlusion=occlusion, memory_bank=memory_bank, unknown=unknown)
 
     # Loss-only, per-point grid logits: huge (they carry the P/K grid dim) and unused at
     # inference. kpt_chunk is inference-only, so we DON'T reassemble them to full-N -- that
@@ -497,9 +535,14 @@ class TrackerEncoder(nn.Module):
     def _decode_from_scene(self, scene_features, views_norm, coords, query_times, camera_group,
                            cube_scale, cube_scale_shared, f_eff,
                            scene_center, scene_radius, occlusion=None,
-                           memory_bank=None):
+                           memory_bank=None, unknown=None):
         """Per-point decode from precomputed scene_features (the body of the forward pass
-        after scene encoding). Returns the result dict. See _forward_window."""
+        after scene encoding). Returns the result dict. See _forward_window.
+
+        `unknown` (B, N) marks MEMORY-ONLY points: they have no query position, so their
+        query token is built from their memory bank instead (see MemoryQueryEncoder) and
+        their query ray is the position-free image-centre ray.
+        """
         device = coords.device
         B, N, R = coords.shape
         T = views_norm[0].shape[1]
@@ -517,22 +560,79 @@ class TrackerEncoder(nn.Module):
         if occlusion is not None:
             occlusion_rep = repeat(occlusion, 'b n c -> b (t n) c', t=T)
 
-        query_embeds = self.query_encoder(
-            views_norm, camera_group,
-            query_coords = query_coords,
-            query_time = query_times_rep,
-            target_time = target_time,
-            cube_scale = cube_scale,
-            occlusion = occlusion_rep
-        )
-        # Reshape from flat (b, t*n, cams, d) → explicit (b, t, n, cams, d) for Decoder
-        query_embeds = rearrange(query_embeds, 'b (t n) cams d -> b t n cams d', t=T, n=N)
+        # Split the point axis: points with a real query go through the QueryEncoder,
+        # memory-only points through the MemoryQueryEncoder. The QueryEncoder is entirely
+        # per-token, so slicing points leaves the kept ones byte-identical -- and the
+        # memory-only points never pay for patch sampling they would only discard.
+        mem_pts = known_pts = None
+        if unknown is not None and bool(unknown.any()):
+            assert self.memory_attention and memory_bank is not None, \
+                'memory-only queries require memory_attention with a memory bank'
+            assert not self.is_gridnorm, \
+                ('memory-only queries are incompatible with output_mode=gridnorm: its '
+                 'per-camera gauge solve is fit on the query correspondences, so a point '
+                 'without a query would corrupt every point in that camera')
+            uni = unknown.all(dim=0) | (~unknown.any(dim=0))
+            assert bool(uni.all()), \
+                ('memory-only mask must be identical across the batch (batch_size=1); '
+                 'got per-item masks that differ')
+            mem_pts = unknown.any(dim=0).nonzero(as_tuple=True)[0]
+            known_pts = (~unknown.any(dim=0)).nonzero(as_tuple=True)[0]
+
+        def _sel(idx):
+            """(t n)-flat token indices for a subset of points (t-major layout)."""
+            return (torch.arange(T, device=device)[:, None] * N + idx[None, :]).reshape(-1)
+
+        query_embeds = None
+        if mem_pts is None or known_pts.numel() > 0:
+            sub = _sel(known_pts) if mem_pts is not None else None
+            qe = self.query_encoder(
+                views_norm, camera_group,
+                query_coords = query_coords if sub is None else query_coords[:, sub],
+                query_time = query_times_rep if sub is None else query_times_rep[:, sub],
+                target_time = target_time if sub is None else target_time[:, sub],
+                cube_scale = cube_scale,
+                occlusion = (occlusion_rep if sub is None else
+                             (occlusion_rep[:, sub] if occlusion_rep is not None else None)),
+            )
+            n_sub = N if mem_pts is None else known_pts.numel()
+            qe = rearrange(qe, 'b (t n) cams d -> b t n cams d', t=T, n=n_sub)
+            if mem_pts is None:
+                query_embeds = qe
+            else:
+                query_embeds = qe.new_zeros((B, T, N, n_cams, qe.shape[-1]))
+                query_embeds[:, :, known_pts] = qe
+
+        if mem_pts is not None and mem_pts.numel() > 0:
+            sub = _sel(mem_pts)
+            sizes = torch.stack([
+                torch.tensor([v.shape[-1], v.shape[-2]], dtype=torch.float32, device=device)
+                for v in views_norm])                                    # [n_cams, 2] (W, H)
+            mqe = self.memory_query_encoder(
+                memory_bank[:, mem_pts], query_times_rep[:, sub], target_time[:, sub],
+                camera_group, sizes, T)
+            mqe = rearrange(mqe, 'b (t n) cams d -> b t n cams d', t=T, n=mem_pts.numel())
+            if query_embeds is None:
+                query_embeds = mqe.new_zeros((B, T, N, n_cams, mqe.shape[-1]))
+            query_embeds[:, :, mem_pts] = mqe
 
         if R == 3:
             p2d_query = project_points_torch(camera_group, query_coords) # [cams, b, (t n), 2]
             p2d_query = rearrange(p2d_query, 'cams b (t n) r -> cams b t n r', t=T, n=N)
         else:
             p2d_query = rearrange(query_coords, 'b (t n) r -> 1 b t n r', t=T, n=N)
+
+        # Memory-only points have no position, so their query ray must not imply one: use
+        # the image-centre pixel, identical for every such point in a camera. The cameras
+        # still differ from each other, so PROPE keeps its knowledge of the rig geometry --
+        # what is withheld is any hint of WHERE the point is. Substituting the pixel (both
+        # sides already finite, since coords were zeroed upstream) rather than patching the
+        # rays afterwards is what keeps NaN out of the backward pass.
+        if unknown is not None and bool(unknown.any()):
+            centre = torch.tensor([self.image_size / 2.0, self.image_size / 2.0],
+                                  device=device, dtype=p2d_query.dtype)
+            unk = repeat(unknown, 'b n -> cams b t n 1', cams=p2d_query.shape[0], t=T)
+            p2d_query = torch.where(unk, centre.expand_as(p2d_query), p2d_query)
 
         query_rays_per_cam = []
         for i in range(len(camera_group)):
@@ -745,6 +845,23 @@ class TrackerEncoder(nn.Module):
                     t_idx = repeat(query_times, 'b n -> b 1 n r', r=3)
                     query_3d = torch.gather(points_3d_rays, dim=1, index=t_idx)  # (b, 1, n, 3)
                     query_world = repeat(query_3d, 'b 1 n r -> cams b t n r', t=T, cams=n_cams)
+
+                # A memory-only point has no query to anchor its residual on, so anchor it
+                # on the model's OWN absolute reconstruction at the query frame:
+                # triangulation when there are 2+ cameras (it fuses every view through the
+                # rig geometry, rather than trusting one depth estimate), else the ray
+                # reconstruction. Both are computed above from the absolute 2D pixel bins,
+                # so there is no circularity. Detached: the residual head must not be able
+                # to move its own anchor.
+                if unknown is not None and bool(unknown.any()):
+                    src = points_3d_tri if (n_cams > 1 and points_3d_tri is not None) \
+                        else points_3d_rays
+                    src = torch.where(torch.isfinite(src), src, points_3d_rays)
+                    t_idx = repeat(query_times.to(torch.long), 'b n -> b 1 n r', r=3)
+                    anchor = torch.gather(src, dim=1, index=t_idx).detach()   # (b,1,n,3)
+                    anchor = repeat(anchor, 'b 1 n r -> cams b t n r', t=T, cams=n_cams)
+                    unk = repeat(unknown, 'b n -> cams b t n 1', cams=n_cams, t=T)
+                    query_world = torch.where(unk, anchor.to(query_world.dtype), query_world)
 
                 # Ray-local anchor, kept only for the CE-target consumer in losses.py. It is
                 # NOT folded into p3d_cams: the world reconstruction below is anchor-relative.

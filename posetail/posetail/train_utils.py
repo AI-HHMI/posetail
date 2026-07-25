@@ -608,6 +608,28 @@ def total_to_per_gpu(i, world_size):
     return per_gpu
     
 
+def memory_only_kwargs(model, batch, query_coords, cgroup, is_2d):
+    """Withhold the query position for the batch's memory-only points.
+
+    Returns kwargs for model(): the (possibly NaN'd) query coords are returned separately
+    since they replace the caller's, plus a precomputed `cube_scale`.
+
+    The scale MUST be computed here, from the complete query set, before any position is
+    removed. get_camera_scale drops non-finite points, so computing it afterwards would
+    make a scene-level quantity shift depending on whether the branch fired -- a confound
+    silently correlated with the mask. (2D mode's scale is all ones, so it is skipped.)
+    """
+    mask = getattr(batch, 'memory_only', None)
+    if mask is None or not bool(mask.any()):
+        return query_coords, {}
+    mask = mask.to(query_coords.device)
+    kwargs = {}
+    if not is_2d and cgroup:
+        kwargs['cube_scale'] = model.compute_cube_scale(cgroup, query_coords)
+    query_coords = query_coords.masked_fill(mask[..., None], float('nan'))
+    return query_coords, kwargs
+
+
 def memory_kwargs(model, batch, device):
     """Encode this batch's remembered frames into the memory bank -> {'memory_bank': ...}.
 
@@ -670,6 +692,10 @@ def train_iteration(config, model, fabric, batch,
     # Per-point appearance memory over a few context frames (memory_attention). Built
     # here, not inside forward, so the context choice (and its RNG) lives in the loop.
     model_kwargs.update(memory_kwargs(model, batch, device))
+    # Memory-only points: drop their query position (and pin the scene scale first).
+    query_coords, mo_kwargs = memory_only_kwargs(
+        model, batch, query_coords, cgroup, p2d is not None)
+    model_kwargs.update(mo_kwargs)
 
     # with fabric.autocast():
     outputs = model(

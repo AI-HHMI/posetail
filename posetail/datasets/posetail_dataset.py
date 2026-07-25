@@ -408,6 +408,12 @@ def custom_collate(batch):
         mem_p2d = torch.stack(batch[11], axis=1)      # (cams, b, M, n, 2)
         mem_valid = torch.stack(batch[12], axis=1)    # (cams, b, M, n)
 
+    # Points whose query position is withheld (memory-only). Only present when every item
+    # in the batch has one, so the mask stays rectangular.
+    memory_only = None
+    if len(batch) > 13 and all(v is not None for v in batch[13]):
+        memory_only = torch.stack(batch[13], axis=0)  # (b, n)
+
     batch = edict({'views': views,
                    'coords': coords,
                    'p2d': p2d,
@@ -420,7 +426,8 @@ def custom_collate(batch):
                    'sample_info': rows,
                    'mem_views': mem_views,
                    'mem_p2d': mem_p2d,
-                   'mem_valid': mem_valid})
+                   'mem_valid': mem_valid,
+                   'memory_only': memory_only})
 
     return batch
 
@@ -485,6 +492,11 @@ class PosetailDataset(Dataset):
         # of memory entries and generalizes to a different count at inference).
         self.memory_num_context = config.dataset[split].get('memory_num_context', 0)
         self.memory_prob = config.dataset[split].get('memory_prob', 0.0)
+        # "memory-only" points: their query position is withheld entirely, so the model has
+        # to FIND them from their memory alone. Only meaningful when memory frames were
+        # sampled for this item -- with no memory there would be nothing to find them from.
+        self.memory_only_prob = config.dataset[split].get('memory_only_prob', 0.0)
+        self.memory_only_kpt_prob = config.dataset[split].get('memory_only_kpt_prob', 0.5)
 
         self.crop_to_points = config.dataset[split].get('crop_to_points', True)
         self.min_crop_dim = config.dataset[split].get('min_crop_dim', 64)
@@ -725,6 +737,7 @@ class PosetailDataset(Dataset):
         # Memory-frame state, filled in by the 3D path when memory is enabled (native-2D
         # datasets have no world coords / multi-camera geometry, so they carry no memory).
         mem_idx = mem_coords = mem_cgroups = mem_crops = None
+        memory_only = None
 
         # ── 2D-only path ──────────────────────────────────────────────────────
         if is_true_2d:
@@ -1025,6 +1038,20 @@ class PosetailDataset(Dataset):
             else:
                 query_times = torch.zeros((coords.shape[1],), dtype=torch.int32, device='cpu')
 
+            # --- memory-only points: withhold the query position entirely, so the model
+            # must locate them from their memory. Conditional on memory frames existing.
+            if mem_idx is not None and np.random.random() < self.memory_only_prob:
+                n_kpts_cur = coords.shape[1]
+                memory_only = torch.rand(n_kpts_cur) < self.memory_only_kpt_prob
+                # Keep at least one anchored point: the scene scale and the crop are both
+                # derived from the query set, so an all-memory-only sample would have
+                # nothing to place the scene by.
+                if bool(memory_only.all()):
+                    memory_only[np.random.randint(n_kpts_cur)] = False
+                # They are searched for from the first frame onward.
+                query_times = torch.where(memory_only, torch.zeros_like(query_times),
+                                          query_times)
+
             if is_2d_mode:
                 p2d = project_points_torch(cgroup, coords)  # (1, t, n_kpts, 2)
             else:
@@ -1182,6 +1209,12 @@ class PosetailDataset(Dataset):
         # per-sample occlusion-dropout: replace the whole sample with -1 (unknown)
         if np.random.random() < self.occlusion_dropout_prob:
             query_occlusion = torch.full((n_kpts_out, n_cams_out), -1.0)
+        # A memory-only point has no query, so nothing is known about its occlusion state
+        # there either -- saying otherwise would leak information about where it is.
+        if memory_only is not None:
+            query_occlusion = torch.where(memory_only[:, None],
+                                          torch.full_like(query_occlusion, -1.0),
+                                          query_occlusion)
         query_occlusion = query_occlusion.to(torch.int64)                    # (N, cams)
 
         # --- memory observations: where each point sits in each remembered frame, and
@@ -1210,7 +1243,7 @@ class PosetailDataset(Dataset):
             mem_views = [v for v in mem_views]                            # list per camera
 
         return (views, coords, vis, fnums, cgroup, row, query_times, vis_2d, p2d,
-                query_occlusion, mem_views, mem_p2d, mem_valid)
+                query_occlusion, mem_views, mem_p2d, mem_valid, memory_only)
 
 
     def _build_2d_cgroup(self, row, img_path, cam_names):

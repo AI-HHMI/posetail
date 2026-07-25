@@ -1726,3 +1726,152 @@ class MemoryEncoder(nn.Module):
         fused = torch.where(seen[..., None], fused,
                             self.null_entry.to(fused.dtype).expand_as(fused))
         return rearrange(fused, 'b m n d -> b n m d')
+
+
+class MemoryQueryEncoder(nn.Module):
+    """Builds the decoder's query token for points whose position is NOT given.
+
+    The normal QueryEncoder describes a point by where it is -- an image patch at its
+    projected pixel, that pixel's position, its depth. A memory-only point has none of
+    that: the task is to FIND it. Substituting learned "missing" placeholders there would
+    give every such point an identical, contentless token; instead this reads the point's
+    own memory bank, so the token says *which* target to look for.
+
+    Mirrors QueryEncoder's gated fusion so the two tokens are interchangeable:
+      - appearance: a learned seed cross-attends over the point's M memory entries
+        (constant across target frames and cameras, exactly as QueryEncoder's
+        patch/pos/depth terms are constant across target frames)
+      - time: the same scheme as QueryEncoder ('learned' tables or 'fourier_rel'), which
+        is what varies over the target frame
+      - camera: the camera-only terms, so a point's token is not identical across views;
+        the position-dependent terms simply have no meaning here and are absent.
+
+        memory_bank [B, N, M, dim] -> [B, T_query, n_cams, decoder_dim]   (T_query = T*N)
+    """
+
+    def __init__(self, dim, decoder_dim, num_heads=8, cross_attn_dim=None, max_freq=10,
+                 n_frames=16, time_embed_mode='learned', principal_point_embedding=False,
+                 intrinsic_embedding=False, dropout=0.0):
+        super().__init__()
+        self.dim = dim
+        self.max_freq = max_freq
+        self.n_frames = n_frames
+        self.time_embed_mode = time_embed_mode
+        self.principal_point_embedding = principal_point_embedding
+        self.intrinsic_embedding = intrinsic_embedding
+        cross_attn_dim = cross_attn_dim or dim
+
+        # --- appearance: read this point's memory ---
+        self.seed = nn.Parameter(torch.zeros(1, 1, dim))
+        nn.init.trunc_normal_(self.seed, std=0.02)
+        self.mem_norm = nn.LayerNorm(dim)
+        self.read_attn = DecoupledCrossAttention(
+            latent_dim=dim, kv_dim=dim, cross_attn_dim=cross_attn_dim,
+            num_heads=num_heads, dropout=dropout)
+
+        # --- time (same conventions as QueryEncoder) ---
+        self.time_norm = float(n_frames)
+        if time_embed_mode == 'learned':
+            self.t_query_embed = nn.Embedding(n_frames, dim)
+            self.t_target_embed = nn.Embedding(n_frames, dim)
+        else:
+            self.linear_query_time = nn.Linear(2 * max_freq + 1, dim)
+            self.linear_target_time = nn.Linear(2 * max_freq + 1, dim)
+            self.linear_gap = nn.Linear(2 * max_freq + 1, dim)
+
+        # --- camera-only terms ---
+        if principal_point_embedding:
+            self.linear_pp = nn.Linear(4 * max_freq + 2, dim)
+        if intrinsic_embedding:
+            self.linear_intrinsic = nn.Linear(4 * max_freq + 2, dim)
+
+        self.n_fusion_terms = (3
+                               + int(time_embed_mode == 'fourier_rel')
+                               + int(principal_point_embedding)
+                               + int(intrinsic_embedding))
+        self.gate = nn.Sequential(
+            nn.Linear(dim * self.n_fusion_terms, self.n_fusion_terms), nn.Sigmoid())
+        nn.init.normal_(self.gate[0].weight, std=0.01)
+        nn.init.constant_(self.gate[0].bias, 0.0)
+
+        self.fusion_norm = nn.LayerNorm(dim)
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4), nn.GELU(), nn.Dropout(0.05),
+            nn.Linear(dim * 4, decoder_dim))
+
+    def _interp_time_embed(self, emb, times, n_frames):
+        """Mirrors QueryEncoder._interp_time_embed (resize the table to the clip length)."""
+        if n_frames == emb.num_embeddings:
+            return emb(times)
+        w = F.interpolate(emb.weight.t().unsqueeze(0), size=n_frames,
+                          mode='linear', align_corners=False).squeeze(0).t()
+        return F.embedding(times, w)
+
+    def _fourier_time(self, times, linear):
+        s = (times.to(torch.float32) / self.time_norm)[..., None, None]
+        feat = torch.cat([s, get_fourier_encoding(s, min_freq=0, max_freq=self.max_freq)],
+                         dim=-1)
+        return linear(feat)[..., 0, :]
+
+    def forward(self, memory_bank, query_time, target_time, camera_group, sizes, T):
+        """
+        Args:
+            memory_bank: [B, N, M, dim] the memory entries of THESE points only.
+            query_time / target_time: [B, T_query] (T_query = T*N, t-major), as QueryEncoder.
+            sizes: [n_cams, 2] (W, H) per camera.
+            T: number of target frames, so T_query can be unpacked.
+        """
+        B, N, M, _ = memory_bank.shape
+        n_cams = len(camera_group)
+        T_query = query_time.shape[1]
+
+        # --- appearance: one vector per point, from its own memory ---
+        kv = rearrange(self.mem_norm(memory_bank), 'b n m d -> (b n) m d')
+        q = self.seed.to(kv.dtype).expand(kv.shape[0], -1, -1)          # [(b n), 1, dim]
+        app = self.read_attn(q, kv)[:, 0]                               # [(b n), dim]
+        app = rearrange(app, '(b n) d -> b n d', b=B, n=N)
+        # broadcast over target frames (t-major, matching QueryEncoder's (t n) flatten)
+        embed_app = repeat(app, 'b n d -> b (t n) cams d', t=T, cams=n_cams)
+
+        # --- time ---
+        embed_gap = None
+        if self.time_embed_mode == 'learned':
+            embed_query_time = repeat(
+                self._interp_time_embed(self.t_query_embed, query_time, T),
+                'b t d -> b t cams d', cams=n_cams)
+            embed_target_time = repeat(
+                self._interp_time_embed(self.t_target_embed, target_time, T),
+                'b t d -> b t cams d', cams=n_cams)
+        else:
+            embed_query_time = repeat(self._fourier_time(query_time, self.linear_query_time),
+                                      'b t d -> b t cams d', cams=n_cams)
+            embed_target_time = repeat(self._fourier_time(target_time, self.linear_target_time),
+                                       'b t d -> b t cams d', cams=n_cams)
+            embed_gap = repeat(self._fourier_time(target_time - query_time, self.linear_gap),
+                               'b t d -> b t cams d', cams=n_cams)
+
+        terms = [embed_app, embed_query_time, embed_target_time]
+        if embed_gap is not None:
+            terms.append(embed_gap)
+
+        # --- camera-only terms (same normalization as QueryEncoder) ---
+        if self.principal_point_embedding:
+            pp = torch.stack([(cam['mat'][:2, 2] - cam['offset']).to(sizes.dtype)
+                              for cam in camera_group])                  # [n_cams, 2]
+            pp = pp / sizes * 2.0 - 1.0
+            pp = repeat(pp, 'cams r -> b t cams r', b=B, t=T_query)
+            terms.append(self.linear_pp(
+                torch.cat([pp, get_fourier_encoding(pp, min_freq=0, max_freq=self.max_freq)],
+                          dim=-1)))
+        if self.intrinsic_embedding:
+            focal = torch.stack([torch.stack([cam['mat'][0, 0], cam['mat'][1, 1]]).to(sizes.dtype)
+                                 for cam in camera_group]) / sizes       # [n_cams, 2]
+            focal = repeat(focal, 'cams r -> b t cams r', b=B, t=T_query)
+            terms.append(self.linear_intrinsic(
+                torch.cat([focal, get_fourier_encoding(focal, min_freq=0, max_freq=self.max_freq)],
+                          dim=-1)))
+
+        stack = torch.stack(terms, dim=-2)
+        weights = self.gate(rearrange(stack, 'b t c n d -> b t c (n d)'))
+        combined = einsum(weights, stack, 'b t c n, b t c n d -> b t c d')
+        return self.fusion_mlp(self.fusion_norm(combined))

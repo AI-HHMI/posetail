@@ -215,6 +215,18 @@ def run(config_path, fabric):
         
     model = fabric.setup(model)
 
+    # The memory bank is built by the training loop, not inside forward(), so these run on
+    # the wrapped module from "outside". Fabric blocks that by default under DDP (the
+    # strategy needs to know which calls participate in the autograd graph it syncs), so
+    # declare them as forward methods. Without this, multi-GPU dies at the first step with
+    # "You are calling the method ... from outside the model".
+    # (guard on _original_module: under DDP _forward_module is the DistributedDataParallel
+    # wrapper, which does not expose the underlying model's methods)
+    if hasattr(model, 'mark_forward_method'):
+        for _m in ('build_memory_bank', 'compute_cube_scale'):
+            if hasattr(model._original_module, _m):
+                model.mark_forward_method(_m)
+
     model.print_summary()
 
     base_lr = config.training.optimizer.learning_rate

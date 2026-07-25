@@ -196,6 +196,99 @@ def main():
     d = (full['coords_pred'].double() - chunked['coords_pred'].double()).abs().max().item()
     results.append(report(f'chunked == full-N (maxabsdiff={d:.3e})', d < 1e-5))
 
+    # ---- 9. memory-only queries ------------------------------------------------------
+    # Points whose query position is withheld: the model must find them from memory.
+    print('9. memory-only queries')
+    mem.eval()
+
+    def run(model, coords_in, bank, n_cams=2, **kw):
+        v, c, q, g = make_batch()
+        g = g[:n_cams]
+        v = v[:n_cams]
+        cs = model.compute_cube_scale(g, coords)      # full set, BEFORE masking
+        with torch.no_grad():
+            return model(views=v, coords=coords_in, camera_group=g, query_times=q,
+                         memory_bank=bank, cube_scale=cs, **kw)
+
+    bank = mem.build_memory_bank(*make_memory())
+    unk = torch.zeros(B, N, dtype=torch.bool)
+    unk[:, :2] = True
+    coords_mo = coords.clone()
+    coords_mo[unk] = float('nan')
+
+    out_mo = run(mem, coords_mo, bank)
+    results.append(report('finite outputs with memory-only points',
+                          all(bool(torch.isfinite(out_mo[k]).all())
+                              for k in ['coords_pred', '2d_pred', '3d_pred_direct'])))
+
+    # all-False mask must reproduce the plain path exactly (regression guard)
+    out_plain = run(mem, coords, bank)
+    out_nomask = run(mem, coords, bank)
+    results.append(report('all-known mask == plain path (bit-identical)',
+                          torch.equal(out_plain['coords_pred'], out_nomask['coords_pred'])))
+
+    # the known points must be unaffected by their neighbours going memory-only
+    d_known = (out_plain['coords_pred'][:, :, 2:].double()
+               - out_mo['coords_pred'][:, :, 2:].double()).abs().max().item()
+    results.append(report(f'known points barely move when others go memory-only '
+                          f'(maxabsdiff={d_known:.2e})', d_known < 1e-3))
+
+    # THE load-bearing test: memory-only predictions must actually follow the memory.
+    # This can only be measured on a model that is OFF its zero-init state -- the grid
+    # heads and the memory read are both zero-init, so a freshly built model emits the
+    # grid centre for every point regardless of its input (2d_pred has exactly one unique
+    # value). Perturb them to emulate a partly-trained model, then swap the bank.
+    trained = build(True)
+    trained.load_state_dict(mem.state_dict(), strict=False)
+    with torch.no_grad():
+        for h in (trained.decoder.heads_2d, trained.decoder.heads_3d):
+            for m_i in range(2):
+                h[m_i][1].weight.normal_(0, 0.02)
+        for mca in trained.decoder.memory_cross_attns:
+            mca.out_proj.weight.normal_(0, 0.02)
+    trained.eval()
+
+    # Perturb ONLY the memory-only points' own bank rows. That isolates the effect: the
+    # anchored points' rows are untouched, so their decoder memory-read is unchanged and
+    # they must not move AT ALL, while the memory-only points -- whose query token IS this
+    # memory -- must. (Swapping the whole bank would move every point, since the decoder
+    # reads memory for all of them, and would prove nothing.)
+    bank_a = mem.build_memory_bank(*make_memory())
+    bank_b = bank_a.clone()
+    bank_b[:, :2] = bank_b[:, :2].roll(1, dims=-1) * 3.0 + 0.5
+    out_a = run(trained, coords_mo, bank_a)
+    out_b = run(trained, coords_mo, bank_b)
+    d_mo = (out_a['2d_pred'][..., :2, :].double()
+            - out_b['2d_pred'][..., :2, :].double()).abs().max().item()
+    d_kn = (out_a['2d_pred'][..., 2:, :].double()
+            - out_b['2d_pred'][..., 2:, :].double()).abs().max().item()
+    results.append(report(f'memory-only points follow THEIR memory '
+                          f'(they move {d_mo:.3f} px; anchored points, whose memory was '
+                          f'untouched, move {d_kn:.3e} px)',
+                          d_mo > 1e-2 and d_kn < 1e-6))
+
+    # single camera must fall back to the ray anchor (triangulation is None there)
+    bank1 = mem.build_memory_bank(*make_memory(n_cams=1))
+    out_1cam = run(mem, coords_mo, bank1, n_cams=1)
+    results.append(report('single camera works (ray anchor, no triangulation)',
+                          bool(torch.isfinite(out_1cam['coords_pred']).all())))
+
+    # gradients must be finite everywhere -- the NaN-in-the-discarded-branch trap
+    gm = build(True)
+    gm.train()
+    v, c, q, g = make_batch()
+    bank_g = gm.build_memory_bank(*make_memory())
+    o = gm(views=v, coords=coords_mo, camera_group=g, query_times=q, memory_bank=bank_g,
+           cube_scale=gm.compute_cube_scale(g, coords))
+    (o['coords_pred'].square().mean() + o['2d_pred'].square().mean()).backward()
+    bad = [n for n, p in gm.named_parameters()
+           if p.grad is not None and not torch.isfinite(p.grad).all()]
+    results.append(report(f'no non-finite gradients{"" if not bad else " -- " + bad[0]}',
+                          not bad))
+    results.append(report('grad reaches memory_query_encoder',
+                          any(n.startswith('memory_query_encoder') and p.grad is not None
+                              and p.grad.abs().sum() > 0 for n, p in gm.named_parameters())))
+
     print()
     print(f'RESULT: {sum(results)}/{len(results)} passed')
     return 0 if all(results) else 1

@@ -18,6 +18,10 @@ split_dir = 'train'
 # number of memory entries at inference than it saw in training.
 memory_num_context = [2, 8]
 memory_prob = 0.4
+# memory-only queries: withhold the position of some points entirely so the model has to
+# find them from memory. Fires only on items that carry memory frames.
+memory_only_prob = 0.3
+memory_only_kpt_prob = 0.5
 n_frames = 24
 min_res = 256
 max_res = 256
