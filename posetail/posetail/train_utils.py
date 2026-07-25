@@ -18,7 +18,7 @@ from easydict import EasyDict
 
 # from posetail.datasets.datasets import Rat7mIterableDataset
 from posetail.datasets.utils import safe_make
-from posetail.posetail.cube import get_camera_scale
+from posetail.posetail.cube import get_camera_scale, compute_cube_scale
 from posetail.posetail.eval_metrics import get_eval_metrics, get_metrics_by_motion, get_direct_depth_metrics
 from posetail.posetail.cube import get_camera_scale
 from posetail.posetail.losses import get_vis_true, unroll_batch, normalize_by_mean_depth
@@ -625,28 +625,41 @@ def memory_only_kwargs(model, batch, query_coords, cgroup, is_2d):
     mask = mask.to(query_coords.device)
     kwargs = {}
     if not is_2d and cgroup:
-        kwargs['cube_scale'] = model.compute_cube_scale(cgroup, query_coords)
+        # Module-level function, NOT model.compute_cube_scale: calling a model method from
+        # outside forward() needs mark_forward_method under DDP, which reroutes it through
+        # DDP's forward and issues an extra set of collectives. Firing that only when
+        # memory-only queries appear desynchronized the ranks. This is pure geometry with no
+        # parameters, so there is nothing for DDP to be involved in.
+        kwargs['cube_scale'] = compute_cube_scale(
+            cgroup, query_coords, len(cgroup), query_coords.device,
+            per_camera=getattr(model, 'per_camera_cube_scale', False))
     query_coords = query_coords.masked_fill(mask[..., None], float('nan'))
     return query_coords, kwargs
 
 
 def memory_kwargs(model, batch, device):
-    """Encode this batch's remembered frames into the memory bank -> {'memory_bank': ...}.
+    """This batch's remembered frames, as forward() kwargs -> {'mem_views', 'mem_p2d', ...}.
 
     Which frames are remembered (and how many) is decided by the DATASET -- it samples them
     from anywhere in the video and projects the points into them (see
     PosetailDataset._sample_memory_frame_idx). Batches where the dataset chose not to
     sample memory simply train without it, which is what memory_prob is for.
+
+    The RAW observations are handed to forward(), which encodes the bank itself. Encoding it
+    here instead would mean calling model.build_memory_bank() on the DDP-wrapped module, which
+    Lightning only allows via mark_forward_method -- and that reroutes the call through DDP's
+    forward, issuing a second set of collectives. Because memory only fires on some batches,
+    the per-rank collective count then diverged and multi-GPU training deadlocked with every
+    GPU spinning at 100%.
     """
     if not getattr(model, 'memory_attention', False):
         return {}
     mem_views = getattr(batch, 'mem_views', None)
     if mem_views is None:
         return {}
-    bank = model.build_memory_bank(
-        [v.to(device) for v in mem_views],
-        batch.mem_p2d.to(device), batch.mem_valid.to(device), device=device)
-    return {'memory_bank': bank}
+    return {'mem_views': [v.to(device) for v in mem_views],
+            'mem_p2d': batch.mem_p2d.to(device),
+            'mem_valid': batch.mem_valid.to(device)}
 
 
 def train_iteration(config, model, fabric, batch,
@@ -720,13 +733,6 @@ def train_iteration(config, model, fabric, batch,
 
     fabric.backward(total_loss)
 
-    # Calculate gradient norm
-    grad_norm = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            grad_norm += p.grad.detach().data.norm(2).item() ** 2
-    grad_norm = grad_norm ** 0.5
-
     # Track the learnable soft-argmax temperatures (exp of unclamped log-params). An upward
     # drift is the suspected driver of isolated grad-norm spikes; log so it can be confirmed
     # (and confirmed pinned once _grid_softmax clamps the effective temperature).
@@ -737,26 +743,40 @@ def train_iteration(config, model, fabric, batch,
         elif name.endswith('log_subpixel_temp'):
             temp_dict[f'{prefix}subpixel_temp'] = float(torch.exp(p.detach()).item())
 
-    # torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm,
-    #                                error_if_nonfinite = False)
+    # Clip, and take the PRE-clip total norm from the return value -- the same quantity the
+    # old per-parameter loop computed, without its one .item() sync per parameter.
+    if hasattr(optimizer, '_opts'):
+        # DualOptimizer (muon+adamw): fabric.clip_gradients takes a single optimizer, so clip
+        # the model's grads directly (no AMP unscale needed at 32/bf16 precision).
+        total_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), config.training.max_grad_norm, error_if_nonfinite=False)
+    else:
+        total_norm = fabric.clip_gradients(
+            model, optimizer, max_norm=config.training.max_grad_norm,
+            error_if_nonfinite=False)
 
-    try:
-        if hasattr(optimizer, '_opts'):
-            # DualOptimizer (muon+adamw): fabric.clip_gradients takes a single optimizer, so clip
-            # the model's grads directly (no AMP unscale needed at 32/bf16 precision).
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm,
-                                           error_if_nonfinite=True)
-        else:
-            fabric.clip_gradients(model, optimizer,
-                max_norm = config.training.max_grad_norm,
-                error_if_nonfinite = True)
+    # Whether to skip the step MUST be agreed on by every rank. Skipping it rank-locally
+    # leaves that rank's weights behind the others forever -- DDP re-broadcasts buffers on
+    # every forward but never parameters -- and also desyncs DualOptimizer's Muon warmup
+    # counter and the schedule-free averaging state.
+    total_norm = torch.as_tensor(total_norm, device=device, dtype=torch.float32)
+    local_bad = not bool(torch.isfinite(total_norm).item())
+    bad_flag = torch.tensor(float(local_bad), device=device)
+    if fabric.world_size > 1:
+        bad_flag = fabric.all_reduce(bad_flag, reduce_op='max')
+    skip_step = bool(bad_flag.item() > 0)
 
+    if skip_step:
+        # Print from the rank(s) that actually saw the bad gradients, so the offending sample
+        # is identifiable without all ranks echoing the same message.
+        if local_bad:
+            print("ERROR BAD GRADIENTS!!!")
+            print(batch.sample_info)
+    else:
         optimizer.step()
-    except:
-        print("ERROR BAD GRADIENTS!!!")
-        print(batch.sample_info)
-        
+
     optimizer.zero_grad()
+    grad_norm = float(total_norm.item())
  
     if evaluate and coords.shape[-1] == 3:
         if p2d is not None:
@@ -790,7 +810,10 @@ def train_iteration(config, model, fabric, batch,
                   f'{prefix}elapsed_time': elapsed_time,
                   f'{prefix}elapsed_time_hms': elapsed_time_hms,
                   f'{prefix}learning_rate': learning_rate,
-                  f'{prefix}grad_norm': grad_norm}
+                  f'{prefix}grad_norm': grad_norm,
+                  # 1 whenever every rank skipped the step on non-finite gradients, so these
+                  # stop being invisible in the run history.
+                  f'{prefix}grad_skipped': float(skip_step)}
     train_dict.update(temp_dict)
     train_dict.update(loss_dict)
 

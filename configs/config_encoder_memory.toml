@@ -175,23 +175,11 @@ depth_log_max = 2.5
 seed = 0
 
 finetune = true
-# pretraining
-# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260710_151739-dqbgdtkx/files/checkpoints/checkpoint_00799996.pth'
 
-# finetuned 1
-# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260712_124515-t8ulpbro/files/checkpoints/checkpoint_01187840.pth'
-
-# finetuned 2
-# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260716_220801-066k6c9u/files/checkpoints/checkpoint_01177600.pth'
-
-# finetuned 3
-# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260721_172745-zbkyq75r/files/checkpoints/checkpoint_00256000.pth'
-
-# finetuned 4
-# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260723_233216-aujvtimm/files/checkpoints/checkpoint_00081920.pth'
-
-# finetuned 5
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260724_100235-w6wzkh0v/files/checkpoints/checkpoint_00010242.pth'
+# Warm start from run 3gvz9mto. The memory modules are absent from this checkpoint and load
+# fresh under strict=False; their output projections are zero-init, so the model starts out
+# predicting exactly as this checkpoint does and learns to use memory from there.
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260724_111406-3gvz9mto/files/checkpoints/checkpoint_00102420.pth'
 
 
 

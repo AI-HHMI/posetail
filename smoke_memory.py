@@ -20,6 +20,7 @@ import toml
 import torch
 from easydict import EasyDict as edict
 
+from posetail.posetail.cube import compute_cube_scale
 from posetail.posetail.tracker_encoder import TrackerEncoder
 
 CFG = 'configs/config_encoder_memory.toml'
@@ -205,7 +206,8 @@ def main():
         v, c, q, g = make_batch()
         g = g[:n_cams]
         v = v[:n_cams]
-        cs = model.compute_cube_scale(g, coords)      # full set, BEFORE masking
+        cs = compute_cube_scale(g, coords, len(g), coords.device,
+                                per_camera=model.per_camera_cube_scale)  # full set, BEFORE masking
         with torch.no_grad():
             return model(views=v, coords=coords_in, camera_group=g, query_times=q,
                          memory_bank=bank, cube_scale=cs, **kw)
@@ -279,7 +281,8 @@ def main():
     v, c, q, g = make_batch()
     bank_g = gm.build_memory_bank(*make_memory())
     o = gm(views=v, coords=coords_mo, camera_group=g, query_times=q, memory_bank=bank_g,
-           cube_scale=gm.compute_cube_scale(g, coords))
+           cube_scale=compute_cube_scale(g, coords, len(g), coords.device,
+                                        per_camera=gm.per_camera_cube_scale))
     (o['coords_pred'].square().mean() + o['2d_pred'].square().mean()).backward()
     bad = [n for n, p in gm.named_parameters()
            if p.grad is not None and not torch.isfinite(p.grad).all()]

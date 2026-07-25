@@ -391,6 +391,30 @@ def get_camera_scale(camera_group, p):
     scale = 1.0 / sensitivity
     return fill_nan_with_batch_median(scale)
 
+
+def compute_cube_scale(camera_group, coords, n_cams, device, per_camera=False):
+    """Per-camera scene scale (n_cams, B) for a query set.
+
+    Pure geometry: a function of the cameras and the points, with no learnable parameters
+    and nothing to synchronize. Deliberately a module-level function rather than a model
+    method -- calling a method on a Fabric/DDP-wrapped model from outside forward() requires
+    marking it as a forward method, which reroutes it through DDP's forward and issues an
+    extra set of collectives. Doing that conditionally (only when memory-only queries fire)
+    desynchronized the ranks and deadlocked multi-GPU training.
+
+    2D queries (R == 2) have no world coordinates, so their scale is all ones.
+    """
+    R = coords.shape[-1]
+    if R == 3:
+        cube_scale = get_camera_scale(camera_group, coords)      # (n_cams, B)
+    else:
+        cube_scale = torch.ones((n_cams, coords.shape[0]), device=device)
+    if not per_camera:
+        med = torch.median(cube_scale, dim=0).values             # (B,)
+        cube_scale = med[None, :].expand(n_cams, coords.shape[0]).contiguous()
+    return cube_scale
+
+
 class UnprojectViews:
 
     def __init__(self, 

@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from einops import rearrange, einsum, reduce, repeat
 
-from posetail.posetail.cube import get_camera_scale, from_homogeneous, to_homogeneous
+from posetail.posetail.cube import compute_cube_scale, from_homogeneous, to_homogeneous
 from posetail.posetail.cube import undistort_points, triangulate_simple_batch, triangulate_simple_batch_reg, project_points_torch
 from posetail.posetail.cube import points_to_rays, _invert_SE3, solve_scale_offset
 from posetail.posetail.cube import noisy_or_logit
@@ -294,16 +294,10 @@ class TrackerEncoder(nn.Module):
 
     def _cube_scale(self, camera_group, coords, n_cams, device):
         """Per-camera scene scale (n_cams, B), shared across cameras unless configured
-        per-camera. Extracted so build_memory_bank uses exactly the same scale as forward."""
-        R = coords.shape[-1]
-        if R == 3:
-            cube_scale = get_camera_scale(camera_group, coords)     # (n_cams, B)
-        else:
-            cube_scale = torch.ones((n_cams, coords.shape[0]), device=device)
-        if not self.per_camera_cube_scale:
-            med = torch.median(cube_scale, dim=0).values            # (B,)
-            cube_scale = med[None, :].expand(n_cams, coords.shape[0]).contiguous()
-        return cube_scale
+        per-camera. The math lives in cube.compute_cube_scale so callers outside the model
+        (which must not invoke model methods under DDP) can use exactly the same scale."""
+        return compute_cube_scale(camera_group, coords, n_cams, device,
+                                  per_camera=self.per_camera_cube_scale)
 
     def build_memory_bank(self, mem_views, mem_p2d, mem_valid, device=None):
         """Encode a set of remembered observations into the bank -> (B, N, M, latent_dim).
@@ -349,14 +343,9 @@ class TrackerEncoder(nn.Module):
         print("  scene representation params: {:,d}".format(count_parameters(self.scene_encoder)))
         print("  decoder params: {:,d}".format(count_parameters(self.decoder)))
         
-    def compute_cube_scale(self, camera_group, coords):
-        """Public wrapper so a caller can compute the scene scale itself and pass it to
-        forward(). Used to compute it from the COMPLETE query set before any memory-only
-        points have their query removed -- see forward()'s `cube_scale` argument."""
-        return self._cube_scale(camera_group, coords, len(camera_group), coords.device)
-
     def forward(self, views, coords, camera_group, query_times=None,
-                kpt_chunk=None, occlusion=None, memory_bank=None, cube_scale=None):
+                kpt_chunk=None, occlusion=None, memory_bank=None, cube_scale=None,
+                mem_views=None, mem_p2d=None, mem_valid=None):
         '''
         B: batch size
         T: number of frames in video
@@ -365,12 +354,22 @@ class TrackerEncoder(nn.Module):
         W: width of image
         D: latent dimension
 
+        Memory is supplied in ONE of two mutually exclusive forms (or neither, which skips
+        the memory cross-attention entirely): an already-encoded `memory_bank`, or the raw
+        `mem_views`/`mem_p2d`/`mem_valid` triple, which is encoded here. Training uses the raw
+        form so the encoding happens inside forward (see train_utils.memory_kwargs);
+        inference passes a prebuilt bank it carries across windows.
+
         memory_bank: (B, N, M, D) per-point appearance memory over M context frames,
-            produced by build_memory_bank(). None -> the memory cross-attention is
-            skipped entirely.
+            produced by build_memory_bank().
+        mem_views: list over cameras (len n_cams) of (B, M, H, W, C) raw remembered frames.
+            M is the number of remembered observations and is independent of T -- each entry
+            is one frame sampled from anywhere in the video, with its own crop and geometry.
+        mem_p2d:  (n_cams, B, M, N, 2) pixel position of each point in each remembered frame.
+        mem_valid: (n_cams, B, M, N) bool -- point is in that frame AND not occluded there.
         cube_scale: (n_cams, B) precomputed scene scale, or None to compute it here.
             Pass it when some queries are memory-only: computed from the COMPLETE query
-            set (see compute_cube_scale) the scale is then identical whether or not the
+            set (see cube.compute_cube_scale) the scale is then identical whether or not the
             memory-only branch fired, instead of quietly shifting with the mask.
 
         A point whose `coords` row is non-finite is MEMORY-ONLY: its position is not given
@@ -385,6 +384,13 @@ class TrackerEncoder(nn.Module):
         n_cams = len(views)
 
         assert len(views) == len(camera_group), "views should match number of cameras"
+
+        # Encode the remembered observations, ahead of everything else so the bank is ready
+        # for the query encoder and the decoder's per-layer memory reads.
+        assert memory_bank is None or mem_views is None, \
+            'pass either memory_bank or the raw mem_views/mem_p2d/mem_valid triple, not both'
+        if mem_views is not None:
+            memory_bank = self.build_memory_bank(mem_views, mem_p2d, mem_valid, device=device)
 
         # Memory-only points: no query position. Detected here so a NaN query is safe from
         # ANY caller. The coords are zeroed for them -- a finite, position-free value that
