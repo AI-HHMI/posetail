@@ -54,6 +54,11 @@ intensity_floor = 0.0
 
 [dataset.val]
 split_dir = 'val'
+# Memory always on for val, with a FIXED count (not a range like train): a val number that
+# also jittered with M would not be comparable pass to pass. memory_only stays off so val
+# remains comparable to the pre-memory checkpoint this run warm-starts from.
+memory_num_context = 8
+memory_prob = 1.0
 n_frames = 24
 max_res = 256
 cams_to_sample = 5
