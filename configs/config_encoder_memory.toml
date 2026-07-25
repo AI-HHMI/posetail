@@ -101,6 +101,12 @@ memory_vit_dim = 256
 memory_vit_depth = 6
 memory_vit_heads = 8
 memory_vit_patch_size = 8
+# how many cross-attention blocks read the ViT tokens into each point's entry. One layer had
+# to pull "which part of this animal is this point" out of 1024 tokens in a single shot.
+memory_read_depth = 3
+# seeds in MemoryQueryEncoder. Measured with a bank of known rank, K makes no difference to
+# the token's effective rank (a single seed's attention already varies per point), so 1.
+memory_pool_seeds = 1
 
 # processing
 stride_length = 24
