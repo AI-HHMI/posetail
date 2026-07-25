@@ -1,6 +1,6 @@
 [wandb]
 project_name = 'posetail-memory-v1'
-path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3'
+path = '/groups/karashchuk/home/karashchukl/results/posetail-memory-v1'
 mode = 'online' # 'online', 'offline', 'disabled'
 
 [dataset]
