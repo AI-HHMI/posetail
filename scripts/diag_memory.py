@@ -31,9 +31,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from posetail.datasets.posetail_dataset import PosetailDataset, custom_collate  # noqa: E402
 from posetail.inference.inference_utils import load_model_from_base_folder      # noqa: E402
 from posetail.posetail.cube import compute_cube_scale                           # noqa: E402
-from posetail.posetail.tracker_encoder import TrackerEncoder                    # noqa: E402
+from posetail.posetail.tracker_encoder import (TrackerEncoder,                  # noqa: E402
+                                               normalize_mem_depth)
 from posetail.posetail.train_utils import (dict_to_device, load_config,         # noqa: E402
-                                           memory_kwargs)
+                                           memory_raw_from_batch)
 
 
 def parse_args():
@@ -137,7 +138,10 @@ def main():
             ok = rearrange(val[0], 'b m n -> (b m) n')
             dep = itr = None
             if b.mem_depth is not None:
-                dep = rearrange(b.mem_depth.to(device)[0], 'b m n -> (b m) n') / cs[0].clamp(min=1e-6)
+                # normalize_mem_depth, not a hand-rolled copy: a diagnostic that drifts from
+                # what build_memory_bank actually does is how a training run gets misread.
+                dep_full = normalize_mem_depth(b.mem_depth.to(device), cs)   # (cams,B,M,N)
+                dep = rearrange(dep_full[0], 'b m n -> (b m) n')
                 itr = rearrange(b.mem_intrinsics.to(device)[0], 'b m r -> (b m) r')
             q_seed, pp = me._query(v, p, ok, depth=dep, intrinsics=itr, tokens=tok)
             bias = (me._spatial_prior(tok.shape[1], pp, ok, q_seed.dtype)
@@ -148,7 +152,7 @@ def main():
                 x = x + blk['mlp'](blk['norm_m'](x))
 
             bank = model.build_memory_bank(
-                **memory_kwargs(model, b, device), device=device, cube_scale=cs)
+                memory_raw_from_batch(model, b), device=device, cube_scale=cs)
 
             # ONE target frame is enough to measure rank, and it keeps the (T*N) flatten
             # unambiguous. `mv` is the MEMORY views, whose axis 1 is M (not the clip

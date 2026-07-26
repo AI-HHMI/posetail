@@ -45,7 +45,7 @@ from posetail.inference.inference_utils import (build_chunk_memory,            #
 from posetail.posetail.cube import compute_cube_scale                            # noqa: E402
 from posetail.posetail.eval_metrics import get_eval_metrics                     # noqa: E402
 from posetail.posetail.train_utils import (_eval_cube_scale, dict_to_device,    # noqa: E402
-                                           memory_kwargs, memory_only_kwargs)
+                                           memory_raw_from_batch, memory_only_kwargs)
 
 METRICS = ['mte', 'delta_x_avg', 'avg_jaccard', 'survival_rate', 'mpjpe']
 
@@ -89,17 +89,17 @@ def build_bank(model, batch, device, cube_scale=None):
     Training hands the RAW observations to forward() and lets it encode the bank internally,
     because encoding outside would mean calling build_memory_bank on the DDP-wrapped module
     -- which routes through DDP's forward and desynced the per-rank collective count (see
-    train_utils.memory_kwargs). This script is single-process and the model is not wrapped,
-    so calling it directly is safe here, and it means the frame encode happens once per batch
-    instead of once per arm.
+    train_utils.memory_raw_from_batch). This script is single-process and the model is not
+    wrapped, so calling it directly is safe here, and it means the frame encode happens once
+    per batch instead of once per arm.
 
-    The batch unpacking is `memory_kwargs`, deliberately: training, this script, diag_memory
-    and inference must not drift apart on how a memory observation is assembled.
+    The batch unpacking is `memory_raw_from_batch`, deliberately: training, this script,
+    diag_memory and inference must not drift apart on how a memory observation is assembled.
     """
-    kw = memory_kwargs(model, batch, device)
-    if not kw:
+    raw = memory_raw_from_batch(model, batch)
+    if raw is None:
         return None
-    return model.build_memory_bank(**kw, device=device, cube_scale=cube_scale)
+    return model.build_memory_bank(raw, device=device, cube_scale=cube_scale)
 
 
 def build_bank_from_chunk(model, batch, views, cgroup, coords, device, n_ctx,

@@ -35,6 +35,120 @@ _T_AXIS = {
 _N_AXIS = {k: v + 1 for k, v in _T_AXIS.items()}
 
 
+# ---- raw memory contract -------------------------------------------------------------
+# The COMPLETE set of per-sample memory tensors, and the ONLY place their shapes are
+# documented. forward(memory_raw=...) and build_memory_bank(memory_raw) accept exactly
+# these keys and nothing else, so a renamed or misspelled field raises instead of being
+# silently dropped by a **kwargs splat.
+#
+#   mem_views:      list over cameras (len n_cams) of (B, M, S, H, W, C) raw remembered
+#                   tubelets, uint8 as the dataset stores them. M is the number of
+#                   remembered observations, independent of the clip length T -- each is
+#                   one frame sampled from anywhere in the video, with its own crop and
+#                   geometry, paired into an S-frame tubelet so the video backbone sees a
+#                   real pair rather than a duplicated still.
+#   mem_p2d:        (n_cams, B, M, N, 2) pixel position of each point in each frame.
+#   mem_valid:      (n_cams, B, M, N) bool -- point in frame AND not occluded there.
+#   mem_depth:      (n_cams, B, M, N) METRIC distance to that camera. Normalized by
+#                   cube_scale in build_memory_bank; absent (or 2D-mode) drops the term.
+#   mem_intrinsics: (n_cams, B, M, 4) = (fx/W, fy/H, cx/W, cy/H).
+#   mem_slot:       (B, M) which half of each tubelet holds the remembered frame.
+#   mem_tokens:     (n_cams, B, M, n_tok, dim) precomputed scene tokens. Inference passes
+#                   these -- its memory frames come from the chunk it just encoded, so
+#                   re-encoding them would be pure waste. Absent means encode them.
+#
+# Note the axis order is NOT uniform: everything is cams-first except mem_slot, which is
+# batch-first. That is what the shape checks in prepare_memory_raw are for.
+MEMORY_RAW_REQUIRED = ('mem_views', 'mem_p2d', 'mem_valid')
+MEMORY_RAW_OPTIONAL = ('mem_depth', 'mem_intrinsics', 'mem_slot', 'mem_tokens')
+MEMORY_RAW_KEYS = MEMORY_RAW_REQUIRED + MEMORY_RAW_OPTIONAL
+
+
+def normalize_mem_depth(mem_depth, cube_scale):
+    """METRIC memory depth -> the normalized quantity the QueryEncoder's depth term uses.
+
+    cube_scale is (n_cams, B); broadcast over the (M, N) axes. Either argument being None
+    means the term is DROPPED and MemoryEncoder._query substitutes its missing_depth
+    token -- that is 2D-mode, where no meaningful scale exists and encoding a raw metric
+    distance would be out of distribution against the 3D case.
+
+    Module level so scripts/diag_memory.py, which reproduces the read stage by stage,
+    cannot drift from what build_memory_bank actually does.
+    """
+    if mem_depth is None or cube_scale is None:
+        return None
+    return mem_depth / cube_scale[:, :, None, None].clamp(min=1e-6)
+
+
+def prepare_memory_raw(memory_raw, device=None):
+    """Validate a raw-memory dict (see MEMORY_RAW_KEYS) and move it to `device`.
+
+    Returns a NEW dict with every MEMORY_RAW_KEYS entry present, absent optionals as
+    None, so consumers index instead of .get().
+
+    Raises ValueError -- never assert, so the checks survive `python -O` -- on an unknown
+    or misspelled key, a missing required key, or any shape/dtype disagreement. An
+    explicit None for an OPTIONAL key means "absent", so producers that compute e.g.
+    mem_depth conditionally need no special case.
+
+    This is the ONE place raw memory is moved to a device; producers hand over whatever
+    device the batch is already on.
+    """
+    if not isinstance(memory_raw, dict):
+        raise ValueError(f'memory_raw must be a dict with keys {list(MEMORY_RAW_KEYS)}, '
+                         f'got {type(memory_raw).__name__}')
+    unknown = sorted(set(memory_raw) - set(MEMORY_RAW_KEYS))
+    if unknown:
+        raise ValueError(f'memory_raw got unknown key(s) {unknown}; allowed keys are '
+                         f'{list(MEMORY_RAW_KEYS)}')
+    missing = [k for k in MEMORY_RAW_REQUIRED if memory_raw.get(k) is None]
+    if missing:
+        raise ValueError(f'memory_raw is missing required key(s) {missing}; pass '
+                         'memory_raw=None to run without memory')
+
+    dev = device if device is not None else memory_raw['mem_p2d'].device
+    out = {k: None for k in MEMORY_RAW_KEYS}
+    out['mem_views'] = [v.to(dev) for v in memory_raw['mem_views']]
+    for k in MEMORY_RAW_KEYS[1:]:
+        v = memory_raw.get(k)
+        if v is not None:
+            out[k] = v.to(dev)
+
+    n_cams = len(out['mem_views'])
+    B, M, S = out['mem_views'][0].shape[:3]
+    N = out['mem_p2d'].shape[3] if out['mem_p2d'].ndim == 5 else -1
+    dims = f'(n_cams={n_cams}, B={B}, M={M}, N={N})'
+
+    def _check(key, want):
+        v = out[key]
+        if v is not None and tuple(v.shape) != want:
+            raise ValueError(f'memory_raw["{key}"] must be {want} {dims}, '
+                             f'got {tuple(v.shape)}')
+
+    for c, v in enumerate(out['mem_views']):
+        if v.ndim != 6 or tuple(v.shape[:3]) != (B, M, S):
+            raise ValueError(f'memory_raw["mem_views"][{c}] must be (B, M, S, H, W, C) '
+                             f'with (B, M, S) == {(B, M, S)}, got {tuple(v.shape)}')
+    _check('mem_p2d', (n_cams, B, M, N, 2))
+    _check('mem_valid', (n_cams, B, M, N))
+    _check('mem_depth', (n_cams, B, M, N))
+    _check('mem_intrinsics', (n_cams, B, M, 4))
+    _check('mem_slot', (B, M))
+    tok = out['mem_tokens']
+    if tok is not None and (tok.ndim != 5 or tuple(tok.shape[:3]) != (n_cams, B, M)):
+        raise ValueError(f'memory_raw["mem_tokens"] must be (n_cams, B, M, n_tok, dim) '
+                         f'with the leading dims {(n_cams, B, M)}, got {tuple(tok.shape)}')
+
+    # A float mem_valid would broadcast silently through the null_entry torch.where.
+    if out['mem_valid'].dtype != torch.bool:
+        raise ValueError('memory_raw["mem_valid"] must be bool, got '
+                         f'{out["mem_valid"].dtype}')
+    if out['mem_slot'] is not None and out['mem_slot'].dtype.is_floating_point:
+        raise ValueError('memory_raw["mem_slot"] must be an integer tensor (which half of '
+                         f'each tubelet), got {out["mem_slot"].dtype}')
+    return out
+
+
 class TrackerEncoder(nn.Module):
 
     def __init__(self, image_size = 256,
@@ -322,7 +436,7 @@ class TrackerEncoder(nn.Module):
         """Scene tokens for already-normalized views. Exists so a caller can encode a chunk
         ONCE and reuse the result for both the memory bank and the forward pass; training
         stays on the in-forward path, since calling model methods outside forward is a DDP
-        hazard (see train_utils.memory_kwargs)."""
+        hazard (see train_utils.memory_raw_from_batch)."""
         return self.scene_encoder(views_norm)
 
     def _encode_memory_frames(self, views_norm):
@@ -347,9 +461,7 @@ class TrackerEncoder(nn.Module):
             tokens = self.encode_scene([flat])[0]              # ((cams B M), n_tok, dim)
         return rearrange(tokens, '(cams b m) t d -> cams b m t d', cams=n_cams, b=B, m=M)
 
-    def build_memory_bank(self, mem_views, mem_p2d, mem_valid, mem_depth=None,
-                          mem_intrinsics=None, device=None, cube_scale=None,
-                          mem_slot=None, mem_tokens=None):
+    def build_memory_bank(self, memory_raw, device=None, cube_scale=None):
         """Encode remembered observations -> (B, N, M*n_cams, latent_dim), one entry per
         (memory frame, camera), frame-major.
 
@@ -357,33 +469,35 @@ class TrackerEncoder(nn.Module):
         this only encodes them. Handles frame normalization so raw frames can be passed.
 
         Args:
-            mem_views: list over cameras of [B, M, 2, H, W, C] raw remembered tubelets.
-            mem_p2d:   [n_cams, B, M, N, 2] pixel position of each point in each frame.
-            mem_valid: [n_cams, B, M, N] bool -- point in frame AND not occluded there.
-            mem_depth: [n_cams, B, M, N] METRIC distance to that camera, or None. Divided
-                by cube_scale here so the encoder sees the same normalized quantity the
-                QueryEncoder does; pass cube_scale=None (2D-mode) to drop the term instead.
-            mem_intrinsics: [n_cams, B, M, 4] = (fx/W, fy/H, cx/W, cy/H), or None.
-            mem_slot: [B, M] which half of each tubelet holds the remembered frame.
-            mem_tokens: [n_cams, B, M, n_tok, dim] precomputed scene tokens. Inference
-                passes these -- its memory frames come from the chunk it just encoded, so
-                re-encoding them would be pure waste. None means encode them here.
+            memory_raw: dict of the raw remembered observations. See MEMORY_RAW_KEYS for
+                the full key list and every field's shape; prepare_memory_raw validates it
+                and moves it to `device`.
+            cube_scale: (n_cams, B) scene scale, used to normalize the memory depth term
+                so the encoder sees the same quantity the QueryEncoder does. None is
+                2D-mode: the term is dropped rather than encoding a raw metric distance.
+                mem_depth and mem_intrinsics are independent -- MemoryEncoder._query gates
+                the depth term and the camera terms separately.
         """
         assert self.memory_attention, 'build_memory_bank requires memory_attention=True'
-        device = device if device is not None else mem_p2d.device
-        views_norm = self._normalize_views_mem(mem_views, device)
-        if mem_tokens is None:
-            mem_tokens = self._encode_memory_frames(views_norm)
-        depth = None
-        if mem_depth is not None and cube_scale is not None:
-            # cube_scale is (n_cams, B); broadcast over the (M, N) axes.
-            cs = cube_scale.to(device)[:, :, None, None]
-            depth = mem_depth.to(device) / cs.clamp(min=1e-6)
+        raw = prepare_memory_raw(memory_raw, device=device)
+        dev = raw['mem_p2d'].device
+        views_norm = self._normalize_views_mem(raw['mem_views'], dev)
+        tokens = raw['mem_tokens']
+        if tokens is None:
+            tokens = self._encode_memory_frames(views_norm)
+        if cube_scale is not None:
+            cube_scale = cube_scale.to(dev)
+            n_cams, B = len(raw['mem_views']), raw['mem_views'][0].shape[0]
+            # A wrong-shaped cube_scale broadcasts and silently mis-normalizes every depth.
+            if tuple(cube_scale.shape) != (n_cams, B):
+                raise ValueError(
+                    f'cube_scale must be (n_cams, B) = {(n_cams, B)} to broadcast over the '
+                    f'memory (M, N) axes, got {tuple(cube_scale.shape)}')
         return self.memory_encoder(
-            views_norm, mem_p2d.to(device), mem_valid.to(device), mem_tokens,
-            mem_slot=(mem_slot.to(device) if mem_slot is not None else None),
-            mem_depth=depth,
-            mem_intrinsics=(mem_intrinsics.to(device) if mem_intrinsics is not None else None))
+            views_norm, raw['mem_p2d'], raw['mem_valid'], tokens,
+            mem_slot=raw['mem_slot'],
+            mem_depth=normalize_mem_depth(raw['mem_depth'], cube_scale),
+            mem_intrinsics=raw['mem_intrinsics'])
 
     def _normalize_views_mem(self, mem_views, device):
         """Memory tubelets [B, M, 2, H, W, C] -> [B, M, 2, C, H, W], normalized.
@@ -425,9 +539,7 @@ class TrackerEncoder(nn.Module):
         
     def forward(self, views, coords, camera_group, query_times=None,
                 kpt_chunk=None, occlusion=None, memory_bank=None, cube_scale=None,
-                mem_views=None, mem_p2d=None, mem_valid=None,
-                mem_depth=None, mem_intrinsics=None, mem_slot=None,
-                scene_features=None):
+                memory_raw=None, scene_features=None):
         '''
         B: batch size
         T: number of frames in video
@@ -438,22 +550,18 @@ class TrackerEncoder(nn.Module):
 
         Memory is supplied in ONE of two mutually exclusive forms (or neither, which skips
         the memory cross-attention entirely): an already-encoded `memory_bank`, or the raw
-        `mem_views`/`mem_p2d`/`mem_valid` triple, which is encoded here. Training uses the raw
-        form so the encoding happens inside forward (see train_utils.memory_kwargs);
+        observations in `memory_raw`, which are encoded here. Training uses the raw form so
+        the encoding happens inside forward (see train_utils.memory_raw_from_batch);
         inference passes a prebuilt bank it carries across windows.
 
-        memory_bank: (B, N, M, D) per-point appearance memory over M context frames,
-            produced by build_memory_bank().
-        mem_views: list over cameras (len n_cams) of (B, M, 2, H, W, C) raw remembered
-            tubelets. M is the number of remembered observations and is independent of T --
-            each entry is one frame sampled from anywhere in the video, with its own crop and
-            geometry, paired with an adjacent frame so the video backbone sees a real tubelet.
-        mem_slot: (B, M) which half of each tubelet holds the remembered frame.
+        memory_bank: (B, N, M*n_cams, D) per-point appearance memory, produced by
+            build_memory_bank(). Dim 1 is the POINT axis (sliced by kpt_chunk); dim 2 is
+            the ENTRY axis, one entry per (memory frame, camera), frame-major.
+        memory_raw: dict of raw remembered observations -- see MEMORY_RAW_KEYS for the key
+            list and every field's shape.
         scene_features: precomputed output of encode_scene(views), to skip re-encoding the
             clip. Inference passes this so one chunk encode serves both the memory bank and
             this forward; training leaves it None.
-        mem_p2d:  (n_cams, B, M, N, 2) pixel position of each point in each remembered frame.
-        mem_valid: (n_cams, B, M, N) bool -- point is in that frame AND not occluded there.
         cube_scale: (n_cams, B) precomputed scene scale, or None to compute it here.
             Pass it when some queries are memory-only: computed from the COMPLETE query
             set (see cube.compute_cube_scale) the scale is then identical whether or not the
@@ -472,8 +580,16 @@ class TrackerEncoder(nn.Module):
 
         assert len(views) == len(camera_group), "views should match number of cameras"
 
-        assert memory_bank is None or mem_views is None, \
-            'pass either memory_bank or the raw mem_views/mem_p2d/mem_valid triple, not both'
+        if memory_bank is not None and memory_raw is not None:
+            raise ValueError('pass either memory_bank (pre-encoded) or memory_raw '
+                             '(encoded here), not both')
+        if memory_bank is not None and (
+                memory_bank.ndim != 4 or tuple(memory_bank.shape[:2]) != (B, N)
+                or memory_bank.shape[-1] != self.latent_dim):
+            raise ValueError(
+                f'memory_bank must be (B, N, entries, latent_dim) = ({B}, {N}, *, '
+                f'{self.latent_dim}), got {tuple(memory_bank.shape)}. Dim 1 is the POINT '
+                'axis (bank[:, k0:k1]); dim 2 is the ENTRY axis (bank[:, :, :k*n_cams]).')
 
         # Memory-only points: no query position. Detected here so a NaN query is safe from
         # ANY caller. The coords are zeroed for them -- a finite, position-free value that
@@ -508,11 +624,9 @@ class TrackerEncoder(nn.Module):
         # cube_scale is all ones and there are no world coords, so the depth term is dropped
         # (the encoder substitutes its missing_depth token) rather than encoding a raw metric
         # distance that would be out of distribution against the 3D case.
-        if mem_views is not None:
+        if memory_raw is not None:
             memory_bank = self.build_memory_bank(
-                mem_views, mem_p2d, mem_valid, device=device,
-                mem_depth=mem_depth, mem_intrinsics=mem_intrinsics, mem_slot=mem_slot,
-                cube_scale=(cube_scale if R == 3 else None))
+                memory_raw, device=device, cube_scale=(cube_scale if R == 3 else None))
 
         # Effective focal per camera (cropped+resized intrinsics). cube_scale only converts
         # world->pixels, leaving a leftover f_eff factor in the absolute-depth outputs; scaling

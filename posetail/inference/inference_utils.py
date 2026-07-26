@@ -368,12 +368,13 @@ def load_multiview_clip(readers, start_frame, n_frames, crop_boxes=None, target_
     return views, end_frame - start_frame
 
 
-def build_chunk_memory(model, views, camera_group, frame_idx, coords_at, is_2d,
-                       cube_scale=None, scene_features=None):
-    """Encode remembered frames taken from the CURRENT chunk.
+def chunk_memory_raw(model, views, camera_group, frame_idx, coords_at, is_2d,
+                     scene_features=None):
+    """Remembered observations taken from the CURRENT chunk, as a `memory_raw` dict.
 
-    Returns a bank slice of (B, N, K*n_cams, dim): one entry per (remembered frame,
-    camera), frame-major, matching what the dataset feeds during training.
+    Ready for model.build_memory_bank() OR forward(memory_raw=...) -- see MEMORY_RAW_KEYS
+    for the key list. One entry per (remembered frame, camera), frame-major, matching what
+    the dataset feeds during training.
 
     The chunk's frames are already cropped and resized around the tracked points, so a
     remembered frame reuses that crop rather than re-reading and re-cropping the video.
@@ -391,8 +392,6 @@ def build_chunk_memory(model, views, camera_group, frame_idx, coords_at, is_2d,
         frame_idx: (K,) which frames of the chunk to remember.
         coords_at: (B, K, N, R) each point's position at those frames, in MODEL space
             (world coords for 3D; model-input pixels for 2D).
-        cube_scale: (n_cams, B) scene scale, or None in 2D where there are no world
-            coordinates -- the depth term is then dropped, exactly as in training.
         scene_features: (n_cams, B, gT*gH*gW, dim) tokens for this chunk, or None.
     """
     K = int(frame_idx.numel())
@@ -442,13 +441,28 @@ def build_chunk_memory(model, views, camera_group, frame_idx, coords_at, is_2d,
         mem_tokens = scene_features[:, :, tok_idx].reshape(
             scene_features.shape[0], scene_features.shape[1], K, n_sp, -1)
 
+    # mem_depth (2D) and mem_tokens (no scene_features) are legitimately None -- an absent
+    # optional key, which prepare_memory_raw treats the same as omitting it.
+    return {'mem_views': mem_views,                                 # (B, K, tub, H, W, C)
+            'mem_p2d': torch.stack(p2d_l, dim=2),                   # (cams, B, K, N, 2)
+            'mem_valid': torch.stack(ok_l, dim=2),                  # (cams, B, K, N)
+            'mem_depth': mem_depth,                                 # (cams, B, K, N)
+            'mem_intrinsics': intr,                                 # (cams, B, K, 4)
+            'mem_slot': slot[None].expand(coords_at.shape[0], K),   # (B, K)
+            'mem_tokens': mem_tokens}                               # (cams, B, K, n_tok, d)
+
+
+def build_chunk_memory(model, views, camera_group, frame_idx, coords_at, is_2d,
+                       cube_scale=None, scene_features=None):
+    """chunk_memory_raw, encoded -> (B, N, K*n_cams, dim). See chunk_memory_raw for args.
+
+    cube_scale: (n_cams, B) scene scale, or None in 2D where there are no world
+        coordinates -- the depth term is then dropped, exactly as in training.
+    """
     return model.build_memory_bank(
-        mem_views,
-        torch.stack(p2d_l, dim=2),                                  # (cams, B, K, N, 2)
-        torch.stack(ok_l, dim=2),                                   # (cams, B, K, N)
-        mem_depth=mem_depth, mem_intrinsics=intr, cube_scale=cube_scale,
-        mem_slot=slot[None].expand(coords_at.shape[0], K),
-        mem_tokens=mem_tokens)
+        chunk_memory_raw(model, views, camera_group, frame_idx, coords_at, is_2d,
+                         scene_features=scene_features),
+        cube_scale=cube_scale)
 
 
 def crop_camera_group_to_queries(camera_group, query_coords, min_crop_dim, padding=20, is_2d=False):

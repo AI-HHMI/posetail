@@ -23,7 +23,7 @@ from posetail.posetail.eval_metrics import get_eval_metrics, get_metrics_by_moti
 from posetail.posetail.cube import get_camera_scale
 from posetail.posetail.losses import get_vis_true, unroll_batch, normalize_by_mean_depth
 from posetail.posetail.tracker import Tracker
-from posetail.posetail.tracker_encoder import TrackerEncoder
+from posetail.posetail.tracker_encoder import TrackerEncoder, MEMORY_RAW_KEYS
 from posetail.posetail.tracker_tapnext import TrackerTapNext
 
 from schedulefree import AdamWScheduleFree
@@ -654,13 +654,19 @@ def memory_only_kwargs(model, batch, query_coords, cgroup, is_2d):
     return query_coords, kwargs
 
 
-def memory_kwargs(model, batch, device):
-    """This batch's remembered frames, as forward() kwargs -> {'mem_views', 'mem_p2d', ...}.
+def memory_raw_from_batch(model, batch):
+    """This batch's remembered frames as a `memory_raw` dict, or None if there are none.
 
     Which frames are remembered (and how many) is decided by the DATASET -- it samples them
     from anywhere in the video and projects the points into them (see
     PosetailDataset._sample_memory_frame_idx). Batches where the dataset chose not to
     sample memory simply train without it, which is what memory_prob is for.
+
+    The batch field names ARE the canonical MEMORY_RAW_KEYS, so this is a straight
+    projection: no hand-copied per-key block to fall out of sync with the model, and no
+    coupling between mem_depth and mem_intrinsics (MemoryEncoder._query gates the depth
+    term and the camera terms independently). prepare_memory_raw validates the result and
+    owns the device move, so nothing is touched here.
 
     The RAW observations are handed to forward(), which encodes the bank itself. Encoding it
     here instead would mean calling model.build_memory_bank() on the DDP-wrapped module, which
@@ -670,23 +676,17 @@ def memory_kwargs(model, batch, device):
     GPU spinning at 100%.
     """
     if not getattr(model, 'memory_attention', False):
-        return {}
-    mem_views = getattr(batch, 'mem_views', None)
-    if mem_views is None:
-        return {}
-    kw = {'mem_views': [v.to(device) for v in mem_views],
-          'mem_p2d': batch.mem_p2d.to(device),
-          'mem_valid': batch.mem_valid.to(device)}
-    # which half of each 2-frame tubelet is the remembered frame (the other is only there
-    # so the video backbone sees a real tubelet rather than a duplicated still)
-    if getattr(batch, 'mem_slot', None) is not None:
-        kw['mem_slot'] = batch.mem_slot.to(device)
-    # depth / intrinsics of each remembered observation, for the seed's depth and camera
-    # terms. forward() drops the depth term in 2D-mode, where there is no meaningful scale.
-    if getattr(batch, 'mem_depth', None) is not None:
-        kw['mem_depth'] = batch.mem_depth.to(device)
-        kw['mem_intrinsics'] = batch.mem_intrinsics.to(device)
-    return kw
+        return None
+    if getattr(batch, 'mem_views', None) is None:
+        return None
+    return {k: getattr(batch, k) for k in MEMORY_RAW_KEYS
+            if getattr(batch, k, None) is not None}
+
+
+def memory_kwargs(model, batch):
+    """memory_raw_from_batch as forward() kwargs -> {} or {'memory_raw': {...}}."""
+    raw = memory_raw_from_batch(model, batch)
+    return {'memory_raw': raw} if raw is not None else {}
 
 
 def train_iteration(config, model, fabric, batch,
@@ -731,7 +731,7 @@ def train_iteration(config, model, fabric, batch,
         model_kwargs['occlusion'] = getattr(batch, 'query_occlusion', None)
     # Per-point appearance memory over a few context frames (memory_attention). Built
     # here, not inside forward, so the context choice (and its RNG) lives in the loop.
-    model_kwargs.update(memory_kwargs(model, batch, device))
+    model_kwargs.update(memory_kwargs(model, batch))
     # Memory-only points: drop their query position (and pin the scene scale first).
     query_coords, mo_kwargs = memory_only_kwargs(
         model, batch, query_coords, cgroup, p2d is not None)
@@ -906,12 +906,23 @@ def train_epoch(config, model, fabric, dataloader,
 
         optimizer.zero_grad()
 
+        # Same kwargs as train_iteration: evaluating memory-only points as if they were
+        # ordinary anchored ones would silently measure a different task than the one
+        # being trained.
+        model_kwargs = {}
+        if getattr(model, 'occlusion_embedding', False):
+            model_kwargs['occlusion'] = getattr(batch, 'query_occlusion', None)
+        model_kwargs.update(memory_kwargs(model, batch))
+        query_coords, mo_kwargs = memory_only_kwargs(
+            model, batch, query_coords, cgroup, p2d is not None)
+        model_kwargs.update(mo_kwargs)
+
         outputs = model(
             views = list(views),
             coords = query_coords,
             query_times = query_times,
             camera_group = cgroup,
-            **memory_kwargs(model, batch, device))
+            **model_kwargs)
 
         coords_pred = outputs['coords_pred']
         vis_pred = outputs['vis_pred']
@@ -1087,6 +1098,17 @@ def test_epoch(config, model, dataloader, loss = None,
         if cgroup: 
             cgroup = [dict_to_device(cam_dict, device) for cam_dict in cgroup]
                        
+        # Same kwargs as train_iteration: evaluating memory-only points as if they were
+        # ordinary anchored ones would silently measure a different task than the one
+        # being trained.
+        model_kwargs = {}
+        if getattr(model, 'occlusion_embedding', False):
+            model_kwargs['occlusion'] = getattr(batch, 'query_occlusion', None)
+        model_kwargs.update(memory_kwargs(model, batch))
+        query_coords, mo_kwargs = memory_only_kwargs(
+            model, batch, query_coords, cgroup, p2d is not None)
+        model_kwargs.update(mo_kwargs)
+
         # get model predictions
         with torch.no_grad():
             outputs = model(
@@ -1094,7 +1116,7 @@ def test_epoch(config, model, dataloader, loss = None,
                 coords = query_coords,
                 query_times = query_times,
                 camera_group = cgroup,
-                **memory_kwargs(model, batch, device))
+                **model_kwargs)
         
         coords_pred = outputs['coords_pred']
         vis_pred = outputs['vis_pred']

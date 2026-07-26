@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from posetail.datasets.posetail_dataset import PosetailDataset, custom_collate  # noqa: E402
 from posetail.inference.inference_utils import load_model_from_base_folder      # noqa: E402
 from posetail.posetail.cube import compute_cube_scale                           # noqa: E402
-from posetail.posetail.train_utils import (dict_to_device, memory_kwargs,       # noqa: E402
+from posetail.posetail.train_utils import (dict_to_device, memory_raw_from_batch,  # noqa: E402
                                            memory_only_kwargs)
 
 
@@ -133,8 +133,7 @@ def main():
             n_cams_seen.append(n_cams)
 
             bank = model.build_memory_bank(
-                **{k: v for k, v in memory_kwargs(model, batch, device).items()},
-                device=device, cube_scale=cube_scale)
+                memory_raw_from_batch(model, batch), device=device, cube_scale=cube_scale)
 
             qc, mo_kw = memory_only_kwargs(model, batch, query_coords, cgroup, False)
             mo = batch.memory_only

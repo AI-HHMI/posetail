@@ -13,6 +13,8 @@ model the same way the dataset / tracking loop does.
   6. gradients            -- out_proj learns at step 0; the whole encoder learns after
   7. memory ViT           -- small dedicated single-frame encoder, non-native sizes
   8. kpt_chunk parity     -- chunked decode == full-N decode with memory on
+  9. memory-only queries  -- a point with no query position is located from memory alone
+ 10. the memory_raw contract -- raw-in-forward == pre-encoded bank, and the validator bites
 
 Run: pixi run python smoke_memory.py
 """
@@ -21,7 +23,8 @@ import torch
 from easydict import EasyDict as edict
 
 from posetail.posetail.cube import compute_cube_scale
-from posetail.posetail.tracker_encoder import TrackerEncoder
+from posetail.posetail.tracker_encoder import (TrackerEncoder, MEMORY_RAW_KEYS,
+                                               prepare_memory_raw)
 
 CFG = 'configs/config_encoder_memory.toml'
 B, T, H, W, N = 1, 8, 256, 256, 4
@@ -108,8 +111,8 @@ def main():
     print('2. bank shape')
     mem.eval()
     with torch.no_grad():
-        bank = mem.build_memory_bank(**make_memory(M=M_CTX))
-        bank8 = mem.build_memory_bank(**make_memory(M=8))
+        bank = mem.build_memory_bank(make_memory(M=M_CTX))
+        bank8 = mem.build_memory_bank(make_memory(M=8))
     n_cams = 2
     results.append(report(f'bank {tuple(bank.shape)} == (B,N,M*n_cams,dim)',
                           tuple(bank.shape[:3]) == (B, N, M_CTX * n_cams)))
@@ -126,7 +129,7 @@ def main():
     with torch.no_grad():
         out_off = base(views=views, coords=coords, camera_group=cg, query_times=qt)
         out_on = mem(views=views, coords=coords, camera_group=cg, query_times=qt,
-                     memory_bank=mem.build_memory_bank(**make_memory()))
+                     memory_bank=mem.build_memory_bank(make_memory()))
         out_none = mem(views=views, coords=coords, camera_group=cg, query_times=qt)
     keys = ['coords_pred', '2d_pred', 'vis_pred', 'depth_pred']
     results.append(report('warm-start: memory ON at init == memory OFF (zero-init out_proj)',
@@ -140,7 +143,7 @@ def main():
     # ---- 5. degenerate memory --------------------------------------------------------
     print('5. degenerate memory (no camera can see the point)')
     with torch.no_grad():
-        bank_bad = mem.build_memory_bank(**make_memory(valid=False))
+        bank_bad = mem.build_memory_bank(make_memory(valid=False))
     results.append(report('bank is finite when nothing is visible',
                           bool(torch.isfinite(bank_bad).all())))
     results.append(report('invisible entries carry the learned null token',
@@ -161,7 +164,7 @@ def main():
     def grads_of(model):
         v, c, q, g = make_batch()
         out = model(views=v, coords=c, camera_group=g, query_times=q,
-                    memory_bank=model.build_memory_bank(**make_memory()))
+                    memory_bank=model.build_memory_bank(make_memory()))
         (out['coords_pred'].square().mean() + out['2d_pred'].square().mean()).backward()
         return {n for n, p in model.named_parameters()
                 if p.grad is not None and p.grad.abs().sum() > 0}
@@ -239,7 +242,7 @@ def main():
                           both_off.memory_encoder.n_query_terms == 6
                           and not both_off.memory_encoder.spatial_bias))
     with torch.no_grad():
-        b_off = both_off.build_memory_bank(**make_memory())
+        b_off = both_off.build_memory_bank(make_memory())
     results.append(report('bank is finite with both parts off',
                           bool(torch.isfinite(b_off).all())))
 
@@ -247,7 +250,7 @@ def main():
     print('8. kpt_chunk parity')
     mem.eval()
     with torch.no_grad():
-        bank = mem.build_memory_bank(**make_memory())
+        bank = mem.build_memory_bank(make_memory())
         full = mem(views=views, coords=coords, camera_group=cg, query_times=qt,
                    memory_bank=bank)
         chunked = mem(views=views, coords=coords, camera_group=cg, query_times=qt,
@@ -270,7 +273,7 @@ def main():
             return model(views=v, coords=coords_in, camera_group=g, query_times=q,
                          memory_bank=bank, cube_scale=cs, **kw)
 
-    bank = mem.build_memory_bank(**make_memory())
+    bank = mem.build_memory_bank(make_memory())
     unk = torch.zeros(B, N, dtype=torch.bool)
     unk[:, :2] = True
     coords_mo = coords.clone()
@@ -313,7 +316,7 @@ def main():
     # they must not move AT ALL, while the memory-only points -- whose query token IS this
     # memory -- must. (Swapping the whole bank would move every point, since the decoder
     # reads memory for all of them, and would prove nothing.)
-    bank_a = mem.build_memory_bank(**make_memory())
+    bank_a = mem.build_memory_bank(make_memory())
     bank_b = bank_a.clone()
     bank_b[:, :2] = bank_b[:, :2].roll(1, dims=-1) * 3.0 + 0.5
     out_a = run(trained, coords_mo, bank_a)
@@ -328,7 +331,7 @@ def main():
                           d_mo > 1e-2 and d_kn < 1e-6))
 
     # single camera must fall back to the ray anchor (triangulation is None there)
-    bank1 = mem.build_memory_bank(**make_memory(n_cams=1))
+    bank1 = mem.build_memory_bank(make_memory(n_cams=1))
     out_1cam = run(mem, coords_mo, bank1, n_cams=1)
     results.append(report('single camera works (ray anchor, no triangulation)',
                           bool(torch.isfinite(out_1cam['coords_pred']).all())))
@@ -337,7 +340,7 @@ def main():
     gm = build(True)
     gm.train()
     v, c, q, g = make_batch()
-    bank_g = gm.build_memory_bank(**make_memory())
+    bank_g = gm.build_memory_bank(make_memory())
     o = gm(views=v, coords=coords_mo, camera_group=g, query_times=q, memory_bank=bank_g,
            cube_scale=compute_cube_scale(g, coords, len(g), coords.device,
                                         per_camera=gm.per_camera_cube_scale))
@@ -349,6 +352,100 @@ def main():
     results.append(report('grad reaches memory_query_encoder',
                           any(n.startswith('memory_query_encoder') and p.grad is not None
                               and p.grad.abs().sum() > 0 for n, p in gm.named_parameters())))
+
+    # ---- 10. the memory_raw contract --------------------------------------------------
+    print('10. memory_raw contract')
+    mem.eval()
+    v, c, q, g = make_batch()
+    raw = make_memory()
+    cs = compute_cube_scale(g, coords, len(g), coords.device,
+                            per_camera=mem.per_camera_cube_scale)
+
+    results.append(report('make_memory() emits exactly MEMORY_RAW_KEYS',
+                          set(raw) <= set(MEMORY_RAW_KEYS)))
+
+    # (A) THE gap this refactor closes: raw-in-forward is the TRAINING path, and until now
+    # every test pre-built the bank. It must be bit-identical to doing it by hand.
+    with torch.no_grad():
+        out_bank = mem(views=v, coords=coords, camera_group=g, query_times=q,
+                       memory_bank=mem.build_memory_bank(raw, cube_scale=cs), cube_scale=cs)
+        out_raw = mem(views=v, coords=coords, camera_group=g, query_times=q,
+                      memory_raw=raw, cube_scale=cs)
+    results.append(report('forward(memory_raw=) == forward(memory_bank=build(raw))',
+                          torch.equal(out_bank['coords_pred'], out_raw['coords_pred'])))
+
+    # (G) memory-only through the raw path -- section 9 only covers the pre-encoded bank.
+    with torch.no_grad():
+        out_mo_raw = mem(views=v, coords=coords_mo, camera_group=g, query_times=q,
+                         memory_raw=raw, cube_scale=cs)
+    results.append(report('memory-only (NaN coords) works through memory_raw',
+                          bool(torch.isfinite(out_mo_raw['coords_pred']).all())))
+
+    # (F) mem_tokens pass-through. The whole inference path rests on this equivalence
+    # (it slices tokens out of the chunk encode instead of re-encoding the tubelets).
+    with torch.no_grad():
+        tok_pt = mem._encode_memory_frames(mem._normalize_views_mem(raw['mem_views'], 'cpu'))
+        b_tok = mem.build_memory_bank({**raw, 'mem_tokens': tok_pt}, cube_scale=cs)
+        b_enc = mem.build_memory_bank(raw, cube_scale=cs)
+    results.append(report('mem_tokens pass-through == encoding them here',
+                          torch.equal(b_tok, b_enc)))
+
+    # (E) 2D-mode: R == 2, one camera, cube_scale dropped so the depth term goes with it.
+    # Nothing tested this branch before, and it only works because nobody has broken it.
+    raw1 = make_memory(n_cams=1)
+    with torch.no_grad():
+        out_2d = mem(views=v[:1], coords=coords[..., :2], camera_group=g[:1],
+                     query_times=q, memory_raw=raw1)
+        b_nodepth = mem.build_memory_bank(raw1, cube_scale=None)
+        b_dropped = mem.build_memory_bank({**raw1, 'mem_depth': None}, cube_scale=None)
+    results.append(report('2D-mode (R==2) forward is finite with memory_raw',
+                          bool(torch.isfinite(out_2d['2d_pred']).all())))
+    results.append(report('cube_scale=None drops the depth term (== omitting mem_depth)',
+                          torch.equal(b_nodepth, b_dropped)))
+
+    def raises(fn, exc=ValueError):
+        try:
+            fn()
+        except exc:
+            return True
+        except Exception:
+            return False
+        return False
+
+    # (B) the validator bites. A silently-dropped key is the exact failure this refactor
+    # exists to remove, so each of these must raise rather than quietly train without it.
+    results.append(report('misspelled key rejected',
+                          raises(lambda: prepare_memory_raw({**raw, 'mem_slots': raw['mem_slot']}))))
+    results.append(report('missing required key rejected',
+                          raises(lambda: prepare_memory_raw({k: x for k, x in raw.items()
+                                                             if k != 'mem_valid'}))))
+    results.append(report('wrong mem_valid shape rejected',
+                          raises(lambda: prepare_memory_raw({**raw,
+                                                             'mem_valid': raw['mem_valid'][..., :1]}))))
+    results.append(report('n_cams disagreement between mem_views and mem_p2d rejected',
+                          raises(lambda: prepare_memory_raw({**raw,
+                                                             'mem_views': raw['mem_views'][:1]}))))
+    results.append(report('float mem_valid rejected',
+                          raises(lambda: prepare_memory_raw({**raw,
+                                                             'mem_valid': raw['mem_valid'].float()}))))
+    results.append(report('non-dict memory_raw rejected',
+                          raises(lambda: prepare_memory_raw(raw['mem_p2d']))))
+
+    # (C)/(D)/(H) the forward-level guards.
+    results.append(report('memory_bank + memory_raw together rejected',
+                          raises(lambda: mem(views=v, coords=coords, camera_group=g,
+                                             query_times=q, memory_bank=b_enc,
+                                             memory_raw=raw, cube_scale=cs))))
+    results.append(report('a bank sliced on the wrong axis is rejected',
+                          raises(lambda: mem(views=v, coords=coords, camera_group=g,
+                                             query_times=q, memory_bank=b_enc[:, :1],
+                                             cube_scale=cs))))
+    # No back-compat shim: the old loose kwargs must be a loud TypeError, which is the
+    # whole justification for skipping one.
+    results.append(report('the old loose mem_views= kwarg is a TypeError',
+                          raises(lambda: mem(views=v, coords=coords, camera_group=g,
+                                             query_times=q, mem_views=raw['mem_views']),
+                                 TypeError)))
 
     print()
     print(f'RESULT: {sum(results)}/{len(results)} passed')
