@@ -40,7 +40,8 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from posetail.datasets.posetail_dataset import PosetailDataset, custom_collate  # noqa: E402
-from posetail.inference.inference_utils import load_model_from_base_folder      # noqa: E402
+from posetail.inference.inference_utils import (build_chunk_memory,            # noqa: E402
+                                                load_model_from_base_folder)
 from posetail.posetail.cube import compute_cube_scale                            # noqa: E402
 from posetail.posetail.eval_metrics import get_eval_metrics                     # noqa: E402
 from posetail.posetail.train_utils import (_eval_cube_scale, dict_to_device,    # noqa: E402
@@ -66,6 +67,13 @@ def parse_args():
     p.add_argument('--memory-only', action='store_true',
                    help='also withhold some query positions, so those points must be found '
                         'from memory alone; reported separately and only for M>0')
+    p.add_argument('--memory-source', default='dataset', choices=['dataset', 'chunk'],
+                   help="where remembered frames come from. 'dataset' (default): sampled "
+                        'from anywhere in the video with their own crops and encoded in '
+                        'isolation -- the TRAINING distribution, and the only source that '
+                        "tests long-range memory. 'chunk': remembered from the clip itself "
+                        'and read out of the clip encode via build_chunk_memory -- the '
+                        'literal INFERENCE path. The pair brackets the train/inference gap.')
     p.add_argument('--num-workers', type=int, default=None,
                    help='dataloader workers (default: from config). Memory adds M x n_cams '
                         'image reads per sample, so the loader is often the bottleneck.')
@@ -92,6 +100,25 @@ def build_bank(model, batch, device, cube_scale=None):
     if not kw:
         return None
     return model.build_memory_bank(**kw, device=device, cube_scale=cube_scale)
+
+
+def build_bank_from_chunk(model, batch, views, cgroup, coords, device, n_ctx,
+                          cube_scale=None):
+    """The INFERENCE memory path: remember frames from the clip itself and read their tokens
+    straight out of the clip encode, exactly as build_chunk_memory does while tracking.
+
+    Frames are spread evenly over the clip. This measures a different thing from the dataset
+    source -- memory from within the window, not from across the video -- so the two are
+    reported as separate arms, never mixed.
+    """
+    T = views[0].shape[1]
+    K = min(n_ctx, T)
+    frame_idx = torch.linspace(0, T - 1, K, device=device).round().long()
+    is_2d = coords.shape[-1] == 2
+    scene_features = model.encode_scene(model._normalize_views(views, device))
+    coords_at = coords[:, frame_idx]                              # (B, K, N, R)
+    return build_chunk_memory(model, views, cgroup, frame_idx, coords_at, is_2d,
+                              cube_scale=cube_scale, scene_features=scene_features)
 
 
 def build_dataset(config, args):
@@ -196,10 +223,23 @@ def main():
 
             # Build the memory bank ONCE; each arm just slices it.
             n_cams = len(batch.mem_views) if batch.mem_views is not None else 1
-            bank = build_bank(model, batch, device,
-                              cube_scale=(None if p2d is not None else compute_cube_scale(
-                                  cgroup, query_coords, len(cgroup), device,
-                                  per_camera=getattr(model, 'per_camera_cube_scale', False))))
+            mem_cube_scale = (None if p2d is not None else compute_cube_scale(
+                cgroup, query_coords, len(cgroup), device,
+                per_camera=getattr(model, 'per_camera_cube_scale', False)))
+            if args.memory_source == 'chunk':
+                # A batch with no dataset memory also has no memory-only mask, so keep the
+                # same skip rule -- otherwise the two sources would run on different clips
+                # and the comparison between them would be meaningless.
+                if batch.mem_views is None:
+                    skipped_ds[ds_name] += 1
+                    continue
+                bank = build_bank_from_chunk(
+                    model, batch, views, cgroup,
+                    (coords if p2d is None else p2d[:, 0]), device,
+                    max(args.contexts), cube_scale=mem_cube_scale)
+                n_cams = len(cgroup)
+            else:
+                bank = build_bank(model, batch, device, cube_scale=mem_cube_scale)
             if bank is None:                 # dataset sampled no memory (e.g. 2D-only trial)
                 skipped_ds[ds_name] += 1
                 continue

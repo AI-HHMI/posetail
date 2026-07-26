@@ -458,6 +458,23 @@ def load_checkpoint(config_path, checkpoint_path, model = None,
     # change) -> warm-start from only the shape-compatible weights; the dropped ones keep the
     # model's fresh init. (strict=False ignores missing/unexpected keys but NOT size mismatches.)
     param_dict, dropped_keys = _filter_shape_mismatch(param_dict, model)
+
+    # The memory subtree is reinitialized WHOLESALE when the checkpoint's memory encoder
+    # does not match this model's, rather than letting shape-mismatch prune it selectively.
+    # Partial survival is the bad case: after the MemoryViT->backbone swap the read blocks'
+    # k/v projections mismatch and are dropped, but their norms, q_proj and out_proj survive
+    # trained to read tokens that no longer exist. A coherent fresh init beats a stale one.
+    mem_dropped = [k for k in dropped_keys
+                   if k.startswith(('memory_encoder.', 'memory_query_encoder.'))]
+    if mem_dropped:
+        stale = [k for k in param_dict
+                 if k.startswith(('memory_encoder.', 'memory_query_encoder.'))]
+        for k in stale:
+            param_dict.pop(k)
+        print(f'  [warn] memory path reinitialized in full ({len(mem_dropped)} shape '
+              f'mismatches -> {len(stale)} further params dropped rather than kept stale)')
+        dropped_keys = dropped_keys + stale
+
     arch_changed = len(dropped_keys) > 0
     if arch_changed:
         print(f'  [warn] {len(dropped_keys)} checkpoint params dropped (shape mismatch -> '
