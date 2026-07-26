@@ -402,14 +402,18 @@ def custom_collate(batch):
     # Memory observations (frames remembered from elsewhere in the video). Present only
     # when the dataset sampled them for EVERY item in the batch; otherwise the batch just
     # trains without memory, which is the point of memory_prob.
-    mem_views = mem_p2d = mem_valid = mem_depth = mem_intrinsics = None
+    mem_views = mem_p2d = mem_valid = mem_depth = mem_intrinsics = mem_slot = None
     if len(batch) > 12 and all(v is not None for v in batch[10]):
-        mem_views = [torch.stack(v, dim=0) for v in zip(*list(batch[10]))]
+        mem_views = [torch.stack(v, dim=0) for v in zip(*list(batch[10]))]  # (b,M,2,H,W,C)
         mem_p2d = torch.stack(batch[11], axis=1)      # (cams, b, M, n, 2)
         mem_valid = torch.stack(batch[12], axis=1)    # (cams, b, M, n)
         if len(batch) > 15 and batch[14][0] is not None:
             mem_depth = torch.stack(batch[14], axis=1)        # (cams, b, M, n)
             mem_intrinsics = torch.stack(batch[15], axis=1)   # (cams, b, M, 4)
+        # which half of each tubelet holds the remembered frame (shared across cameras,
+        # since the frame index is)
+        if len(batch) > 16 and batch[16][0] is not None:
+            mem_slot = torch.stack(batch[16], axis=0)         # (b, M)
 
     # Points whose query position is withheld (memory-only). Only present when every item
     # in the batch has one, so the mask stays rectangular.
@@ -432,6 +436,7 @@ def custom_collate(batch):
                    'mem_valid': mem_valid,
                    'mem_depth': mem_depth,
                    'mem_intrinsics': mem_intrinsics,
+                   'mem_slot': mem_slot,
                    'memory_only': memory_only})
 
     return batch
@@ -742,6 +747,7 @@ class PosetailDataset(Dataset):
         # Memory-frame state, filled in by the 3D path when memory is enabled (native-2D
         # datasets have no world coords / multi-camera geometry, so they carry no memory).
         mem_idx = mem_coords = mem_cgroups = mem_crops = None
+        mem_pairs = mem_slot = None
         memory_only = None
 
         # ── 2D-only path ──────────────────────────────────────────────────────
@@ -1027,6 +1033,24 @@ class PosetailDataset(Dataset):
                     if keep:
                         mem_idx = torch.tensor(keep, dtype=torch.long)
                         mem_coords = coords_full[mem_idx]        # (M, n_kpts, 3)
+                        # Each remembered frame is encoded as a real 2-frame TUBELET, since
+                        # that is what the video backbone's tubelet_size=2 patch embedding
+                        # expects; a duplicated still is out of distribution against real
+                        # motion. The partner direction is random because at inference the
+                        # remembered frame lands wherever it falls in the aligned tubelet
+                        # grid -- second as often as first -- so always pairing forward
+                        # would train one parity and infer with both. The pair stays in
+                        # chronological order (a reversed pair is its own distribution
+                        # shift), and mem_slot says which half holds the points' frame.
+                        n_img = len(all_img_fnames)
+                        mem_pairs, slots = [], []
+                        for f in keep:
+                            opts = ([f + 1] if f + 1 < n_img else []) + \
+                                   ([f - 1] if f - 1 >= 0 else [])
+                            g = int(np.random.choice(opts)) if opts else f
+                            mem_pairs.append((f, g) if g > f else (g, f))
+                            slots.append(0 if g > f else 1)
+                        mem_slot = torch.tensor(slots, dtype=torch.long)   # (M,)
                     else:
                         mem_idx = mem_cgroups = mem_crops = None
 
@@ -1123,11 +1147,14 @@ class PosetailDataset(Dataset):
                 # its OWN square crop around the points at that frame.
                 if mem_idx is not None:
                     mem_futures = []
-                    for mnum, f in enumerate(mem_idx.tolist()):
-                        cam_img_path = os.path.join(img_path, cam_name, all_img_fnames[f])
-                        mem_futures.append(executor.submit(
-                            load_image, cam_img_path, mem_crops[mnum][cnum],
-                            mem_cgroups[mnum][cnum]['size'].tolist(), rotation))
+                    for mnum, pair in enumerate(mem_pairs):
+                        # BOTH frames of the tubelet take the crop computed for the
+                        # remembered frame, so the pair is spatially registered.
+                        for f in pair:
+                            cam_img_path = os.path.join(img_path, cam_name, all_img_fnames[f])
+                            mem_futures.append(executor.submit(
+                                load_image, cam_img_path, mem_crops[mnum][cnum],
+                                mem_cgroups[mnum][cnum]['size'].tolist(), rotation))
                     mem_unloaded.append(mem_futures)
 
             views = []
@@ -1159,9 +1186,13 @@ class PosetailDataset(Dataset):
                         if should_grayscale:
                             mem_imgs = [np.stack([cv2.cvtColor(im, cv2.COLOR_RGB2GRAY)] * 3,
                                                  axis=-1) for im in mem_imgs]
-                        mem_views.append(
-                            torch.tensor(np.array(mem_imgs), dtype=torch.float32,
-                                         device='cpu') / 255.0)
+                        # (2M, H, W, C) -> (M, 2, H, W, C): the tubelet axis. Kept uint8;
+                        # the model normalizes. At M=16 x 2 frames x 8 cams a float32 copy
+                        # is ~200 MB per sample through the collate and over PCIe, for
+                        # pixels that are about to be normalized on the GPU anyway.
+                        arr = np.ascontiguousarray(np.array(mem_imgs))
+                        arr = arr.reshape(len(mem_pairs), 2, *arr.shape[1:])
+                        mem_views.append(torch.from_numpy(arr))
 
                 for rect in cutout_rects[cnum]:
                     rx1, ry1, rx2, ry2, fill_color = rect
@@ -1266,7 +1297,7 @@ class PosetailDataset(Dataset):
 
         return (views, coords, vis, fnums, cgroup, row, query_times, vis_2d, p2d,
                 query_occlusion, mem_views, mem_p2d, mem_valid, memory_only,
-                mem_depth, mem_intrinsics)
+                mem_depth, mem_intrinsics, mem_slot)
 
 
     def _build_2d_cgroup(self, row, img_path, cam_names):

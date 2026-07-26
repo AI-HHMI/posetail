@@ -16,11 +16,15 @@ split_dir = 'train'
 # memory: extra observations of the same points sampled from anywhere in the video.
 # A range means the count is drawn per sample, so the model tolerates a different
 # number of memory entries at inference than it saw in training.
-memory_num_context = [2, 8]
-memory_prob = 0.4
+# M=8 must be COMMON, not 1-in-7: the previous [2, 8] meant we evaluated an M=8 curve the
+# model had barely trained.
+memory_num_context = [2, 16]
+memory_prob = 0.6
 # memory-only queries: withhold the position of some points entirely so the model has to
-# find them from memory. Fires only on items that carry memory frames.
-memory_only_prob = 0.3
+# find them from memory. Fires only on items that carry memory frames. At the old
+# 0.4 x 0.3 x 0.5 only ~6% of point-predictions carried the memory-only task, which starts
+# from random init; 0.6 x 0.5 x 0.5 makes it ~15%.
+memory_only_prob = 0.5
 memory_only_kpt_prob = 0.5
 n_frames = 24
 min_res = 256
@@ -84,8 +88,14 @@ device = 'cuda'
 mode_3d = "encoder"
 
 video_encoder_version = 'large'
-# VJEPA backbone frozen for all of pretraining; finetuning unlocks the whole encoder.
-video_encoder_requires_grad = true
+# Backbone FROZEN for the memory work. A memory architecture that works should converge
+# without the backbone adapting to it; leaving it trainable lets a backbone change absorb
+# credit that belongs to the memory path, and makes the memory tokens a moving target for
+# the modules learning to read them. It also removes the largest activation consumer in the
+# step (backward over 24 frames x 8 cameras), which is what pays for the raised M below.
+# NOTE: anchored (M=0) metrics are therefore NOT comparable to d90p0599, which kept
+# finetuning the encoder. The M-curve is a within-run comparison and stays valid.
+video_encoder_requires_grad = false
 video_encoder_hierarchical = true
 
 # Inert while the encoder is frozen.
@@ -96,17 +106,20 @@ soft_argmax_temperature_learnable = true
 # Per-point appearance memory: M context frames sampled from the clip are encoded into
 # one vector per point, which the decoder cross-attends to (identity / appearance history).
 memory_attention = true
-# the memory ViT is its own small single-frame encoder, not the video backbone
-memory_vit_dim = 256
-memory_vit_depth = 6
-memory_vit_heads = 8
-memory_vit_patch_size = 8
-# how many cross-attention blocks read the ViT tokens into each point's entry. One layer had
-# to pull "which part of this animal is this point" out of 1024 tokens in a single shot.
+# Remembered frames are encoded by the VJEPA backbone itself (as real 2-frame tubelets), not
+# by a private ViT. The old 5M-param MemoryViT started from random init, lived in its own
+# feature space, and cost +13 GiB at M=8; measured on d90p0599 the decoder's memory read was
+# nearly independent of bank CONTENT (entropy 0.627 real vs 0.615 with each point handed
+# another point's bank), which is what the shared, pretrained descriptor is meant to fix.
+# how many cross-attention blocks read the frame tokens into each point's entry. One layer
+# had to pull "which part of this animal is this point" out of the grid in a single shot.
 memory_read_depth = 3
 # seeds in MemoryQueryEncoder. Measured with a bank of known rank, K makes no difference to
 # the token's effective rank (a single seed's attention already varies per point), so 1.
 memory_pool_seeds = 1
+# Gradient through the memory frames' scene encode. Off: the backbone is shared with the clip
+# path, and a frozen encode is several times cheaper. Inert while the encoder is frozen.
+memory_encoder_grad = false
 
 # processing
 stride_length = 24

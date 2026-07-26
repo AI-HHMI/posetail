@@ -32,7 +32,8 @@ from posetail.datasets.posetail_dataset import PosetailDataset, custom_collate  
 from posetail.inference.inference_utils import load_model_from_base_folder      # noqa: E402
 from posetail.posetail.cube import compute_cube_scale                           # noqa: E402
 from posetail.posetail.tracker_encoder import TrackerEncoder                    # noqa: E402
-from posetail.posetail.train_utils import dict_to_device, load_config           # noqa: E402
+from posetail.posetail.train_utils import (dict_to_device, load_config,         # noqa: E402
+                                           memory_kwargs)
 
 
 def parse_args():
@@ -113,7 +114,7 @@ def main():
             N = b.mem_p2d.shape[3]
             if N < args.min_points:
                 continue
-            mv = model._normalize_views([v.to(device) for v in b.mem_views], device)
+            mv = model._normalize_views_mem([v.to(device) for v in b.mem_views], device)
             p2d, val = b.mem_p2d.to(device), b.mem_valid.to(device)
             coords, qt = b.coords.to(device), b.query_times.to(device)
             cg = [dict_to_device(c, device) for c in b.cgroup]
@@ -122,7 +123,16 @@ def main():
                                     per_camera=getattr(model, 'per_camera_cube_scale', False))
 
             # --- stage by stage, for camera 0 ---
-            v = rearrange(mv[0], 'b m c h w -> (b m) c h w')
+            # mv is (B, M, 2, C, H, W): the tubelet is for the ENCODER, while the per-point
+            # patch term comes from the remembered frame itself (mem_slot).
+            frame_tok = model._encode_memory_frames(mv)
+            slot = (b.mem_slot.to(device) if b.mem_slot is not None
+                    else torch.zeros(mv[0].shape[0], mv[0].shape[1], dtype=torch.long,
+                                     device=device))
+            sel = rearrange(slot, 'b m -> (b m)')
+            vv = rearrange(mv[0], 'b m s c h w -> (b m) s c h w')
+            v = vv[torch.arange(vv.shape[0], device=device), sel]
+            tok = rearrange(frame_tok[0], 'b m t d -> (b m) t d')
             p = rearrange(p2d[0], 'b m n r -> (b m) n r')
             ok = rearrange(val[0], 'b m n -> (b m) n')
             dep = itr = None
@@ -130,17 +140,13 @@ def main():
                 dep = rearrange(b.mem_depth.to(device)[0], 'b m n -> (b m) n') / cs[0].clamp(min=1e-6)
                 itr = rearrange(b.mem_intrinsics.to(device)[0], 'b m r -> (b m) r')
             q_seed = me._query(v, p, ok, depth=dep, intrinsics=itr)
-            tok = me.vit(v)
             x = q_seed
             for blk in me.read_blocks:
                 x = x + blk['attn'](blk['norm_q'](x), tok)
                 x = x + blk['mlp'](blk['norm_m'](x))
 
             bank = model.build_memory_bank(
-                [w.to(device) for w in b.mem_views], p2d, val,
-                mem_depth=(b.mem_depth.to(device) if b.mem_depth is not None else None),
-                mem_intrinsics=(b.mem_intrinsics.to(device) if b.mem_intrinsics is not None else None),
-                device=device, cube_scale=cs)
+                **memory_kwargs(model, b, device), device=device, cube_scale=cs)
 
             # ONE target frame is enough to measure rank, and it keeps the (T*N) flatten
             # unambiguous. `mv` is the MEMORY views, whose axis 1 is M (not the clip

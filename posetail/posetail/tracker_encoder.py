@@ -86,12 +86,10 @@ class TrackerEncoder(nn.Module):
                  scale_init = 1.0,
                  scale_delta = 2.0,
                  memory_attention = False,
-                 memory_vit_dim = 256,
-                 memory_vit_depth = 6,
-                 memory_vit_heads = 8,
-                 memory_vit_patch_size = 8,
                  memory_pool_seeds = 1,
-                 memory_read_depth = 3):
+                 memory_read_depth = 3,
+                 memory_encoder_grad = False,
+                 memory_kpt_chunk = 4096):
         super().__init__()
 
         self.mode_3d = mode_3d
@@ -266,14 +264,18 @@ class TrackerEncoder(nn.Module):
         # Which frames those are is decided by the data pipeline (dataset while training,
         # the tracking loop at inference), not here -- this owns only the encoding.
         self.memory_attention = memory_attention
+        # Whether the memory frames' scene encode carries gradient. Off by default: the
+        # backbone is shared with the clip path and already trains there, and a frozen
+        # encode is several times cheaper. Inert when the encoder is frozen outright --
+        # with no parameter requiring grad, autograd builds no graph either way.
+        self.memory_encoder_grad = memory_encoder_grad
         if memory_attention:
             self.memory_encoder = MemoryEncoder(
                 dim=latent_dim, num_heads=n_heads,
                 cross_attn_dim=cross_attn_dim, max_freq=max_freq,
                 patch_size=query_patch_size,
-                image_size=self.image_size, vit_dim=memory_vit_dim,
-                vit_depth=memory_vit_depth, vit_heads=memory_vit_heads,
-                vit_patch_size=memory_vit_patch_size, read_depth=memory_read_depth,
+                token_dim=self.scene_encoder.embed_dim,
+                read_depth=memory_read_depth, kpt_chunk=memory_kpt_chunk,
             )
             # Builds the query token for points given NO position (memory-only queries):
             # it reads the point's own memory instead of its image patch.
@@ -287,10 +289,17 @@ class TrackerEncoder(nn.Module):
             )
 
     def _normalize_views(self, views, device):
-        """Raw (b t h w c) uint8-ish frames -> list of normalized (b t c h w) tensors."""
+        """Raw (b t h w c) uint8-ish frames -> list of normalized (b t c h w) tensors.
+
+        Memory frames are handed over as uint8 to keep the collate and the host->device copy
+        small (a float32 tubelet set is ~200 MB per sample at M=16 x 8 cameras), so scale
+        them here; clip views already arrive in [0, 1].
+        """
         out = []
         for frames in views:
             frames = frames.to(device)
+            if frames.dtype == torch.uint8:
+                frames = frames.float() / 255.0
             frames = rearrange(frames, 'b t h w c -> b t c h w')
             out.append(self.transform_norm(frames))
         return out
@@ -302,8 +311,38 @@ class TrackerEncoder(nn.Module):
         return compute_cube_scale(camera_group, coords, n_cams, device,
                                   per_camera=self.per_camera_cube_scale)
 
+    def encode_scene(self, views_norm):
+        """Scene tokens for already-normalized views. Exists so a caller can encode a chunk
+        ONCE and reuse the result for both the memory bank and the forward pass; training
+        stays on the in-forward path, since calling model methods outside forward is a DDP
+        hazard (see train_utils.memory_kwargs)."""
+        return self.scene_encoder(views_norm)
+
+    def _encode_memory_frames(self, views_norm):
+        """Encode every (camera, memory frame) tubelet in ONE scene-encoder call.
+
+        views_norm: list over cameras of [B, M, 2, C, H, W] -> [n_cams, B, M, n_tok, dim].
+
+        Batching is not optional: looping per camera measured 3.6x slower than one call.
+        The tubelet is a REAL adjacent pair, not a duplicated still -- a duplicated frame
+        scored 0.52 same-patch nearest-neighbour against clip tubelets against 0.43 for the
+        encoder's image path, i.e. both are off-distribution, and only a real pair is not.
+        """
+        n_cams = len(views_norm)
+        B, M, S = views_norm[0].shape[:3]
+        assert S == self.scene_encoder.tubelet_size, (
+            f'memory frames must arrive as {self.scene_encoder.tubelet_size}-frame tubelets, '
+            f'got {S}. A temporal dim of 1 silently routes VJEPA down its IMAGE path '
+            '(patch_embed_img), which is a different feature space, with no error raised.')
+        flat = rearrange(torch.stack(views_norm), 'cams b m s c h w -> (cams b m) s c h w')
+        grad = torch.enable_grad if self.memory_encoder_grad else torch.no_grad
+        with grad():
+            tokens = self.encode_scene([flat])[0]              # ((cams B M), n_tok, dim)
+        return rearrange(tokens, '(cams b m) t d -> cams b m t d', cams=n_cams, b=B, m=M)
+
     def build_memory_bank(self, mem_views, mem_p2d, mem_valid, mem_depth=None,
-                          mem_intrinsics=None, device=None, cube_scale=None):
+                          mem_intrinsics=None, device=None, cube_scale=None,
+                          mem_slot=None, mem_tokens=None):
         """Encode remembered observations -> (B, N, M*n_cams, latent_dim), one entry per
         (memory frame, camera), frame-major.
 
@@ -311,25 +350,45 @@ class TrackerEncoder(nn.Module):
         this only encodes them. Handles frame normalization so raw frames can be passed.
 
         Args:
-            mem_views: list over cameras of [B, M, H, W, C] raw remembered frames.
+            mem_views: list over cameras of [B, M, 2, H, W, C] raw remembered tubelets.
             mem_p2d:   [n_cams, B, M, N, 2] pixel position of each point in each frame.
             mem_valid: [n_cams, B, M, N] bool -- point in frame AND not occluded there.
             mem_depth: [n_cams, B, M, N] METRIC distance to that camera, or None. Divided
                 by cube_scale here so the encoder sees the same normalized quantity the
                 QueryEncoder does; pass cube_scale=None (2D-mode) to drop the term instead.
             mem_intrinsics: [n_cams, B, M, 4] = (fx/W, fy/H, cx/W, cy/H), or None.
+            mem_slot: [B, M] which half of each tubelet holds the remembered frame.
+            mem_tokens: [n_cams, B, M, n_tok, dim] precomputed scene tokens. Inference
+                passes these -- its memory frames come from the chunk it just encoded, so
+                re-encoding them would be pure waste. None means encode them here.
         """
         assert self.memory_attention, 'build_memory_bank requires memory_attention=True'
         device = device if device is not None else mem_p2d.device
-        views_norm = self._normalize_views(mem_views, device)
+        views_norm = self._normalize_views_mem(mem_views, device)
+        if mem_tokens is None:
+            mem_tokens = self._encode_memory_frames(views_norm)
         depth = None
         if mem_depth is not None and cube_scale is not None:
             # cube_scale is (n_cams, B); broadcast over the (M, N) axes.
             cs = cube_scale.to(device)[:, :, None, None]
             depth = mem_depth.to(device) / cs.clamp(min=1e-6)
         return self.memory_encoder(
-            views_norm, mem_p2d.to(device), mem_valid.to(device), mem_depth=depth,
+            views_norm, mem_p2d.to(device), mem_valid.to(device), mem_tokens,
+            mem_slot=(mem_slot.to(device) if mem_slot is not None else None),
+            mem_depth=depth,
             mem_intrinsics=(mem_intrinsics.to(device) if mem_intrinsics is not None else None))
+
+    def _normalize_views_mem(self, mem_views, device):
+        """Memory tubelets [B, M, 2, H, W, C] -> [B, M, 2, C, H, W], normalized.
+        _normalize_views only knows the (b t h w c) layout, so fold the tubelet axis into
+        the frame axis around it and unfold after."""
+        out = []
+        for frames in mem_views:
+            B, M, S = frames.shape[:3]
+            flat = rearrange(frames, 'b m s h w c -> b (m s) h w c')
+            norm = self._normalize_views([flat], device)[0]
+            out.append(rearrange(norm, 'b (m s) c h w -> b m s c h w', m=M, s=S))
+        return out
 
     def unfreeze_video_encoder(self, iteration):
         """Unfreeze the video encoder once `iteration` reaches the configured
@@ -360,7 +419,8 @@ class TrackerEncoder(nn.Module):
     def forward(self, views, coords, camera_group, query_times=None,
                 kpt_chunk=None, occlusion=None, memory_bank=None, cube_scale=None,
                 mem_views=None, mem_p2d=None, mem_valid=None,
-                mem_depth=None, mem_intrinsics=None):
+                mem_depth=None, mem_intrinsics=None, mem_slot=None,
+                scene_features=None):
         '''
         B: batch size
         T: number of frames in video
@@ -377,9 +437,14 @@ class TrackerEncoder(nn.Module):
 
         memory_bank: (B, N, M, D) per-point appearance memory over M context frames,
             produced by build_memory_bank().
-        mem_views: list over cameras (len n_cams) of (B, M, H, W, C) raw remembered frames.
-            M is the number of remembered observations and is independent of T -- each entry
-            is one frame sampled from anywhere in the video, with its own crop and geometry.
+        mem_views: list over cameras (len n_cams) of (B, M, 2, H, W, C) raw remembered
+            tubelets. M is the number of remembered observations and is independent of T --
+            each entry is one frame sampled from anywhere in the video, with its own crop and
+            geometry, paired with an adjacent frame so the video backbone sees a real tubelet.
+        mem_slot: (B, M) which half of each tubelet holds the remembered frame.
+        scene_features: precomputed output of encode_scene(views), to skip re-encoding the
+            clip. Inference passes this so one chunk encode serves both the memory bank and
+            this forward; training leaves it None.
         mem_p2d:  (n_cams, B, M, N, 2) pixel position of each point in each remembered frame.
         mem_valid: (n_cams, B, M, N) bool -- point is in that frame AND not occluded there.
         cube_scale: (n_cams, B) precomputed scene scale, or None to compute it here.
@@ -439,7 +504,7 @@ class TrackerEncoder(nn.Module):
         if mem_views is not None:
             memory_bank = self.build_memory_bank(
                 mem_views, mem_p2d, mem_valid, device=device,
-                mem_depth=mem_depth, mem_intrinsics=mem_intrinsics,
+                mem_depth=mem_depth, mem_intrinsics=mem_intrinsics, mem_slot=mem_slot,
                 cube_scale=(cube_scale if R == 3 else None))
 
         # Effective focal per camera (cropped+resized intrinsics). cube_scale only converts
@@ -491,12 +556,13 @@ class TrackerEncoder(nn.Module):
             views_norm, coords, query_times, camera_group,
             cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
             kpt_chunk=kpt_chunk, occlusion=occlusion, memory_bank=memory_bank,
-            unknown=unknown)
+            unknown=unknown, scene_features=scene_features)
 
     def _forward_window(self, views_norm, coords, query_times, camera_group,
                         cube_scale, cube_scale_shared, f_eff,
                         scene_center, scene_radius, kpt_chunk=None,
-                        occlusion=None, memory_bank=None, unknown=None):
+                        occlusion=None, memory_bank=None, unknown=None,
+                        scene_features=None):
         """Single encoder/decoder pass over the whole clip.
 
         views_norm frames are already normalized ('b t c h w'); coords are the query
@@ -510,9 +576,13 @@ class TrackerEncoder(nn.Module):
         has no cross-point attention and the scene scalars are computed over all N in
         forward(). Disabled for gridnorm, whose per-camera gauge solve couples points.
 
+        scene_features: already-encoded clip tokens, when the caller encoded the chunk
+        itself (inference reuses one encode for the memory bank and this pass).
+
         Returns the result dict.
         """
-        scene_features = self.scene_encoder(views_norm)
+        if scene_features is None:
+            scene_features = self.encode_scene(views_norm)
         N = coords.shape[1]
         if kpt_chunk and N > kpt_chunk and not self.is_gridnorm:
             results = []

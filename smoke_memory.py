@@ -56,14 +56,23 @@ def make_batch(seed=1234, coords=None):
     return views, coords, qt, cg
 
 
-def make_memory(n_cams=2, M=M_CTX, valid=True):
-    """Remembered observations, as the dataset would emit them."""
-    mem_views = [torch.rand(B, M, H, W, 3) for _ in range(n_cams)]
-    mem_p2d = torch.rand(n_cams, B, M, N, 2) * (W - 1)
-    mem_valid = torch.full((n_cams, B, M, N), bool(valid))
-    mem_depth = torch.rand(n_cams, B, M, N) * 3 + 1
-    mem_intrinsics = torch.rand(n_cams, B, M, 4)
-    return mem_views, mem_p2d, mem_valid, mem_depth, mem_intrinsics
+def make_memory(n_cams=2, M=M_CTX, valid=True, slot=None):
+    """Remembered observations, as the dataset would emit them.
+
+    Each entry is a 2-frame TUBELET (uint8, as the dataset stores it) because the video
+    backbone's patch embedding is tubelet_size=2; mem_slot says which half holds the frame
+    the points were projected into.
+    """
+    return dict(
+        mem_views=[torch.randint(0, 256, (B, M, 2, H, W, 3), dtype=torch.uint8)
+                   for _ in range(n_cams)],
+        mem_p2d=torch.rand(n_cams, B, M, N, 2) * (W - 1),
+        mem_valid=torch.full((n_cams, B, M, N), bool(valid)),
+        mem_depth=torch.rand(n_cams, B, M, N) * 3 + 1,
+        mem_intrinsics=torch.rand(n_cams, B, M, 4),
+        mem_slot=(torch.full((B, M), slot, dtype=torch.long) if slot is not None
+                  else torch.randint(0, 2, (B, M))),
+    )
 
 
 def build(memory, **over):
@@ -99,8 +108,8 @@ def main():
     print('2. bank shape')
     mem.eval()
     with torch.no_grad():
-        bank = mem.build_memory_bank(*make_memory(M=M_CTX))
-        bank8 = mem.build_memory_bank(*make_memory(M=8))
+        bank = mem.build_memory_bank(**make_memory(M=M_CTX))
+        bank8 = mem.build_memory_bank(**make_memory(M=8))
     n_cams = 2
     results.append(report(f'bank {tuple(bank.shape)} == (B,N,M*n_cams,dim)',
                           tuple(bank.shape[:3]) == (B, N, M_CTX * n_cams)))
@@ -117,7 +126,7 @@ def main():
     with torch.no_grad():
         out_off = base(views=views, coords=coords, camera_group=cg, query_times=qt)
         out_on = mem(views=views, coords=coords, camera_group=cg, query_times=qt,
-                     memory_bank=mem.build_memory_bank(*make_memory()))
+                     memory_bank=mem.build_memory_bank(**make_memory()))
         out_none = mem(views=views, coords=coords, camera_group=cg, query_times=qt)
     keys = ['coords_pred', '2d_pred', 'vis_pred', 'depth_pred']
     results.append(report('warm-start: memory ON at init == memory OFF (zero-init out_proj)',
@@ -131,7 +140,7 @@ def main():
     # ---- 5. degenerate memory --------------------------------------------------------
     print('5. degenerate memory (no camera can see the point)')
     with torch.no_grad():
-        bank_bad = mem.build_memory_bank(*make_memory(valid=False))
+        bank_bad = mem.build_memory_bank(**make_memory(valid=False))
     results.append(report('bank is finite when nothing is visible',
                           bool(torch.isfinite(bank_bad).all())))
     results.append(report('invisible entries carry the learned null token',
@@ -152,7 +161,7 @@ def main():
     def grads_of(model):
         v, c, q, g = make_batch()
         out = model(views=v, coords=c, camera_group=g, query_times=q,
-                    memory_bank=model.build_memory_bank(*make_memory()))
+                    memory_bank=model.build_memory_bank(**make_memory()))
         (out['coords_pred'].square().mean() + out['2d_pred'].square().mean()).backward()
         return {n for n, p in model.named_parameters()
                 if p.grad is not None and p.grad.abs().sum() > 0}
@@ -169,30 +178,46 @@ def main():
         for mca in warmed.decoder.memory_cross_attns:
             mca.out_proj.weight.normal_(0, 0.02)
     have1 = grads_of(warmed)
-    for w in ['memory_encoder.vit', 'memory_encoder.patch_processor',
+    for w in ['memory_encoder.patch_processor',
               'memory_encoder.read_blocks', 'memory_encoder.query_gate',
               'memory_encoder.query_mlp', 'decoder.memory_cross_attns']:
         results.append(report(f'trained regime: grad reaches {w}',
                               any(n.startswith(w) for n in have1)))
 
-    # ---- 7. the memory ViT -----------------------------------------------------------
-    print('7. memory ViT')
-    vit = mem.memory_encoder.vit
-    n_vit = sum(p.numel() for p in vit.parameters())
-    n_scene = sum(p.numel() for p in mem.scene_encoder.parameters())
-    results.append(report(f'much smaller than the scene backbone '
-                          f'({n_vit/1e6:.1f}M vs {n_scene/1e6:.0f}M)', n_vit < n_scene / 10))
-    p = vit.patch_size
+    # ---- 7. memory frames go through the SCENE encoder --------------------------------
+    print('7. memory frames use the scene backbone')
+    results.append(report('no private memory ViT remains',
+                          not hasattr(mem.memory_encoder, 'vit')))
+    # The read must consume tokens at the scene encoder's width, or the memory entries are
+    # not in the same feature space as the clip tokens -- the whole point of the swap.
+    results.append(report('read blocks key on scene-width tokens',
+                          all(blk['attn'].kv_dim == mem.scene_encoder.embed_dim
+                              for blk in mem.memory_encoder.read_blocks)))
+    kw = make_memory()
     with torch.no_grad():
-        tok = vit(torch.randn(2, 3, 224, 320))     # non-native size -> interpolated pos-embed
-    results.append(report(f'encodes a single frame at a non-native size (patch {p})',
-                          tuple(tok.shape) == (2, (224 // p) * (320 // p), vit.embed_dim)))
+        vn = mem._normalize_views_mem(kw['mem_views'], 'cpu')
+        tok = mem._encode_memory_frames(vn)
+    gh = H // mem.scene_encoder.patch_size
+    results.append(report(f'one batched encode -> (cams, B, M, {gh * gh}, '
+                          f'{mem.scene_encoder.embed_dim}) tokens',
+                          tuple(tok.shape) == (2, B, M_CTX, gh * gh,
+                                               mem.scene_encoder.embed_dim)))
+    # A temporal dim of 1 silently routes VJEPA down its IMAGE path (a different feature
+    # space) instead of erroring, so the tubelet assertion is load-bearing.
+    bad = [v[:, :, :1] for v in vn]
+    try:
+        mem._encode_memory_frames(bad)
+        ok_assert = False
+    except AssertionError:
+        ok_assert = True
+    results.append(report('a 1-frame "tubelet" is rejected, not silently image-encoded',
+                          ok_assert))
 
     # ---- 8. kpt_chunk parity ---------------------------------------------------------
     print('8. kpt_chunk parity')
     mem.eval()
     with torch.no_grad():
-        bank = mem.build_memory_bank(*make_memory())
+        bank = mem.build_memory_bank(**make_memory())
         full = mem(views=views, coords=coords, camera_group=cg, query_times=qt,
                    memory_bank=bank)
         chunked = mem(views=views, coords=coords, camera_group=cg, query_times=qt,
@@ -215,7 +240,7 @@ def main():
             return model(views=v, coords=coords_in, camera_group=g, query_times=q,
                          memory_bank=bank, cube_scale=cs, **kw)
 
-    bank = mem.build_memory_bank(*make_memory())
+    bank = mem.build_memory_bank(**make_memory())
     unk = torch.zeros(B, N, dtype=torch.bool)
     unk[:, :2] = True
     coords_mo = coords.clone()
@@ -258,7 +283,7 @@ def main():
     # they must not move AT ALL, while the memory-only points -- whose query token IS this
     # memory -- must. (Swapping the whole bank would move every point, since the decoder
     # reads memory for all of them, and would prove nothing.)
-    bank_a = mem.build_memory_bank(*make_memory())
+    bank_a = mem.build_memory_bank(**make_memory())
     bank_b = bank_a.clone()
     bank_b[:, :2] = bank_b[:, :2].roll(1, dims=-1) * 3.0 + 0.5
     out_a = run(trained, coords_mo, bank_a)
@@ -273,7 +298,7 @@ def main():
                           d_mo > 1e-2 and d_kn < 1e-6))
 
     # single camera must fall back to the ray anchor (triangulation is None there)
-    bank1 = mem.build_memory_bank(*make_memory(n_cams=1))
+    bank1 = mem.build_memory_bank(**make_memory(n_cams=1))
     out_1cam = run(mem, coords_mo, bank1, n_cams=1)
     results.append(report('single camera works (ray anchor, no triangulation)',
                           bool(torch.isfinite(out_1cam['coords_pred']).all())))
@@ -282,7 +307,7 @@ def main():
     gm = build(True)
     gm.train()
     v, c, q, g = make_batch()
-    bank_g = gm.build_memory_bank(*make_memory())
+    bank_g = gm.build_memory_bank(**make_memory())
     o = gm(views=v, coords=coords_mo, camera_group=g, query_times=q, memory_bank=bank_g,
            cube_scale=compute_cube_scale(g, coords, len(g), coords.device,
                                         per_camera=gm.per_camera_cube_scale))

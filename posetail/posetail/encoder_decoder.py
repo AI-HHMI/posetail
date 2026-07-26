@@ -1531,70 +1531,6 @@ class AttentionPooling(nn.Module):
         return rearrange(pooled[:, 0], '(b k) d -> b k d', b=b, k=k)
 
 
-class MemoryViTBlock(nn.Module):
-    """Standard pre-norm transformer block (self-attention + MLP)."""
-
-    def __init__(self, dim, num_heads, mlp_ratio=4.0, dropout=0.0):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
-        self.norm2 = nn.LayerNorm(dim)
-        hidden = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim))
-
-    def forward(self, x):
-        h = self.norm1(x)
-        x = x + self.attn(h, h, h, need_weights=False)[0]
-        return x + self.mlp(self.norm2(x))
-
-
-class MemoryViT(nn.Module):
-    """Small SINGLE-FRAME ViT that encodes memory context frames.
-
-    Deliberately independent of the V-JEPA scene backbone. That backbone is huge (the
-    'large' variant is ~305M params) and video-native: its tubelet_size=2 means a lone
-    frame has to be duplicated into a 2-frame clip, so every context frame costs as much
-    encoder work as two clip frames. Memory only needs enough appearance detail to
-    re-identify a point, so a compact image ViT (a few million params, one frame in, one
-    grid of tokens out) does the job at a small fraction of the cost.
-
-        x: [B, C, H, W]  ->  tokens [B, (H/patch)*(W/patch), embed_dim]
-    """
-
-    def __init__(self, image_size=256, patch_size=16, embed_dim=256, depth=6,
-                 num_heads=8, mlp_ratio=4.0, dropout=0.0, in_chans=3):
-        super().__init__()
-        self.patch_size = patch_size
-        self.embed_dim = embed_dim
-        self.image_size = image_size
-        self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size,
-                                     stride=patch_size)
-        grid = image_size // patch_size
-        self._pe_grid = (grid, grid)
-        self.pos_embed = nn.Parameter(torch.zeros(1, embed_dim, grid, grid))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        self.blocks = nn.ModuleList([
-            MemoryViTBlock(embed_dim, num_heads, mlp_ratio, dropout) for _ in range(depth)
-        ])
-        self.norm = nn.LayerNorm(embed_dim)
-
-    def _pos_embed_for(self, gH, gW, dtype):
-        """Bicubically resize the learned grid so non-native input sizes still work
-        (mirrors SceneRepresentation's interpolating pos-embed)."""
-        pe = self.pos_embed.to(dtype)
-        if (gH, gW) != self._pe_grid:
-            pe = F.interpolate(pe, size=(gH, gW), mode='bicubic', align_corners=False)
-        return rearrange(pe, '1 d h w -> 1 (h w) d')
-
-    def forward(self, x):
-        x = self.patch_embed(x)                                  # [B, D, gH, gW]
-        gH, gW = x.shape[-2:]
-        x = rearrange(x, 'b d h w -> b (h w) d') + self._pos_embed_for(gH, gW, x.dtype)
-        for blk in self.blocks:
-            x = blk(x)
-        return self.norm(x)
-
-
 class MemoryEncoder(nn.Module):
     """Builds a per-point appearance memory bank from a set of remembered observations.
 
@@ -1605,11 +1541,14 @@ class MemoryEncoder(nn.Module):
     "here is an image, and here is where the point is in it".
 
     Per (camera, memory frame):
-      1. Encode the frame ONCE with a small image ViT (MemoryViT) -- one encode serves
-         every point in that frame.
+      1. The frame's tokens are supplied by the caller (`mem_tokens`), encoded ONCE by the
+         V-JEPA scene backbone -- the same encoder, the same feature space and the same
+         width as the clip tokens the rest of the model reasons in. This module used to own
+         a small private image ViT (MemoryViT); a randomly-initialized 5M-param encoder in
+         its own feature space turned out to be the weak link, and it cost +13 GiB at M=8.
       2. Build a per-point query from the local appearance (a patch at the point's pixel)
          plus where in the frame it sits, and whether it is actually visible there.
-      3. Cross-attend that query to the frame's ViT tokens for wider context.
+      3. Cross-attend that query to the frame's tokens for wider context.
     Then each (point, memory frame, camera) becomes its own bank entry -- no cross-camera
     pooling, so the decoder can learn viewpoint selection instead of seeing an average.
 
@@ -1625,19 +1564,18 @@ class MemoryEncoder(nn.Module):
     """
 
     def __init__(self, dim, num_heads=8, cross_attn_dim=None, max_freq=10, dropout=0.0,
-                 patch_size=9, image_size=256, vit_dim=256, vit_depth=6, vit_heads=8,
-                 vit_patch_size=8, read_depth=3):
+                 patch_size=9, token_dim=512, read_depth=3, kpt_chunk=None):
         super().__init__()
         self.dim = dim
         self.max_freq = max_freq
         self.patch_size = patch_size
+        self.token_dim = token_dim
+        # Point-axis chunk for the per-point work. The frame's tokens are encoded once
+        # OUTSIDE this loop, so chunking costs nothing but bounds the per-point tensors on
+        # dense sets (point-odyssey runs 40k-76k points through one build_memory_bank call,
+        # and the model's own kpt_chunk only covers the decoder, which runs later).
+        self.kpt_chunk = kpt_chunk
         cross_attn_dim = cross_attn_dim or dim
-
-        # Dedicated small image ViT for the remembered frames (see MemoryViT): far cheaper
-        # than re-running the video backbone, and single-frame so there is no tubelet.
-        self.vit = MemoryViT(image_size=image_size, patch_size=vit_patch_size,
-                             embed_dim=vit_dim, depth=vit_depth, num_heads=vit_heads,
-                             dropout=dropout)
 
         # --- per-point query: a query encoder in its own right -----------------------------
         # Built like QueryEncoder (per-term encodings -> learned gate -> norm -> MLP) rather
@@ -1674,7 +1612,7 @@ class MemoryEncoder(nn.Module):
         self.query_mlp = nn.Sequential(
             nn.Linear(dim, dim * 4), nn.GELU(), nn.Dropout(0.05), nn.Linear(dim * 4, dim))
 
-        # Per-point read of the frame's ViT tokens. NOT zero-init: this is the main path by
+        # Per-point read of the frame's scene tokens. NOT zero-init: this is the main path by
         # which appearance beyond the local patch enters a memory vector. A single layer was
         # measured to collapse rank (13.3 -> 2.9), hence the stack.
         self.read_norm_q = nn.LayerNorm(dim)
@@ -1682,7 +1620,7 @@ class MemoryEncoder(nn.Module):
             nn.ModuleDict({
                 'norm_q': nn.LayerNorm(dim),
                 'attn': DecoupledCrossAttention(
-                    latent_dim=dim, kv_dim=vit_dim, cross_attn_dim=cross_attn_dim,
+                    latent_dim=dim, kv_dim=token_dim, cross_attn_dim=cross_attn_dim,
                     num_heads=num_heads, dropout=dropout),
                 'norm_m': nn.LayerNorm(dim),
                 'mlp': nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(),
@@ -1759,12 +1697,38 @@ class MemoryEncoder(nn.Module):
         fused = einsum(w, terms, 'bm n t, bm n t d -> bm n d')
         return self.query_mlp(self.query_norm(fused))
 
-    def forward(self, mem_views, mem_p2d, mem_valid, mem_depth=None, mem_intrinsics=None):
+    def _entries(self, v, tokens, p, ok, dp, it):
+        """Per-point entries for ONE camera's memory frames, chunked over the point axis.
+
+        The frame tokens are computed by the caller and shared across every chunk, so the
+        split costs nothing and keeps the per-point tensors bounded on dense point sets.
+        """
+        N = p.shape[1]
+        step = self.kpt_chunk if (self.kpt_chunk and N > self.kpt_chunk) else N
+        out = []
+        for k0 in range(0, N, step):
+            k1 = min(k0 + step, N)
+            x = self._query(v, p[:, k0:k1], ok[:, k0:k1],
+                            depth=(dp[:, k0:k1] if dp is not None else None),
+                            intrinsics=it)                            # [(B M), n, dim]
+            for blk in self.read_blocks:
+                x = x + blk['attn'](blk['norm_q'](x), tokens)
+                x = x + blk['mlp'](blk['norm_m'](x))
+            out.append(x)
+        return out[0] if len(out) == 1 else torch.cat(out, dim=1)
+
+    def forward(self, mem_views, mem_p2d, mem_valid, mem_tokens, mem_slot=None,
+                mem_depth=None, mem_intrinsics=None):
         """
         Args:
-            mem_views: list over cameras of [B, M, C, H, W] normalized memory frames.
+            mem_views: list over cameras of [B, M, 2, C, H, W] normalized memory tubelets.
+                The tubelet exists for the ENCODER (tubelet_size=2); the per-point patch
+                term must come from the remembered frame itself, which is mem_slot.
             mem_p2d:   [n_cams, B, M, N, 2] pixel position of each point in each frame.
             mem_valid: [n_cams, B, M, N] bool -- point is in frame AND not occluded there.
+            mem_tokens: [n_cams, B, M, n_tok, token_dim] scene-encoder tokens per tubelet.
+            mem_slot:  [B, M] long in {0, 1} -- which half of the tubelet is the remembered
+                frame. None means slot 0 (the pair is [t, t+1]).
             mem_depth: [n_cams, B, M, N] distance to that camera, already divided by
                 cube_scale, or None in 2D-mode (no world coords -> no meaningful scale).
             mem_intrinsics: [n_cams, B, M, 4] = (fx/W, fy/H, cx/W, cy/H), or None.
@@ -1774,22 +1738,23 @@ class MemoryEncoder(nn.Module):
         """
         n_cams = len(mem_views)
         B, M = mem_views[0].shape[:2]
-        N = mem_p2d.shape[3]
+
+        if mem_slot is None:
+            mem_slot = torch.zeros(B, M, dtype=torch.long, device=mem_p2d.device)
+        sel = rearrange(mem_slot, 'b m -> (b m)')
 
         per_cam = []
         for c in range(n_cams):
-            v = rearrange(mem_views[c], 'b m c h w -> (b m) c h w')
+            # (B M, 2, C, H, W) -> the remembered frame only, for the patch/appearance term
+            vv = rearrange(mem_views[c], 'b m s c h w -> (b m) s c h w')
+            v = vv[torch.arange(vv.shape[0], device=vv.device), sel]   # [(B M), C, H, W]
+            tokens = rearrange(mem_tokens[c], 'b m t d -> (b m) t d')
             p = rearrange(mem_p2d[c], 'b m n r -> (b m) n r')
             ok = rearrange(mem_valid[c], 'b m n -> (b m) n')
             dp = rearrange(mem_depth[c], 'b m n -> (b m) n') if mem_depth is not None else None
             it = (rearrange(mem_intrinsics[c], 'b m r -> (b m) r')
                   if mem_intrinsics is not None else None)
-            x = self._query(v, p, ok, depth=dp, intrinsics=it)        # [(B M), N, dim]
-            tokens = self.vit(v)                                     # [(B M), tok, vit_dim]
-            for blk in self.read_blocks:
-                x = x + blk['attn'](blk['norm_q'](x), tokens)
-                x = x + blk['mlp'](blk['norm_m'](x))
-            per_cam.append(x)
+            per_cam.append(self._entries(v, tokens, p, ok, dp, it))
         mem_cam = torch.stack(per_cam)                               # [cams,(B M),N,dim]
 
         # One entry per (frame, camera): no cross-camera pooling. Averaging the views was

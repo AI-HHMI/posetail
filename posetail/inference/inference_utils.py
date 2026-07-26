@@ -369,7 +369,7 @@ def load_multiview_clip(readers, start_frame, n_frames, crop_boxes=None, target_
 
 
 def build_chunk_memory(model, views, camera_group, frame_idx, coords_at, is_2d,
-                       cube_scale=None):
+                       cube_scale=None, scene_features=None):
     """Encode remembered frames taken from the CURRENT chunk.
 
     Returns a bank slice of (B, N, K*n_cams, dim): one entry per (remembered frame,
@@ -378,6 +378,14 @@ def build_chunk_memory(model, views, camera_group, frame_idx, coords_at, is_2d,
     The chunk's frames are already cropped and resized around the tracked points, so a
     remembered frame reuses that crop rather than re-reading and re-cropping the video.
 
+    Since every remembered frame comes from the chunk the model is ALREADY encoding, the
+    tokens exist: with tubelet_size=2 the tubelet containing frame t is t // 2, and its
+    token grid is scene_features[..., k*gH*gW : (k+1)*gH*gW] (the same index convention the
+    decoder's cross-attention RoPE uses). Passing `scene_features` therefore costs zero
+    extra backbone passes AND gives tokens from the full-clip encode rather than from an
+    isolated 2-frame approximation of it. Leaving it None re-encodes the tubelets in
+    isolation, which is what TRAINING does -- keep that path as the matched A/B control.
+
     Args:
         views: list per camera of (B, T, H, W, C) chunk frames (as passed to the model).
         frame_idx: (K,) which frames of the chunk to remember.
@@ -385,9 +393,19 @@ def build_chunk_memory(model, views, camera_group, frame_idx, coords_at, is_2d,
             (world coords for 3D; model-input pixels for 2D).
         cube_scale: (n_cams, B) scene scale, or None in 2D where there are no world
             coordinates -- the depth term is then dropped, exactly as in training.
+        scene_features: (n_cams, B, gT*gH*gW, dim) tokens for this chunk, or None.
     """
     K = int(frame_idx.numel())
-    mem_views = [v[:, frame_idx] for v in views]                    # (B, K, H, W, C)
+    tub = model.scene_encoder.tubelet_size
+    T = views[0].shape[1]
+    gT = max(T // tub, 1)
+    # Clamp: a video's last chunk can be short and odd, leaving its final frame outside the
+    # tubelet grid. Unclamped, the token slice would run past that camera's block.
+    tk = torch.clamp(torch.div(frame_idx, tub, rounding_mode='floor'), max=gT - 1)
+    slot = (frame_idx - tk * tub).clamp(0, tub - 1)                 # (K,)
+    pair = (tk[:, None] * tub + torch.arange(tub, device=tk.device)[None]).clamp(max=T - 1)
+    mem_views = [v[:, pair.reshape(-1)].reshape(v.shape[0], K, tub, *v.shape[2:])
+                 for v in views]                                    # (B, K, tub, H, W, C)
     sizes = torch.stack([cam['size'].to(coords_at.dtype).to(coords_at.device)
                          for cam in camera_group])                  # (cams, 2)
     p2d_l, ok_l, depth_l = [], [], []
@@ -415,11 +433,22 @@ def build_chunk_memory(model, views, camera_group, frame_idx, coords_at, is_2d,
     intr = repeat(intr, 'cams r -> cams b k r', b=coords_at.shape[0], k=K)
 
     mem_depth = torch.stack(depth_l, dim=2) if depth_l else None    # (cams, B, K, N)
+
+    mem_tokens = None
+    if scene_features is not None:
+        n_sp = scene_features.shape[2] // gT                        # tokens per tubelet
+        tok_idx = (tk[:, None] * n_sp
+                   + torch.arange(n_sp, device=tk.device)[None]).reshape(-1)
+        mem_tokens = scene_features[:, :, tok_idx].reshape(
+            scene_features.shape[0], scene_features.shape[1], K, n_sp, -1)
+
     return model.build_memory_bank(
         mem_views,
         torch.stack(p2d_l, dim=2),                                  # (cams, B, K, N, 2)
         torch.stack(ok_l, dim=2),                                   # (cams, B, K, N)
-        mem_depth=mem_depth, mem_intrinsics=intr, cube_scale=cube_scale)
+        mem_depth=mem_depth, mem_intrinsics=intr, cube_scale=cube_scale,
+        mem_slot=slot[None].expand(coords_at.shape[0], K),
+        mem_tokens=mem_tokens)
 
 
 def crop_camera_group_to_queries(camera_group, query_coords, min_crop_dim, padding=20, is_2d=False):
@@ -943,6 +972,15 @@ def run_tracker_encoder_on_videos(
             # from the ORIGINAL query coordinate (not a prediction). Built BEFORE the
             # forward so even the very first chunk reads a real memory entry. Points
             # usually share a query frame, so this is normally one extra encode, once.
+            # Encode this chunk ONCE and reuse it for the memory bank and the forward pass.
+            # Remembered frames are chunk frames, so their tokens are already in here --
+            # re-encoding them would be pure waste, and an isolated 2-frame encode is a
+            # weaker approximation of the same thing.
+            chunk_features = None
+            if mem_on:
+                chunk_features = model.encode_scene(
+                    model._normalize_views(views, device))
+
             if mem_on and bool(seeded.any()):
                 sidx = seeded.nonzero(as_tuple=True)[0]
                 for f in torch.unique(times_chunk[0, sidx]):
@@ -951,7 +989,7 @@ def run_tracker_encoder_on_videos(
                         model, views, camera_group_chunk,
                         f.reshape(1).to(torch.long),
                         queries_model[:, pts][:, None], is_2d,
-                        cube_scale=mem_cube_scale)
+                        cube_scale=mem_cube_scale, scene_features=chunk_features)
 
             mem_kwargs = {}
             if mem_on:
@@ -966,6 +1004,7 @@ def run_tracker_encoder_on_videos(
                 camera_group=camera_group_chunk,
                 kpt_chunk=max_kpts,
                 occlusion=(occ_chunk[:, run_idx] if occ_chunk is not None else None),
+                scene_features=chunk_features,
                 **mem_kwargs,
             )
 
@@ -1002,7 +1041,8 @@ def run_tracker_encoder_on_videos(
                             else outputs[pred_key_3d])[:, :keep_len]
                     blk = build_chunk_memory(model, views, camera_group_chunk,
                                              top.to(torch.long), traj[:, top], is_2d,
-                                             cube_scale=mem_cube_scale)
+                                             cube_scale=mem_cube_scale,
+                                             scene_features=chunk_features)
                     full = _null.expand(1, N, blk.shape[2], _dim).clone()
                     full[:, active_idx] = blk
                     mem_recent = torch.cat([mem_recent[:, :, blk.shape[2]:], full], dim=2)

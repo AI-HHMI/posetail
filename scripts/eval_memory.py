@@ -44,7 +44,7 @@ from posetail.inference.inference_utils import load_model_from_base_folder      
 from posetail.posetail.cube import compute_cube_scale                            # noqa: E402
 from posetail.posetail.eval_metrics import get_eval_metrics                     # noqa: E402
 from posetail.posetail.train_utils import (_eval_cube_scale, dict_to_device,    # noqa: E402
-                                           memory_only_kwargs)
+                                           memory_kwargs, memory_only_kwargs)
 
 METRICS = ['mte', 'delta_x_avg', 'avg_jaccard', 'survival_rate', 'mpjpe']
 
@@ -82,22 +82,16 @@ def build_bank(model, batch, device, cube_scale=None):
     because encoding outside would mean calling build_memory_bank on the DDP-wrapped module
     -- which routes through DDP's forward and desynced the per-rank collective count (see
     train_utils.memory_kwargs). This script is single-process and the model is not wrapped,
-    so calling it directly is safe here, and it means the memory ViT encode happens once per
-    batch instead of once per arm.
+    so calling it directly is safe here, and it means the frame encode happens once per batch
+    instead of once per arm.
+
+    The batch unpacking is `memory_kwargs`, deliberately: training, this script, diag_memory
+    and inference must not drift apart on how a memory observation is assembled.
     """
-    if not getattr(model, 'memory_attention', False):
+    kw = memory_kwargs(model, batch, device)
+    if not kw:
         return None
-    mem_views = getattr(batch, 'mem_views', None)
-    if mem_views is None:
-        return None
-    md = getattr(batch, 'mem_depth', None)
-    mi = getattr(batch, 'mem_intrinsics', None)
-    return model.build_memory_bank(
-        [v.to(device) for v in mem_views],
-        batch.mem_p2d.to(device), batch.mem_valid.to(device),
-        mem_depth=(md.to(device) if md is not None else None),
-        mem_intrinsics=(mi.to(device) if mi is not None else None),
-        device=device, cube_scale=cube_scale)
+    return model.build_memory_bank(**kw, device=device, cube_scale=cube_scale)
 
 
 def build_dataset(config, args):
@@ -169,15 +163,19 @@ def main():
 
     # acc[arm][dataset] -> list of metric dicts;  arm is 'M=k' or 'M=k/memonly'
     acc = defaultdict(lambda: defaultdict(list))
-    n_seen = n_skipped = 0
+    n_seen = n_yielded = n_unreadable = 0
     skipped_ds = defaultdict(int)   # datasets with no memory path (native-2D trials)
     t0 = time.time()
 
     with torch.inference_mode():
         for bi, batch in enumerate(loader):
-            # a sample can fail to load (e.g. unreadable trial); custom_collate yields None
+            n_yielded += 1
+            # A sample can fail to load (unreadable trial, missing frame); custom_collate
+            # yields None and the dataset name is gone with it, so these CANNOT be
+            # attributed per-dataset -- counted separately rather than silently merged
+            # into the no-memory-path tally, which made the coverage line misleading.
             if batch is None or batch.views is None:
-                n_skipped += 1
+                n_unreadable += 1
                 continue
             views = [v.to(device) for v in batch.views]
             coords = batch.coords.to(device)
@@ -203,7 +201,6 @@ def main():
                                   cgroup, query_coords, len(cgroup), device,
                                   per_camera=getattr(model, 'per_camera_cube_scale', False))))
             if bank is None:                 # dataset sampled no memory (e.g. 2D-only trial)
-                n_skipped += 1
                 skipped_ds[ds_name] += 1
                 continue
 
@@ -262,9 +259,20 @@ def main():
         for ds in sorted({d for per_ds in acc.values() for d in per_ds})
     }
 
+    n_nomem = sum(skipped_ds.values())
     skip_note = ('  (no memory path: ' + ', '.join(f'{k} x{v}' for k, v in sorted(skipped_ds.items())) + ')') if skipped_ds else ''
-    print(f'\n{n_seen} clips evaluated, {n_skipped} skipped, {time.time() - t0:.0f}s'
-          f'{skip_note}\n')
+    print(f'\n{n_seen} clips evaluated, {n_nomem} without a memory path, '
+          f'{n_unreadable} unreadable, of {n_yielded} sampled, {time.time() - t0:.0f}s'
+          f'{skip_note}')
+    # The three buckets must exhaust what the loader produced, or the coverage line is
+    # lying about which datasets were actually measured.
+    assert n_seen + n_nomem + n_unreadable == n_yielded, (
+        f'skip accounting does not close: {n_seen}+{n_nomem}+{n_unreadable} != {n_yielded}')
+    missing = sorted(set(dataset.metadata['dataset'].unique()) - set(acc['0'].keys())
+                     - set(skipped_ds))
+    if missing:
+        print(f'  WARNING: sampled but never evaluated or attributed: {", ".join(missing)}')
+    print()
     print(fmt_table({a: overall[a] for a in sorted(overall)}, 'OVERALL  (M* = memory-only points)'))
     for ds, rows in per_dataset.items():
         print(fmt_table(rows, ds))

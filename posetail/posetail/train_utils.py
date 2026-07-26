@@ -660,6 +660,10 @@ def memory_kwargs(model, batch, device):
     kw = {'mem_views': [v.to(device) for v in mem_views],
           'mem_p2d': batch.mem_p2d.to(device),
           'mem_valid': batch.mem_valid.to(device)}
+    # which half of each 2-frame tubelet is the remembered frame (the other is only there
+    # so the video backbone sees a real tubelet rather than a duplicated still)
+    if getattr(batch, 'mem_slot', None) is not None:
+        kw['mem_slot'] = batch.mem_slot.to(device)
     # depth / intrinsics of each remembered observation, for the seed's depth and camera
     # terms. forward() drops the depth term in 2D-mode, where there is no meaningful scale.
     if getattr(batch, 'mem_depth', None) is not None:
