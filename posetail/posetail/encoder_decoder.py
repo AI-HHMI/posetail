@@ -720,9 +720,14 @@ class SceneRepresentation(nn.Module):
             xr = rearrange(view, 'b t c h w -> b c t h w')
             feat = self.encoder(xr)  # [B, n_tokens, embed_dim]
             if self.pos_embed_mode != 'none':
-                gT = view.shape[1] // self.tubelet_size
                 gH = view.shape[3] // self.patch_size
                 gW = view.shape[4] // self.patch_size
+                # Derive the temporal grid from the ENCODER'S OUTPUT, not from
+                # T // tubelet_size: the encoder switches to its image path when the
+                # temporal dim equals img_temporal_dim_size (patch_embed_img has
+                # tubelet_size=1), where the grid is gT=1 while T // tubelet_size is 0 --
+                # which built a zero-length pos_embed and blew up on the add.
+                gT = feat.shape[1] // (gH * gW)
                 if self.pos_embed_mode == 'learned':
                     feat = feat + self._pos_embed_for(gT, gH, gW)
                 elif self.pos_embed_mode == 'spatial':
