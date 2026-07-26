@@ -89,7 +89,11 @@ class TrackerEncoder(nn.Module):
                  memory_pool_seeds = 1,
                  memory_read_depth = 3,
                  memory_encoder_grad = False,
-                 memory_kpt_chunk = 4096,
+                 # Point-axis chunk for the memory bank build. Only bites on dense sets --
+                 # training runs 128 points, i.e. a single chunk -- but at point-odyssey's
+                 # 76k points 4096 peaked at 30.2 GiB against 15.5 GiB here, and the
+                 # remainder is the O(N) bank itself.
+                 memory_kpt_chunk = 1024,
                  memory_token_sample = True,
                  memory_spatial_bias = True):
         super().__init__()
