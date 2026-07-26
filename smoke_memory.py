@@ -213,6 +213,36 @@ def main():
     results.append(report('a 1-frame "tubelet" is rejected, not silently image-encoded',
                           ok_assert))
 
+    # ---- 7b. spatial structure in the entry (3a / 3b) ---------------------------------
+    print('7b. spatial structure in the entry')
+    me = mem.memory_encoder
+    results.append(report('token-sample adds a 7th gated query term',
+                          me.token_sample and me.n_query_terms == 7))
+    # The bias must stay O(N * grid): materializing a per-point TOKEN grid is the ~10 GB
+    # failure this design exists to avoid, so assert the shape, not just the result.
+    n_tok = tok.shape[-2]
+    pp = torch.rand(2, N, 2) * 2 - 1
+    ok_v = torch.ones(2, N, dtype=torch.bool)
+    bias = me._spatial_prior(n_tok, pp, ok_v, torch.float32)
+    results.append(report(f'spatial bias is (BM, 1, N, n_tok) = {tuple(bias.shape)}, '
+                          'head axis broadcast',
+                          tuple(bias.shape) == (2, 1, N, n_tok)))
+    # centred on the point: the argmax token must be the one nearest its pixel
+    g = int(round(n_tok ** 0.5))
+    ctr = torch.stack([(torch.arange(g).float() + .5) / g * 2 - 1] * 1)[0]
+    near = ((pp[0, :, 1:2] - ctr[None]).abs().argmin(-1) * g
+            + (pp[0, :, 0:1] - ctr[None]).abs().argmin(-1))
+    results.append(report('bias peaks at the token containing the point',
+                          bool((bias[0, 0].argmax(-1) == near).all())))
+    both_off = build(True, memory_token_sample=False, memory_spatial_bias=False)
+    results.append(report('both parts are independently switchable',
+                          both_off.memory_encoder.n_query_terms == 6
+                          and not both_off.memory_encoder.spatial_bias))
+    with torch.no_grad():
+        b_off = both_off.build_memory_bank(**make_memory())
+    results.append(report('bank is finite with both parts off',
+                          bool(torch.isfinite(b_off).all())))
+
     # ---- 8. kpt_chunk parity ---------------------------------------------------------
     print('8. kpt_chunk parity')
     mem.eval()

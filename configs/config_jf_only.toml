@@ -1,31 +1,18 @@
 [wandb]
-project_name = 'posetail-memory-v1'
-path = '/groups/karashchuk/home/karashchukl/results/posetail-memory-v1'
-mode = 'online' # 'online', 'offline', 'disabled'
+project_name = 'posetail-finetuning-v3'
+path = '/groups/karashchuk/home/karashchukl/results/jf-only-repro'
+mode = 'offline'
 
 [dataset]
+datasets_to_exclude = ["3dpop","3dzef","allen-mouse","branson-fly","cmupanoptic_3dgs","dex_ycb","johnson-mouse","kubric-multiview","po-animal-sub256-motion","point-odyssey-human","rat7m","rat-city","ravan-fish-sim","sober-zebrafinch","tuthill-fly"]
 # batch_size=1 REQUIRED for mixed 2D+3D (2D loss assumes B=cams=1). Multi-GPU: --strategy ddp.
 batch_size = 1
 num_workers = 12
 # prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v3'
 prefix = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v4'
-# datasets_to_exclude = ["johnson-fly"]
 
 [dataset.train]
 split_dir = 'train'
-# memory: extra observations of the same points sampled from anywhere in the video.
-# A range means the count is drawn per sample, so the model tolerates a different
-# number of memory entries at inference than it saw in training.
-# M=8 must be COMMON, not 1-in-7: the previous [2, 8] meant we evaluated an M=8 curve the
-# model had barely trained.
-memory_num_context = [2, 16]
-memory_prob = 0.6
-# memory-only queries: withhold the position of some points entirely so the model has to
-# find them from memory. Fires only on items that carry memory frames. At the old
-# 0.4 x 0.3 x 0.5 only ~6% of point-predictions carried the memory-only task, which starts
-# from random init; 0.6 x 0.5 x 0.5 makes it ~15%.
-memory_only_prob = 0.5
-memory_only_kpt_prob = 0.5
 n_frames = 24
 min_res = 256
 max_res = 256
@@ -58,11 +45,6 @@ intensity_floor = 0.0
 
 [dataset.val]
 split_dir = 'val'
-# Memory always on for val, with a FIXED count (not a range like train): a val number that
-# also jittered with M would not be comparable pass to pass. memory_only stays off so val
-# remains comparable to the pre-memory checkpoint this run warm-starts from.
-memory_num_context = 8
-memory_prob = 1.0
 n_frames = 24
 max_res = 256
 cams_to_sample = 5
@@ -88,49 +70,14 @@ device = 'cuda'
 mode_3d = "encoder"
 
 video_encoder_version = 'large'
-# Backbone FROZEN for the memory work. A memory architecture that works should converge
-# without the backbone adapting to it; leaving it trainable lets a backbone change absorb
-# credit that belongs to the memory path, and makes the memory tokens a moving target for
-# the modules learning to read them. It also removes the largest activation consumer in the
-# step (backward over 24 frames x 8 cameras), which is what pays for the raised M below.
-# NOTE: anchored (M=0) metrics are therefore NOT comparable to d90p0599, which kept
-# finetuning the encoder. The M-curve is a within-run comparison and stays valid.
-video_encoder_requires_grad = false
+# VJEPA backbone frozen for all of pretraining; finetuning unlocks the whole encoder.
+video_encoder_requires_grad = true
 video_encoder_hierarchical = true
 
 # Inert while the encoder is frozen.
 # video_encoder_finetune_last_n_layers = 12
 
 soft_argmax_temperature_learnable = true
-
-# Per-point appearance memory: M context frames sampled from the clip are encoded into
-# one vector per point, which the decoder cross-attends to (identity / appearance history).
-memory_attention = true
-# Remembered frames are encoded by the VJEPA backbone itself (as real 2-frame tubelets), not
-# by a private ViT. The old 5M-param MemoryViT started from random init, lived in its own
-# feature space, and cost +13 GiB at M=8; measured on d90p0599 the decoder's memory read was
-# nearly independent of bank CONTENT (entropy 0.627 real vs 0.615 with each point handed
-# another point's bank), which is what the shared, pretrained descriptor is meant to fix.
-# how many cross-attention blocks read the frame tokens into each point's entry. One layer
-# had to pull "which part of this animal is this point" out of the grid in a single shot.
-memory_read_depth = 3
-# seeds in MemoryQueryEncoder. Measured with a bank of known rank, K makes no difference to
-# the token's effective rank (a single seed's attention already varies per point), so 1.
-memory_pool_seeds = 1
-# Gradient through the memory frames' scene encode. Off: the backbone is shared with the clip
-# path, and a frozen encode is several times cheaper. Inert while the encoder is frozen.
-memory_encoder_grad = false
-
-# Keep SPATIAL structure in the entry instead of summarizing it away. SAM 2 registers what
-# it decided onto its memory feature map (it fuses the predicted mask); we cannot, because
-# one encoded frame is shared across all N points, so a per-point token grid would be ~10 GB.
-# Both of these attach the same signal at O(N * grid) instead of O(N * grid * dim), and are
-# separately ablatable.
-#   token_sample: the backbone token AT the point's pixel, as a 7th gated query term.
-#   spatial_bias: a learned Gaussian over the token grid, added to the read's attention
-#                 logits, so the read starts at the right patch instead of searching for it.
-memory_token_sample = true
-memory_spatial_bias = true
 
 # processing
 stride_length = 24
@@ -207,21 +154,27 @@ depth_log_max = 2.5
 
 
 [training]
-seed = 0
+seed = 1234
 
 finetune = true
+# pretraining
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-pretraining-v3/wandb/run-20260710_151739-dqbgdtkx/files/checkpoints/checkpoint_00799996.pth'
 
-# Warm start from run 3gvz9mto. The memory modules are absent from this checkpoint and load
-# fresh under strict=False; their output projections are zero-init, so the model starts out
-# predicting exactly as this checkpoint does and learns to use memory from there.
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260724_111406-3gvz9mto/files/checkpoints/checkpoint_00102420.pth'
+# finetuned 1
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260712_124515-t8ulpbro/files/checkpoints/checkpoint_01187840.pth'
+
+# finetuned 2
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260716_220801-066k6c9u/files/checkpoints/checkpoint_01177600.pth'
+
+# finetuned 3
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260721_172745-zbkyq75r/files/checkpoints/checkpoint_00256000.pth'
 
 
 
 n_iterations = 8000000
 scheduler_type = 'muon'
 max_grad_norm = 10.0
-checkpoint_freq = 10240 # in iterations
+checkpoint_freq = 100000000 # in iterations
 eval_metric_freq = 24 # in iterations
 val_freq = 48 # in iterations
 print_freq = 96 # in iterations
@@ -230,11 +183,11 @@ debug_ix = -1 # only works for val
 [training.optimizer]
 # Decoder trains from scratch on the frozen backbone -> 5e-4 base LR (6i8ryveg). encoder_lr_scale
 # moot (encoder frozen).
-learning_rate = 1e-4
+learning_rate = 1.2e-4
 muon_schedulefree = true
 weight_decay = 0.002
-warmup_steps = 2000
-muon_warmup_steps = 2000
+warmup_steps = 250
+muon_warmup_steps = 250
 beta1 = 0.9
 beta2 = 0.95
 

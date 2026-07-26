@@ -1564,7 +1564,8 @@ class MemoryEncoder(nn.Module):
     """
 
     def __init__(self, dim, num_heads=8, cross_attn_dim=None, max_freq=10, dropout=0.0,
-                 patch_size=9, token_dim=512, read_depth=3, kpt_chunk=None):
+                 patch_size=9, token_dim=512, read_depth=3, kpt_chunk=None,
+                 token_sample=True, spatial_bias=True):
         super().__init__()
         self.dim = dim
         self.max_freq = max_freq
@@ -1603,7 +1604,17 @@ class MemoryEncoder(nn.Module):
         self.missing_intrinsic = nn.Parameter(torch.zeros(dim))
         nn.init.normal_(self.missing_intrinsic, std=0.02)
 
-        self.n_query_terms = 6                    # patch, pos, depth, valid, pp, intrinsic
+        # (3a) The scene token AT the point's pixel. Once memory frames are encoded by the
+        # shared backbone, that token is the natural local descriptor and was going unused:
+        # the entry's appearance came from a raw 9x9 RGB patch through a small conv while a
+        # backbone token sat at exactly that location. One vector per point, so it costs the
+        # same order as the query itself -- unlike fusing the whole grid per point, which at
+        # M=8, cams=4, N=600 would be ~10 GB.
+        self.token_sample = token_sample
+        if token_sample:
+            self.linear_token = nn.Linear(token_dim, dim)
+
+        self.n_query_terms = 6 + int(token_sample)   # patch,pos,depth,valid,pp,intrinsic[,tok]
         self.query_gate = nn.Sequential(
             nn.Linear(dim * self.n_query_terms, self.n_query_terms), nn.Sigmoid())
         nn.init.normal_(self.query_gate[0].weight, std=0.01)
@@ -1628,10 +1639,65 @@ class MemoryEncoder(nn.Module):
             }) for _ in range(max(1, read_depth))
         ])
 
+        # (3b) Gaussian spatial prior on the read. SAM 2 registers what it decided onto the
+        # memory feature map by fusing the predicted mask; we cannot, because one encoded
+        # frame is shared by all N points, so a per-point token grid is unaffordable. The
+        # same signal costs O(N * gH*gW) scalars as an additive attention BIAS: the read
+        # starts already looking at the right patch and spends its capacity on context
+        # instead of search, while staying free to attend elsewhere (a bias, not a mask).
+        self.spatial_bias = spatial_bias
+        if spatial_bias:
+            # log-sigma in grid cells, learned. Starts at ~1 cell.
+            self.bias_log_sigma = nn.Parameter(torch.zeros(1))
+            self.bias_strength = nn.Parameter(torch.ones(1))
+
         # Substituted for entries whose camera cannot see the point: a learned "nothing
         # remembered here" token, so the bank needs no validity mask.
         self.null_entry = nn.Parameter(torch.zeros(dim))
         nn.init.trunc_normal_(self.null_entry, std=0.02)
+
+    def _grid_hw(self, n_tok):
+        """Token grid side length. The memory tubelet is a single tubelet of a square crop,
+        so the grid is square and gH*gW == n_tok."""
+        g = int(round(n_tok ** 0.5))
+        assert g * g == n_tok, f'expected a square token grid, got {n_tok} tokens'
+        return g, g
+
+    def _sample_token(self, tokens, pp):
+        """(3a) Bilinearly sample each point's own token from the frame's grid.
+
+        tokens: [BM, n_tok, token_dim];  pp: [BM, N, 2] in [-1, 1] (x, y)  ->  [BM, N, dim]
+        """
+        BM, n_tok, D = tokens.shape
+        gH, gW = self._grid_hw(n_tok)
+        grid = rearrange(tokens, 'bm (h w) d -> bm d h w', h=gH, w=gW)
+        # grid_sample wants (N, 1, P, 2) with (x, y) last -- pp already is (x, y).
+        s = F.grid_sample(grid.float(), pp.float()[:, None], mode='bilinear',
+                          align_corners=False, padding_mode='border')
+        return self.linear_token(rearrange(s, 'bm d 1 n -> bm n d').to(tokens.dtype))
+
+    def _spatial_prior(self, n_tok, pp, valid, dtype):
+        """(3b) Additive log-Gaussian bias over the token grid, centred on each point.
+
+        Returns [BM, 1, N, n_tok] for DecoupledCrossAttention's attn_mask (head axis
+        broadcasts rather than being materialized per head). Invalid points get a flat
+        bias: there is no location to point at, and their entry is replaced by null_entry
+        downstream anyway.
+        """
+        gH, gW = self._grid_hw(n_tok)
+        dev = pp.device
+        # token centres in the same [-1, 1] frame as pp
+        ys = (torch.arange(gH, device=dev, dtype=torch.float32) + 0.5) / gH * 2 - 1
+        xs = (torch.arange(gW, device=dev, dtype=torch.float32) + 0.5) / gW * 2 - 1
+        gy, gx = torch.meshgrid(ys, xs, indexing='ij')
+        centres = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=-1)      # (n_tok, 2)
+        # distances in GRID CELLS, so sigma is resolution-independent
+        scale = torch.tensor([gW / 2.0, gH / 2.0], device=dev, dtype=torch.float32)
+        d2 = ((pp.float()[:, :, None, :] - centres[None, None]) * scale).pow(2).sum(-1)
+        sigma = self.bias_log_sigma.exp().clamp(min=1e-2)
+        bias = -0.5 * d2 / (sigma ** 2) * self.bias_strength
+        bias = torch.where(valid[:, :, None], bias, torch.zeros_like(bias))
+        return bias[:, None].to(dtype)
 
     @staticmethod
     def _fourier(x, max_freq):
@@ -1641,12 +1707,14 @@ class MemoryEncoder(nn.Module):
         return torch.cat([x4, get_fourier_encoding(x4, min_freq=0, max_freq=max_freq)],
                          dim=-1)[:, 0]
 
-    def _query(self, views, p2d, valid, depth=None, intrinsics=None):
+    def _query(self, views, p2d, valid, depth=None, intrinsics=None, tokens=None):
         """Per-point QUERY for one camera's memory frames -- a query encoder in miniature.
 
         views: [B*M, C, H, W]; p2d: [B*M, N, 2]; valid: [B*M, N];
         depth: [B*M, N] already normalized by cube_scale, or None for 2D-mode;
-        intrinsics: [B*M, 4] = (fx/W, fy/H, cx/W, cy/H)  ->  [B*M, N, dim]
+        intrinsics: [B*M, 4] = (fx/W, fy/H, cx/W, cy/H);
+        tokens: [B*M, n_tok, token_dim] this frame's scene tokens, for the sampled-token
+        term (3a)  ->  [B*M, N, dim]
         """
         BM, C, H, W = views.shape
         N = p2d.shape[1]
@@ -1690,12 +1758,18 @@ class MemoryEncoder(nn.Module):
                 embed_intrinsic = self.linear_intrinsic(
                     self._fourier(it[..., :2], self.max_freq))
 
-        terms = torch.stack([embed_patch, embed_pos, embed_depth, embed_valid,
-                             embed_pp, embed_intrinsic],
-                            dim=-2)                                  # [B*M, N, n_terms, dim]
+        term_list = [embed_patch, embed_pos, embed_depth, embed_valid,
+                     embed_pp, embed_intrinsic]
+        if self.token_sample:
+            # the backbone's own token at this pixel: 16px-coarse but in the shared feature
+            # space, complementing the sharp-but-shallow 9x9 patch above
+            assert tokens is not None, 'token_sample=True requires the frame tokens'
+            term_list.append(self._sample_token(tokens, pp))
+
+        terms = torch.stack(term_list, dim=-2)                       # [B*M, N, n_terms, dim]
         w = self.query_gate(rearrange(terms, 'bm n t d -> bm n (t d)'))
         fused = einsum(w, terms, 'bm n t, bm n t d -> bm n d')
-        return self.query_mlp(self.query_norm(fused))
+        return self.query_mlp(self.query_norm(fused)), pp
 
     def _entries(self, v, tokens, p, ok, dp, it):
         """Per-point entries for ONE camera's memory frames, chunked over the point axis.
@@ -1708,11 +1782,15 @@ class MemoryEncoder(nn.Module):
         out = []
         for k0 in range(0, N, step):
             k1 = min(k0 + step, N)
-            x = self._query(v, p[:, k0:k1], ok[:, k0:k1],
-                            depth=(dp[:, k0:k1] if dp is not None else None),
-                            intrinsics=it)                            # [(B M), n, dim]
+            x, pp = self._query(v, p[:, k0:k1], ok[:, k0:k1],
+                                depth=(dp[:, k0:k1] if dp is not None else None),
+                                intrinsics=it, tokens=tokens)         # [(B M), n, dim]
+            # Built per chunk, never for all N at once: at 70k points the full-N bias would
+            # be ~46 GB. [(B M), 1, n, n_tok] -- the head axis broadcasts.
+            bias = (self._spatial_prior(tokens.shape[1], pp, ok[:, k0:k1], x.dtype)
+                    if self.spatial_bias else None)
             for blk in self.read_blocks:
-                x = x + blk['attn'](blk['norm_q'](x), tokens)
+                x = x + blk['attn'](blk['norm_q'](x), tokens, attn_mask=bias)
                 x = x + blk['mlp'](blk['norm_m'](x))
             out.append(x)
         return out[0] if len(out) == 1 else torch.cat(out, dim=1)

@@ -89,7 +89,9 @@ class TrackerEncoder(nn.Module):
                  memory_pool_seeds = 1,
                  memory_read_depth = 3,
                  memory_encoder_grad = False,
-                 memory_kpt_chunk = 4096):
+                 memory_kpt_chunk = 4096,
+                 memory_token_sample = True,
+                 memory_spatial_bias = True):
         super().__init__()
 
         self.mode_3d = mode_3d
@@ -276,6 +278,7 @@ class TrackerEncoder(nn.Module):
                 patch_size=query_patch_size,
                 token_dim=self.scene_encoder.embed_dim,
                 read_depth=memory_read_depth, kpt_chunk=memory_kpt_chunk,
+                token_sample=memory_token_sample, spatial_bias=memory_spatial_bias,
             )
             # Builds the query token for points given NO position (memory-only queries):
             # it reads the point's own memory instead of its image patch.

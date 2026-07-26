@@ -139,10 +139,12 @@ def main():
             if b.mem_depth is not None:
                 dep = rearrange(b.mem_depth.to(device)[0], 'b m n -> (b m) n') / cs[0].clamp(min=1e-6)
                 itr = rearrange(b.mem_intrinsics.to(device)[0], 'b m r -> (b m) r')
-            q_seed = me._query(v, p, ok, depth=dep, intrinsics=itr)
+            q_seed, pp = me._query(v, p, ok, depth=dep, intrinsics=itr, tokens=tok)
+            bias = (me._spatial_prior(tok.shape[1], pp, ok, q_seed.dtype)
+                    if me.spatial_bias else None)
             x = q_seed
             for blk in me.read_blocks:
-                x = x + blk['attn'](blk['norm_q'](x), tok)
+                x = x + blk['attn'](blk['norm_q'](x), tok, attn_mask=bias)
                 x = x + blk['mlp'](blk['norm_m'](x))
 
             bank = model.build_memory_bank(
