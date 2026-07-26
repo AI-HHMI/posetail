@@ -690,7 +690,11 @@ class PosetailDataset(Dataset):
         # from ANYWHERE in this video (the clip slice above only spans start_ix..end_ix).
         # It rides through the same subject/keypoint selection as `coords` (the `extra=`
         # argument on the samplers) so it always describes the same points.
-        memory_on = self.memory_prob > 0 and not is_true_2d
+        # Native-2D trials get memory too: their pose file is a whole-video PIXEL track,
+        # which is all the memory path needs -- it stores where a point was in a remembered
+        # frame, and that has never required world coordinates. Excluding them meant
+        # branson-fly / rat-city / ravan-fish-sim trained and evaluated no memory at all.
+        memory_on = self.memory_prob > 0
         coords_full = (torch.tensor(data['pose'], dtype=torch.float32, device='cpu')
                        if memory_on else None)
 
@@ -761,11 +765,20 @@ class PosetailDataset(Dataset):
             # coord transforms match load_image's warpAffine -> crop -> resize order;
             # the bounds filter below then drops points rotated outside the new size)
             if should_augment:
-                cgroup, rotation_info, coords = self.augment_image_rotation_2d(cgroup, coords)
+                cgroup, rotation_info, coords, coords_full = \
+                    self.augment_image_rotation_2d(cgroup, coords, extra=coords_full)
             else:
                 rotation_info = [None]
 
-            # validity: finite coords inside image bounds
+            # validity: finite coords inside image bounds. Every keypoint filter below must
+            # also be applied to the whole-video track, or memory would describe different
+            # points from the ones the clip carries.
+            def _keep_2d(m):
+                nonlocal coords, coords_full
+                coords = coords[:, m]
+                if coords_full is not None:
+                    coords_full = coords_full[:, m]
+
             size_tensor = cgroup[0]['size']
             valid_mask = _vis_2d_bounds(coords, size_tensor)
 
@@ -773,14 +786,13 @@ class PosetailDataset(Dataset):
                 mask = valid_mask.sum(dim=0) >= 2
             else:
                 mask = valid_mask[0]
-            coords = coords[:, mask]
+            _keep_2d(mask)
 
             if self.no_nan_coords:
-                mask = torch.all(torch.isfinite(coords), dim=(0, 2))
-                coords = coords[:, mask]
+                _keep_2d(torch.all(torch.isfinite(coords), dim=(0, 2)))
             elif self.min_valid_frames > 1:
                 finite_frames = torch.isfinite(coords).all(dim=2).sum(dim=0)
-                coords = coords[:, finite_frames >= self.min_valid_frames]
+                _keep_2d(finite_frames >= self.min_valid_frames)
 
             if coords.shape[1] < 2:
                 return None
@@ -799,11 +811,37 @@ class PosetailDataset(Dataset):
                 return None
 
             if self.kpts_to_sample:
-                coords, vis, vis_2d, _ = self.sample_keypoints(coords, vis, vis_2d,
-                                                               total_movement, avg_speed)
+                coords, vis, vis_2d, coords_full = self.sample_keypoints(
+                    coords, vis, vis_2d, total_movement, avg_speed, extra=coords_full)
 
             if coords.shape[1] < 2:
                 return None
+
+            # --- memory frames, from anywhere in this video. Computed against the
+            # PRE-CROP camera (the clip's crop follows the clip's points; a remembered
+            # frame needs its own crop around where the points were THEN), mirroring the
+            # 3D path's cgroup_uncropped.
+            if coords_full is not None:
+                n_avail = min(coords_full.shape[0], len(all_img_fnames))
+                mem_idx = self._sample_memory_frame_idx(
+                    coords_full, None, n_avail, exclude=fnums)
+                if mem_idx is not None:
+                    mem_size = self.max_res if self.max_res != -1 else self.min_crop_dim
+                    keep, mem_cgroups, mem_crops = [], [], []
+                    for f in mem_idx.tolist():
+                        cam_m, crop = self._memory_camera_p2d(
+                            cgroup[0], coords_full[f], mem_size)
+                        if cam_m is None:      # no point is in frame here
+                            continue
+                        keep.append(f)
+                        mem_cgroups.append([cam_m])
+                        mem_crops.append([crop])
+                    if keep:
+                        mem_idx = torch.tensor(keep, dtype=torch.long)
+                        mem_coords = coords_full[mem_idx]     # (M, n_kpts, 2) PIXELS
+                        mem_pairs, mem_slot = self._memory_tubelets(keep, len(all_img_fnames))
+                    else:
+                        mem_idx = mem_cgroups = mem_crops = None
 
             # crop around points (shifts pixel coords with the crop)
             if self.crop_to_points:
@@ -829,6 +867,19 @@ class PosetailDataset(Dataset):
                 query_times = torch.tensor(query_times_list, dtype=torch.int32, device='cpu')
             else:
                 query_times = torch.zeros((coords.shape[1],), dtype=torch.int32, device='cpu')
+
+            # memory-only points, same rule as the 3D path: withhold the query position
+            # entirely so the model has to locate the point from its memory. This is the
+            # task memory exists for, so a dataset that carries memory but never any
+            # memory-only queries would contribute nothing to it.
+            if mem_idx is not None and np.random.random() < self.memory_only_prob:
+                n_kpts_cur = coords.shape[1]
+                memory_only = torch.rand(n_kpts_cur) < self.memory_only_kpt_prob
+                # Keep at least one anchored point: the crop is derived from the query set.
+                if bool(memory_only.all()):
+                    memory_only[np.random.randint(n_kpts_cur)] = False
+                query_times = torch.where(memory_only, torch.zeros_like(query_times),
+                                          query_times)
 
             # p2d output: pixel coords as (1, T, N, 2)
             p2d = rearrange(coords, 't n r -> 1 t n r')
@@ -1033,24 +1084,7 @@ class PosetailDataset(Dataset):
                     if keep:
                         mem_idx = torch.tensor(keep, dtype=torch.long)
                         mem_coords = coords_full[mem_idx]        # (M, n_kpts, 3)
-                        # Each remembered frame is encoded as a real 2-frame TUBELET, since
-                        # that is what the video backbone's tubelet_size=2 patch embedding
-                        # expects; a duplicated still is out of distribution against real
-                        # motion. The partner direction is random because at inference the
-                        # remembered frame lands wherever it falls in the aligned tubelet
-                        # grid -- second as often as first -- so always pairing forward
-                        # would train one parity and infer with both. The pair stays in
-                        # chronological order (a reversed pair is its own distribution
-                        # shift), and mem_slot says which half holds the points' frame.
-                        n_img = len(all_img_fnames)
-                        mem_pairs, slots = [], []
-                        for f in keep:
-                            opts = ([f + 1] if f + 1 < n_img else []) + \
-                                   ([f - 1] if f - 1 >= 0 else [])
-                            g = int(np.random.choice(opts)) if opts else f
-                            mem_pairs.append((f, g) if g > f else (g, f))
-                            slots.append(0 if g > f else 1)
-                        mem_slot = torch.tensor(slots, dtype=torch.long)   # (M,)
+                        mem_pairs, mem_slot = self._memory_tubelets(keep, len(all_img_fnames))
                     else:
                         mem_idx = mem_cgroups = mem_crops = None
 
@@ -1261,8 +1295,17 @@ class PosetailDataset(Dataset):
             p2d_list, valid_list, depth_list, intr_list = [], [], [], []
             for mnum in range(len(mem_cgroups)):
                 cams_m = mem_cgroups[mnum]
-                c_f = mem_coords[mnum]                                    # (n_kpts, 3)
-                p = project_points_torch(cams_m, c_f[None])[:, 0]         # (cams, n_kpts, 2)
+                c_f = mem_coords[mnum]                                    # (n_kpts, 3 or 2)
+                if is_true_2d:
+                    # Native-2D: the track IS pixels in the uncropped frame, so map it into
+                    # the memory crop the same way crop_cgroup_to_points_2d maps the clip
+                    # (subtract the crop origin, then the resize scale). No projection and
+                    # no depth exist here -- the encoder substitutes its missing_depth.
+                    crop = mem_crops[mnum][0].to(c_f.dtype)
+                    scale = float(cams_m[0]['size'][0]) / float(crop[2] - crop[0])
+                    p = ((c_f - crop[:2]) * scale)[None]                  # (1, n_kpts, 2)
+                else:
+                    p = project_points_torch(cams_m, c_f[None])[:, 0]     # (cams, n_kpts, 2)
                 size_m = torch.stack([c['size'].to(p.dtype) for c in cams_m])  # (cams, 2)
                 inside = ((p >= 0) & (p < size_m[:, None, :])).all(dim=-1)
                 inside = inside & torch.isfinite(p).all(dim=-1)
@@ -1273,8 +1316,11 @@ class PosetailDataset(Dataset):
                     inside = inside & seen
                 # metric distance to each camera centre (the model divides by cube_scale,
                 # matching how QueryEncoder normalizes its own depth term)
-                centres = torch.stack([c['center'].to(c_f.dtype) for c in cams_m])  # (cams,3)
-                depth_list.append(torch.linalg.norm(c_f[None] - centres[:, None], dim=-1))
+                if is_true_2d:
+                    depth_list.append(torch.zeros_like(p[..., 0]))
+                else:
+                    centres = torch.stack([c['center'].to(c_f.dtype) for c in cams_m])  # (cams,3)
+                    depth_list.append(torch.linalg.norm(c_f[None] - centres[:, None], dim=-1))
                 # Camera params, normalized EXACTLY as QueryEncoder does them so the memory
                 # seed's terms are on the same footing as the query token's:
                 #   focal scale    = focal / size                (encoder_decoder.py:398)
@@ -1666,19 +1712,26 @@ class PosetailDataset(Dataset):
         return cgroup_rotated, rotation_info
 
 
-    def augment_image_rotation_2d(self, cgroup, coords):
+    def augment_image_rotation_2d(self, cgroup, coords, extra=None):
         """Random in-plane rotation for the single-camera 2D path.
 
-        Rolls aug_prob; on skip returns (cgroup, [None], coords) unchanged.
+        Rolls aug_prob; on skip returns (cgroup, [None], coords, extra) unchanged.
         Otherwise rotates the lone camera + pixel coords via rotate_points_image_plane.
         rotation_info is a length-1 list, matching the consumer at the image-load loop.
+
+        `extra` is the whole-video pixel track behind the memory frames; it must take the
+        SAME angle, not a second draw, or the remembered frames land in a different frame
+        from the clip.
         """
         if np.random.random() >= self.aug_prob:
-            return cgroup, [None], coords
+            return cgroup, [None], coords, extra
 
         angle = float(np.random.uniform(-45, 45))
         cam_rot, coords_rot, rot = rotate_points_image_plane(cgroup[0], coords, angle)
-        return [cam_rot], [rot], coords_rot
+        extra_rot = None
+        if extra is not None:
+            _, extra_rot, _ = rotate_points_image_plane(cgroup[0], extra, angle)
+        return [cam_rot], [rot], coords_rot, extra_rot
 
 
     def _sample_memory_frame_idx(self, coords_full, vis_full, n_avail, exclude=None):
@@ -1718,14 +1771,42 @@ class PosetailDataset(Dataset):
             w[exclude[keep]] = 1e-6               # de-emphasize the clip's own frames
         return torch.multinomial(w, M, replacement=False)
 
+    @staticmethod
+    def _memory_tubelets(keep, n_img):
+        """Pair each remembered frame with an adjacent one -> ([(lo, hi)], mem_slot).
+
+        Each remembered frame is encoded as a real 2-frame TUBELET, since that is what the
+        video backbone's tubelet_size=2 patch embedding expects; a duplicated still is out
+        of distribution against real motion. The partner direction is random because at
+        inference the remembered frame lands wherever it falls in the aligned tubelet grid
+        -- second as often as first -- so always pairing forward would train one parity and
+        infer with both. The pair stays in chronological order (a reversed pair is its own
+        distribution shift), and mem_slot says which half holds the points' frame.
+        """
+        pairs, slots = [], []
+        for f in keep:
+            opts = ([f + 1] if f + 1 < n_img else []) + ([f - 1] if f - 1 >= 0 else [])
+            g = int(np.random.choice(opts)) if opts else f
+            pairs.append((f, g) if g > f else (g, f))
+            slots.append(0 if g > f else 1)
+        return pairs, torch.tensor(slots, dtype=torch.long)              # (M,)
+
     def _memory_camera(self, cam, coords_f, size):
-        """Square crop of one camera around the points at ONE frame, resized to size x size.
+        """Square crop of one camera around the 3D points at ONE frame, resized to size x size.
 
         Returns (cam_cropped, crop_box) or (None, None) when the points do not project into
-        this camera at that frame. Square + fixed output size is what lets memory frames
-        from different parts of the video stack into a single tensor.
+        this camera at that frame.
         """
         p2d = project_points_torch([cam], coords_f[None])[0, 0]          # (n_kpts, 2)
+        return self._memory_camera_p2d(cam, p2d, size)
+
+    def _memory_camera_p2d(self, cam, p2d, size):
+        """Square crop around PIXEL positions at one frame, resized to size x size.
+
+        Square + fixed output size is what lets memory frames from different parts of the
+        video stack into a single tensor. Native-2D trials have pixel tracks and no world
+        coordinates, so they enter here directly rather than through a projection.
+        """
         good = torch.isfinite(p2d).all(dim=-1)
         if not bool(good.any()):
             return None, None

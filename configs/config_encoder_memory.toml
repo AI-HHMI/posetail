@@ -19,11 +19,18 @@ split_dir = 'train'
 # M=8 must be COMMON, not 1-in-7: the previous [2, 8] meant we evaluated an M=8 curve the
 # model had barely trained.
 memory_num_context = [2, 16]
-memory_prob = 0.6
+# 0.4 -> 0.8, leaving 20% of samples memory-free so the M=0 regime still gets gradient
+# (inference also starts every track with only the anchor entry).
+# NOTE this is a bigger jump than it looks: native-2D trials used to carry no memory at
+# all, so the previous 0.6 applied to only ~10 of 13 train datasets. Now every dataset is
+# memory-capable, so 0.8 really is 80% of samples, against an effective ~46% before.
+memory_prob = 0.8
 # memory-only queries: withhold the position of some points entirely so the model has to
-# find them from memory. Fires only on items that carry memory frames. At the old
-# 0.4 x 0.3 x 0.5 only ~6% of point-predictions carried the memory-only task, which starts
-# from random init; 0.6 x 0.5 x 0.5 makes it ~15%.
+# find them from memory. Fires only on items that carry memory frames. This is the task
+# that starts from random init and it was the most starved: at the original
+# 0.4 x 0.3 x 0.5 only ~6% of point-predictions carried it, and 0.8 x 0.5 x 0.5 makes it
+# ~20%. Held at 0.5 x 0.5 rather than raised further because every sample also needs
+# anchored points -- the scene scale and the crop are both derived from the query set.
 memory_only_prob = 0.5
 memory_only_kpt_prob = 0.5
 n_frames = 24
