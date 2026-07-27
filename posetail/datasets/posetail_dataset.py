@@ -1387,7 +1387,13 @@ class PosetailDataset(Dataset):
             mem_valid = torch.stack(valid_list, dim=1)                    # (cams, M, n)
             mem_depth = torch.stack(depth_list, dim=1)                    # (cams, M, n)
             mem_intrinsics = torch.stack(intr_list, dim=1)                # (cams, M, 4)
-            mem_p2d = torch.nan_to_num(mem_p2d, nan=0.0, posinf=0.0, neginf=0.0)
+            # mem_p2d keeps its NaNs. Zeroing them here destroyed the only signal that says
+            # "this point has no position at this frame", making it indistinguishable from a
+            # real observation at the crop corner -- and it was only ever needed to keep NaN
+            # out of sample_patches' grid_sample. That is now handled at the call site, so the
+            # information survives for everything else. Note an occluded point still HAS a
+            # valid projection, and an out-of-frame one is simply outside [-1, 1]; neither is
+            # a missing position.
             mem_depth = torch.nan_to_num(mem_depth, nan=0.0, posinf=0.0, neginf=0.0)
             mem_views = [v for v in mem_views]                            # list per camera
 

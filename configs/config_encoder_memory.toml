@@ -139,6 +139,14 @@ memory_encoder_grad = false
 memory_token_sample = true
 memory_spatial_bias = true
 
+# Anchor a memory-only point's query ray on where it last was, crop-relative, instead of the
+# position-free image centre. Each memory crop follows its subject, so a crop-relative
+# coordinate is SUBJECT-relative -- comparable to the clip's own crop, and the invariance that
+# lets an annotation transfer between animals. One memory FRAME per point, shared across
+# cameras: per-camera selection would mix instants, and the back-projected rays would not
+# intersect, so triangulation and camera self-attention would both see inconsistent geometry.
+memory_crop_anchor = true
+
 # processing
 stride_length = 24
 stride_overlap = 4

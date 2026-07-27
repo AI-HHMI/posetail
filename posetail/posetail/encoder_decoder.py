@@ -1725,17 +1725,28 @@ class MemoryEncoder(nn.Module):
         N = p2d.shape[1]
 
         # local appearance: the patch at the point's pixel in this remembered frame
-        # (sample_patches takes a (B, T, C, H, W) clip; each memory frame is a 1-frame clip)
-        patches = sample_patches(views[:, None], p2d,
+        # (sample_patches takes a (B, T, C, H, W) clip; each memory frame is a 1-frame clip).
+        # grid_sample is the ONE consumer that cannot see a NaN -- it would return NaN patches
+        # and NaN gradients -- so sanitize here rather than upstream, which is what used to
+        # destroy "this point has no position" for every other consumer.
+        patches = sample_patches(views[:, None],
+                                 torch.nan_to_num(p2d, nan=0.0, posinf=0.0, neginf=0.0),
                                  torch.zeros(BM, N, dtype=torch.long, device=p2d.device),
                                  self.patch_size)                    # [B*M, N, C, P, P]
         embed_patch = rearrange(
             self.patch_processor(rearrange(patches, 'bm n c p q -> (bm n) c p q')),
             '(bm n) d -> bm n d', bm=BM, n=N)
 
-        # where in this frame the point sits -- the term that carries most of the identity
+        # Where in this frame the point sits -- the term that carries most of the identity.
+        # Crop-relative, and because each memory crop follows its subject that makes it a
+        # SUBJECT-relative coordinate: a rat's nose sits at much the same place in every tight
+        # crop of a rat, whatever its size or where it stands.
+        # `pp_raw` keeps NaN where the point has no position at all (the anchor reads it);
+        # the embedding takes the sanitized copy. An out-of-frame point is NOT missing -- it
+        # simply lands outside [-1, 1], which the Fourier encoding handles.
         size = torch.tensor([W, H], dtype=p2d.dtype, device=p2d.device)
-        pp = torch.nan_to_num((p2d / size) * 2.0 - 1.0, nan=0.0, posinf=0.0, neginf=0.0)
+        pp_raw = (p2d / size) * 2.0 - 1.0
+        pp = torch.nan_to_num(pp_raw, nan=0.0, posinf=0.0, neginf=0.0)
         embed_pos = self.linear_pos(self._fourier(pp, self.max_freq))
 
         # how far away it was; absent in 2D-mode (no world coords -> no meaningful scale)
@@ -1774,7 +1785,9 @@ class MemoryEncoder(nn.Module):
         terms = torch.stack(term_list, dim=-2)                       # [B*M, N, n_terms, dim]
         w = self.query_gate(rearrange(terms, 'bm n t d -> bm n (t d)'))
         fused = einsum(w, terms, 'bm n t, bm n t d -> bm n d')
-        return self.query_mlp(self.query_norm(fused)), pp
+        # pp for the read's spatial bias (sanitized); pp_raw for the anchor, which needs to
+        # know which entries have no position at all.
+        return self.query_mlp(self.query_norm(fused)), pp, pp_raw
 
     def _entries(self, v, tokens, p, ok, dp, it):
         """Per-point entries for ONE camera's memory frames, chunked over the point axis.
@@ -1784,12 +1797,13 @@ class MemoryEncoder(nn.Module):
         """
         N = p.shape[1]
         step = self.kpt_chunk if (self.kpt_chunk and N > self.kpt_chunk) else N
-        out = []
+        out, pos = [], []
         for k0 in range(0, N, step):
             k1 = min(k0 + step, N)
-            x, pp = self._query(v, p[:, k0:k1], ok[:, k0:k1],
-                                depth=(dp[:, k0:k1] if dp is not None else None),
-                                intrinsics=it, tokens=tokens)         # [(B M), n, dim]
+            x, pp, pp_raw = self._query(v, p[:, k0:k1], ok[:, k0:k1],
+                                        depth=(dp[:, k0:k1] if dp is not None else None),
+                                        intrinsics=it, tokens=tokens)  # [(B M), n, dim]
+            pos.append(pp_raw)
             # Built per chunk, never for all N at once: at 70k points the full-N bias would
             # be ~46 GB. [(B M), 1, n, n_tok] -- the head axis broadcasts.
             bias = (self._spatial_prior(tokens.shape[1], pp, ok[:, k0:k1], x.dtype)
@@ -1798,7 +1812,8 @@ class MemoryEncoder(nn.Module):
                 x = x + blk['attn'](blk['norm_q'](x), tokens, attn_mask=bias)
                 x = x + blk['mlp'](blk['norm_m'](x))
             out.append(x)
-        return out[0] if len(out) == 1 else torch.cat(out, dim=1)
+        cat = (lambda xs: xs[0] if len(xs) == 1 else torch.cat(xs, dim=1))
+        return cat(out), cat(pos)
 
     def forward(self, mem_views, mem_p2d, mem_valid, mem_tokens, mem_slot=None,
                 mem_depth=None, mem_intrinsics=None):
@@ -1826,7 +1841,7 @@ class MemoryEncoder(nn.Module):
             mem_slot = torch.zeros(B, M, dtype=torch.long, device=mem_p2d.device)
         sel = rearrange(mem_slot, 'b m -> (b m)')
 
-        per_cam = []
+        per_cam, per_cam_pos = [], []
         for c in range(n_cams):
             # (B M, 2, C, H, W) -> the remembered frame only, for the patch/appearance term
             vv = rearrange(mem_views[c], 'b m s c h w -> (b m) s c h w')
@@ -1837,8 +1852,11 @@ class MemoryEncoder(nn.Module):
             dp = rearrange(mem_depth[c], 'b m n -> (b m) n') if mem_depth is not None else None
             it = (rearrange(mem_intrinsics[c], 'b m r -> (b m) r')
                   if mem_intrinsics is not None else None)
-            per_cam.append(self._entries(v, tokens, p, ok, dp, it))
+            x, pos = self._entries(v, tokens, p, ok, dp, it)
+            per_cam.append(x)
+            per_cam_pos.append(pos)
         mem_cam = torch.stack(per_cam)                               # [cams,(B M),N,dim]
+        mem_pos = torch.stack(per_cam_pos)                           # [cams,(B M),N,2]
 
         # One entry per (frame, camera): no cross-camera pooling. Averaging the views was
         # measured to cost most of the per-point structure (rank 8.8 -> 3.1); the decoder's
@@ -1846,8 +1864,10 @@ class MemoryEncoder(nn.Module):
         vis = rearrange(mem_valid, 'cams b m n -> cams (b m) n')
         mem_cam = torch.where(vis[..., None], mem_cam,
                               self.null_entry.to(mem_cam.dtype).expand_as(mem_cam))
-        # frame-major, camera-minor -- downstream slices k frames as [:, :, :k*n_cams]
-        return rearrange(mem_cam, 'cams (b m) n d -> b n (m cams) d', b=B, m=M)
+        # frame-major, camera-minor -- downstream slices k frames as [:, :, :k*n_cams]. The
+        # positions ride on the SAME entry axis so that slicing applies to both.
+        return (rearrange(mem_cam, 'cams (b m) n d -> b n (m cams) d', b=B, m=M),
+                rearrange(mem_pos, 'cams (b m) n r -> b n (m cams) r', b=B, m=M))
 
 
 class MemoryQueryEncoder(nn.Module):
