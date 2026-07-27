@@ -1436,6 +1436,7 @@ def run_inference(
     memory_context=8,
     memory_score_thresh=0.5,
     use_memory=True,
+    max_subjects=None,
 ):
     """Run inference on one trial with an already-loaded model.
 
@@ -1450,6 +1451,8 @@ def run_inference(
 
     max_points (per subject): random-subsample each subject's tracked points to this cap
     (seeded by `seed`, shared with camera subsampling) -- bounds memory/time on dense sets.
+    max_subjects (per_subject only): track at most this many subjects. The windowed loop runs
+    once per subject, so this is the dominant cost lever on crowded trials.
     See load_trial for details.
     """
     if device is None:
@@ -1512,7 +1515,16 @@ def run_inference(
 
     if per_subject:
         all_subject_outputs = []
-        for subj_idx, subj_queries in enumerate(per_subject_queries):
+        # Per-subject tracking runs the whole windowed loop once per subject, so subject count
+        # is the dominant cost on crowded trials (rat-city has 12). max_subjects caps it for
+        # experiments that want breadth over completeness; None tracks every subject.
+        subj_order = range(len(per_subject_queries))
+        if max_subjects is not None and len(per_subject_queries) > max_subjects:
+            subj_order = list(subj_order)[:max_subjects]
+            print(f'Tracking only the first {max_subjects} of '
+                  f'{len(per_subject_queries)} subjects (max_subjects)')
+        for subj_idx in subj_order:
+            subj_queries = per_subject_queries[subj_idx]
             if subj_queries.shape[0] == 0:
                 print(f'Skipping subject {subj_idx}: no valid query points')
                 continue
