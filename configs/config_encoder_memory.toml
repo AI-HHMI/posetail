@@ -221,7 +221,7 @@ finetune = true
 # Warm start from run 3gvz9mto. The memory modules are absent from this checkpoint and load
 # fresh under strict=False; their output projections are zero-init, so the model starts out
 # predicting exactly as this checkpoint does and learns to use memory from there.
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260724_111406-3gvz9mto/files/checkpoints/checkpoint_00102420.pth'
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260724_111406-3gvz9mto/files/checkpoints/checkpoint_00532584.pth'
 
 
 
