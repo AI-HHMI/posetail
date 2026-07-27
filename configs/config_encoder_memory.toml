@@ -33,6 +33,12 @@ memory_prob = 0.8
 # anchored points -- the scene scale and the crop are both derived from the query set.
 memory_only_prob = 0.5
 memory_only_kpt_prob = 0.5
+# How often a point's memory comes from ANOTHER individual's matching keypoint, instead of
+# its own history. This is the only thing that trains annotation transfer -- "label one rat,
+# box a second, get its keypoints" -- which is cross-INSTANCE, where every memory example so
+# far has been cross-TIME on the same animal. Needs a multi-subject trial; single-subject
+# datasets ignore it.
+memory_cross_subject_prob = 0.25
 n_frames = 24
 min_res = 256
 max_res = 256

@@ -529,6 +529,11 @@ class PosetailDataset(Dataset):
         # sampling is abandoned for single-subject. 48 = 3 VJEPA patches; below ~1 patch an
         # entry cannot encode which point it is.
         self.min_subject_px = config.dataset[split].get('min_subject_px', 48)
+        # How often a point's memory comes from ANOTHER individual's matching keypoint. This
+        # is the only thing that trains annotation transfer ("label one rat, box another");
+        # everything else in memory is cross-time on the same animal. Needs >= 2 subjects.
+        self.memory_cross_subject_prob = config.dataset[split].get(
+            'memory_cross_subject_prob', 0.0)
 
         # for sampling cameras, keypoints
         self.cams_to_sample = format_sample_input(config.dataset[split].get('cams_to_sample', None))
@@ -759,16 +764,35 @@ class PosetailDataset(Dataset):
                         < self.min_subject_px:
                     force_single = True
 
+        cross_subject = False
         if force_single or np.random.random() < 0.5:
-            ix_sample = np.random.randint(coords.shape[0])
+            n_subj = coords.shape[0]
+            ix_sample = np.random.randint(n_subj)
+            # CROSS-SUBJECT memory: draw the remembered observations from a DIFFERENT
+            # individual's corresponding keypoint. Keypoint index k means the same thing on
+            # every subject (same skeleton, aligned indices), so this is a subject-axis swap
+            # and nothing else. It exists because the product asks for something training
+            # never did: "here is keypoint k on rat A, find keypoint k on rat B" -- a
+            # cross-INSTANCE generalization, where every memory-only example so far has been
+            # cross-TIME on the same animal.
+            #
+            # Only the memory side moves: `coords` (and the clip, the crop, the query) stay
+            # with ix_sample, while coords_full/vis_full come from the donor. Swapping here,
+            # before the keypoint filters, means the donor track rides through the SAME
+            # keypoint selection as the target -- which is what keeps index k aligned.
+            donor = ix_sample
+            if (coords_full is not None and n_subj > 1
+                    and np.random.random() < self.memory_cross_subject_prob):
+                donor = int(np.random.choice([s for s in range(n_subj) if s != ix_sample]))
+                cross_subject = True
             coords = coords[ix_sample, None]
             if vis is not None:
                 vis = vis[ix_sample, None]
                 vis_2d = vis_2d[ix_sample, None]
             if coords_full is not None:
-                coords_full = coords_full[ix_sample, None]
+                coords_full = coords_full[donor, None]
                 if vis_full is not None:
-                    vis_full = vis_full[ix_sample, None]
+                    vis_full = vis_full[donor, None]
 
         mem_extra = None
         mem_has_vis = False
@@ -1397,6 +1421,8 @@ class PosetailDataset(Dataset):
             mem_depth = torch.nan_to_num(mem_depth, nan=0.0, posinf=0.0, neginf=0.0)
             mem_views = [v for v in mem_views]                            # list per camera
 
+        # dict copy so the flag rides in sample_info without mutating the metadata row
+        row = {**dict(row), 'cross_subject': bool(cross_subject)}
         return (views, coords, vis, fnums, cgroup, row, query_times, vis_2d, p2d,
                 query_occlusion, mem_views, mem_p2d, mem_valid, memory_only,
                 mem_depth, mem_intrinsics, mem_slot)
