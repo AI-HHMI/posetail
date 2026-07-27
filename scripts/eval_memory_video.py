@@ -86,10 +86,19 @@ def parse_args():
 
 
 def arms(args):
-    """(name, use_memory, per_subject). Memory off first: it defines the occlusion event set."""
-    out = [('mem_off', False, True), ('mem_on', True, True)]
+    """(name, use_memory, per_subject, group).
+
+    Pairing only holds WITHIN a group: `per_subject` changes which points are tracked at all
+    (per-subject concatenates each subject's valid mask, the flat path does not), so the two
+    settings return different point sets and cannot be differenced point-by-point. Each group
+    therefore carries its own memory-off baseline, which defines that group's elapsed-time axis
+    and occlusion event set.
+    """
+    out = [('mem_off', False, True, 'per_subject'),
+           ('mem_on', True, True, 'per_subject')]
     if args.crop_arm:
-        out += [('mem_on_nocrop', True, False)]
+        out += [('mem_off_nocrop', False, False, 'joint'),
+                ('mem_on_nocrop', True, False, 'joint')]
     return out
 
 
@@ -157,8 +166,9 @@ def main():
             print(f'[skip] {name}: {spec["path"]} not found')
             continue
         print(f'\n=== {name} ===')
-        preds = {}
-        for arm, use_memory, per_subject in arms(args):
+        preds, groups = {}, {}
+        for arm, use_memory, per_subject, group in arms(args):
+            groups[arm] = group
             cache = os.path.join(args.out, f'{name}.{arm}.npz')
             if os.path.exists(cache) and not args.force:
                 print(f'  [{arm}] cached')
@@ -178,29 +188,36 @@ def main():
             if device is None or torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        if 'mem_off' not in preds:
+        rows, n_occ = {}, {}
+        for group in sorted(set(groups.values())):
+            members = [a for a in preds if groups[a] == group]
+            base_name = f'mem_off{"" if group == "per_subject" else "_nocrop"}'
+            if base_name not in members:
+                continue
+            # Within a group the baseline defines the elapsed-time axis and the occlusion event
+            # set, so its members are scored on identical points.
+            base = preds[base_name]
+            elapsed, occ = elapsed_frames(base), occluded_mask(base)
+            for arm in members:
+                err = per_point_error(preds[arm])
+                if err.shape[1] != occ.shape[0]:
+                    print(f'  [warn] {arm}: {err.shape[1]} points vs baseline {occ.shape[0]}; '
+                          'skipping (arms in a group must share a point set)')
+                    continue
+                e = elapsed[:err.shape[0], :err.shape[1]] if elapsed is not None else None
+                rows[arm] = {'group': group,
+                             'all_points': summarize(err, e),
+                             'through_occlusion': summarize(err, e, keep=occ)}
+            n_occ[group] = int(occ.sum())
+        if not rows:
             continue
-        # The baseline arm defines both the elapsed-time axis and the occlusion event set, so
-        # every arm is scored on the same points.
-        base = preds['mem_off']
-        elapsed = elapsed_frames(base)
-        occ = occluded_mask(base)
-        rows = {}
-        for arm, out in preds.items():
-            err = per_point_error(out)
-            e = elapsed
-            if e is not None and e.shape != err.shape:
-                e = e[:err.shape[0], :err.shape[1]]
-            rows[arm] = {
-                'all_points': summarize(err, e),
-                'through_occlusion': summarize(err, e, keep=occ[:err.shape[1]]),
-            }
         summary[name] = {'has_vis_gt': spec['has_vis_gt'], 'arms': rows,
-                         'n_occluded_points': int(occ.sum())}
+                         'n_occluded_points': n_occ}
 
-        print(f'  {"arm":14s} ' + ' '.join(f'{k:>12}' for k in rows['mem_off']['all_points']))
+        first = next(iter(rows.values()))['all_points']
+        print(f'  {"arm":16s} ' + ' '.join(f'{k:>12}' for k in first))
         for arm, r in rows.items():
-            print(f'  {arm:14s} ' + ' '.join(
+            print(f'  {arm:16s} ' + ' '.join(
                 f'{v:12.4f}' if isinstance(v, float) else f'{v:12d}'
                 for v in r['all_points'].values()))
 
