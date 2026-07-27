@@ -248,7 +248,11 @@ def main():
             mo_mask = getattr(batch, 'memory_only', None)
             if mo_mask is not None:
                 mo_mask = mo_mask.to(device)[0]
-            cube_scale = _eval_cube_scale(cgroup, query_coords)
+            # A native-2D trial's `coords` ARE pixels (no world coords behind them), unlike a
+            # 3D trial run in 2D mode, which still carries both. get_camera_scale would be
+            # meaningless on pixels, and delta_x/jaccard are already in pixel units there.
+            is_native_2d = coords.shape[-1] == 2
+            cube_scale = None if is_native_2d else _eval_cube_scale(cgroup, query_coords)
 
             base_kwargs = dict(views=views, query_times=query_times, camera_group=cgroup)
             if getattr(model, 'occlusion_embedding', False):
@@ -267,7 +271,14 @@ def main():
                     coords_in, mem = qc, bank[:, :, :k * n_cams]
 
                 out = model(coords=coords_in, memory_bank=mem, **base_kwargs)
-                cp, vp = out['coords_pred'], out['vis_pred']
+                # Native-2D trials have pixel ground truth and no world coords, so they must
+                # be scored against the 2D head. They used to be unreachable here (they
+                # carried no memory at all and were skipped); now that they do carry memory,
+                # comparing coords_pred against them is a 3-vs-2 shape error.
+                if is_native_2d:
+                    cp, vp = out['2d_pred'][0], out['vis_pred']
+                else:
+                    cp, vp = out['coords_pred'], out['vis_pred']
 
                 if mo_mask is None or not bool(mo_mask.any()):
                     m = metrics_for(cp, coords, vp, vis, cube_scale)
