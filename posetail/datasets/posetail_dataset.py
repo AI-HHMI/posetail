@@ -171,6 +171,21 @@ def rotate_camera_image_plane_3d(cam, angle_deg):
     return cam_rot, (M_2x3, (cw_i, ch_i))
 
 
+def _pad_to(img, size):
+    """Zero-pad an (H, W, C) image out to (size, size), bottom and right.
+
+    Same convention as utils.PadToSize, which does this for the clip on the GPU. Memory
+    frames need it in the dataset instead: each has its own crop, so their aspects differ
+    and they must reach a common canvas before they can be stacked.
+    """
+    h, w = img.shape[:2]
+    if h == size and w == size:
+        return img
+    out = np.zeros((size, size, img.shape[2]), dtype=img.dtype)
+    out[:min(h, size), :min(w, size)] = img[:size, :size]
+    return out
+
+
 def load_image(cam_img_path, crop_coords=None, target_size=None, rotation=None):
     img = cv2.imread(cam_img_path)
     if img is None:
@@ -510,6 +525,10 @@ class PosetailDataset(Dataset):
 
         self.crop_to_points = config.dataset[split].get('crop_to_points', True)
         self.min_crop_dim = config.dataset[split].get('min_crop_dim', 64)
+        # Floor on how many pixels a subject may span on the model canvas before multi-subject
+        # sampling is abandoned for single-subject. 48 = 3 VJEPA patches; below ~1 patch an
+        # entry cannot encode which point it is.
+        self.min_subject_px = config.dataset[split].get('min_subject_px', 48)
 
         # for sampling cameras, keypoints
         self.cams_to_sample = format_sample_input(config.dataset[split].get('cams_to_sample', None))
@@ -716,8 +735,31 @@ class PosetailDataset(Dataset):
         should_augment = np.random.random() < self.should_augment_prob * intensity
         should_grayscale = self.split == 'train' and np.random.random() < 0.2
 
-        # sample a random subject with 0.5 probability if using a multi-subject dataset
-        if np.random.random() < 0.5:
+        # Sample a random subject with 0.5 probability -- but FORCE it when cropping around
+        # every subject would shrink each one below a few VJEPA patches. Measured on real
+        # trials, the joint crop makes a rat-city animal 13px and a branson-fly one 24px
+        # against 256px in its own crop; at patch_size=16 that is smaller than a single patch,
+        # so a memory entry cannot encode which point it is. It is also off-distribution for
+        # the deployment case, where the user boxes one animal. Single-subject datasets have a
+        # ratio of 1.0 and are unaffected.
+        force_single = False
+        if coords.shape[0] > 1:
+            fin = torch.isfinite(coords).all(dim=-1)                    # (S, T, K)
+            spans = [float(torch.nan_to_num(
+                        coords[s][fin[s]].max(0).values - coords[s][fin[s]].min(0).values,
+                        nan=0.0).max())
+                     for s in range(coords.shape[0]) if bool(fin[s].any())]
+            joint = coords[fin]
+            if spans and joint.numel():
+                one = float(np.median(spans))
+                allx = float(torch.nan_to_num(
+                    joint.max(0).values - joint.min(0).values, nan=0.0).max())
+                # subject pixels on the model canvas if the crop spanned every subject
+                if allx > 0 and (self.max_res if self.max_res != -1 else 256) * one / allx \
+                        < self.min_subject_px:
+                    force_single = True
+
+        if force_single or np.random.random() < 0.5:
             ix_sample = np.random.randint(coords.shape[0])
             coords = coords[ix_sample, None]
             if vis is not None:
@@ -1220,6 +1262,14 @@ class PosetailDataset(Dataset):
                         if should_grayscale:
                             mem_imgs = [np.stack([cv2.cvtColor(im, cv2.COLOR_RGB2GRAY)] * 3,
                                                  axis=-1) for im in mem_imgs]
+                        # Each memory frame has its OWN crop, and since the crop rule no longer
+                        # forces a square box those crops can differ in aspect -- so the
+                        # resized frames differ in (H, W) and np.array would build an object
+                        # array instead of stacking. Pad each to the common mem_size canvas,
+                        # bottom/right, which is what PadToSize does for the clip; just
+                        # earlier, because memory has one crop per frame where the clip has
+                        # one for all of them.
+                        mem_imgs = [_pad_to(im, mem_size) for im in mem_imgs]
                         # (2M, H, W, C) -> (M, 2, H, W, C): the tubelet axis. Kept uint8;
                         # the model normalizes. At M=16 x 2 frames x 8 cams a float32 copy
                         # is ~200 MB per sample through the collate and over PCIe, for
@@ -1389,30 +1439,7 @@ class PosetailDataset(Dataset):
         coords stay aligned with the cropped image.
         """
         size = cgroup[0]['size']  # one camera
-        pflat = coords.reshape(-1, 2)
-        good = torch.all(torch.isfinite(pflat), dim=1)
-        pflat = pflat[good]
-        low = torch.clamp(torch.min(pflat, dim=0).values - 20, torch.tensor([0, 0]), size).to(torch.int32)
-        high = torch.clamp(torch.max(pflat, dim=0).values + 20, torch.tensor([0, 0]), size).to(torch.int32)
-
-        current_width = high[0] - low[0]
-        current_height = high[1] - low[1]
-
-        base = max(self.min_crop_dim, int(current_width), int(current_height))
-        min_dim_x = min(base, int(size[0]))
-        min_dim_y = min(base, int(size[1]))
-
-        if current_width < min_dim_x:
-            center_x = (low[0] + high[0]) // 2
-            low[0] = torch.clamp(center_x - min_dim_x // 2, 0, size[0] - min_dim_x)
-            high[0] = low[0] + min_dim_x
-
-        if current_height < min_dim_y:
-            center_y = (low[1] + high[1]) // 2
-            low[1] = torch.clamp(center_y - min_dim_y // 2, 0, size[1] - min_dim_y)
-            high[1] = low[1] + min_dim_y
-
-        crop = torch.cat([low, high])
+        crop = self.crop_box_for_points(coords, size)
         x1, y1, x2, y2 = crop
 
         # Match the 3D convention (crop_cgroup_to_points): only `offset` tracks the
@@ -1429,44 +1456,57 @@ class PosetailDataset(Dataset):
 
         return cgroup_cropped, [crop], coords_shifted
 
+    def crop_box_for_points(self, p2d, size):
+        """Crop box around 2D points -> int32 [x1, y1, x2, y2], or None if nothing is finite.
+
+        THE one crop rule. The clip and the memory frames must build their boxes identically:
+        both express a point's position as a fraction of its own crop, and the memory entry's
+        position is only comparable to the clip's if the two boxes were derived the same way.
+        They were not -- memory used to force a square side capped at the frame's SHORTER
+        dimension, so on a wide subject set it cropped away content the clip kept, and the
+        subject sat centred in the memory frame but off-centre in the zero-padded clip frame.
+        """
+        pflat = p2d.reshape(-1, 2)
+        pflat = pflat[torch.all(torch.isfinite(pflat), dim=1)]
+        if pflat.shape[0] == 0:
+            return None
+        size = size.to(torch.float32)
+        zero = torch.zeros(2)
+        low = torch.clamp(torch.min(pflat, dim=0).values - 20, zero, size).to(torch.int32)
+        high = torch.clamp(torch.max(pflat, dim=0).values + 20, zero, size).to(torch.int32)
+
+        current_width = high[0] - low[0]
+        current_height = high[1] - low[1]
+
+        # Each axis is capped at the image dimension so the crop never
+        # exceeds image bounds. Without the cap, a wide bbox (e.g. 700 px
+        # on a 540-tall image) forces min_dim=700 > size[1]=540, making
+        # torch.clamp(x, 0, size[1]-min_dim) return a negative max value
+        # and producing a negative cam['offset'] that breaks project_cam.
+        base = max(self.min_crop_dim, int(current_width), int(current_height))
+        min_dim_x = min(base, int(size[0]))
+        min_dim_y = min(base, int(size[1]))
+
+        if current_width < min_dim_x:
+            center_x = (low[0] + high[0]) // 2
+            low[0] = torch.clamp(center_x - min_dim_x // 2, 0, int(size[0]) - min_dim_x)
+            high[0] = low[0] + min_dim_x
+
+        if current_height < min_dim_y:
+            center_y = (low[1] + high[1]) // 2
+            low[1] = torch.clamp(center_y - min_dim_y // 2, 0, int(size[1]) - min_dim_y)
+            high[1] = low[1] + min_dim_y
+
+        return torch.cat([low, high])
+
     def crop_cgroup_to_points(self, cgroup, coords):
-            
+
         # compute crops locations
         p2d = project_points_torch(cgroup, coords)
         crops = []
 
         for cnum in range(p2d.shape[0]):
-            
-            size = cgroup[cnum]['size']
-            pflat = p2d[cnum].reshape(-1, 2)
-            good = torch.all(torch.isfinite(pflat), dim=1)
-            pflat = pflat[good]
-            low = torch.clamp(torch.min(pflat, dim=0).values - 20, torch.tensor([0,0]), size).to(torch.int32)
-            high = torch.clamp(torch.max(pflat, dim=0).values + 20, torch.tensor([0,0]), size).to(torch.int32)
-
-            current_width = high[0] - low[0]
-            current_height = high[1] - low[1]
-
-            # Each axis is capped at the image dimension so the crop never
-            # exceeds image bounds. Without the cap, a wide bbox (e.g. 700 px
-            # on a 540-tall image) forces min_dim=700 > size[1]=540, making
-            # torch.clamp(x, 0, size[1]-min_dim) return a negative max value
-            # and producing a negative cam['offset'] that breaks project_cam.
-            base = max(self.min_crop_dim, int(current_width), int(current_height))
-            min_dim_x = min(base, int(size[0]))
-            min_dim_y = min(base, int(size[1]))
-
-            if current_width < min_dim_x:
-                center_x = (low[0] + high[0]) // 2
-                low[0] = torch.clamp(center_x - min_dim_x // 2, 0, size[0] - min_dim_x)
-                high[0] = low[0] + min_dim_x
-
-            if current_height < min_dim_y:
-                center_y = (low[1] + high[1]) // 2
-                low[1] = torch.clamp(center_y - min_dim_y // 2, 0, size[1] - min_dim_y)
-                high[1] = low[1] + min_dim_y
-
-            crops.append(torch.cat([low, high]))
+            crops.append(self.crop_box_for_points(p2d[cnum], cgroup[cnum]['size']))
 
         # camera crops
         camera_group_cropped = []
@@ -1792,7 +1832,7 @@ class PosetailDataset(Dataset):
         return pairs, torch.tensor(slots, dtype=torch.long)              # (M,)
 
     def _memory_camera(self, cam, coords_f, size):
-        """Square crop of one camera around the 3D points at ONE frame, resized to size x size.
+        """Crop of one camera around the 3D points at ONE frame, for the memory bank.
 
         Returns (cam_cropped, crop_box) or (None, None) when the points do not project into
         this camera at that frame.
@@ -1801,31 +1841,38 @@ class PosetailDataset(Dataset):
         return self._memory_camera_p2d(cam, p2d, size)
 
     def _memory_camera_p2d(self, cam, p2d, size):
-        """Square crop around PIXEL positions at one frame, resized to size x size.
+        """Crop around PIXEL positions at one frame, for the memory bank.
 
-        Square + fixed output size is what lets memory frames from different parts of the
-        video stack into a single tensor. Native-2D trials have pixel tracks and no world
-        coordinates, so they enter here directly rather than through a projection.
+        Uses `crop_box_for_points` -- the SAME rule as the clip crop. A memory entry's position
+        is stored as a fraction of its own crop, and that only means the same thing as the
+        clip's if both boxes were built the same way. The old rule here forced a square side
+        capped at the frame's SHORTER dimension, which on a wide subject set both cropped away
+        content the clip kept and left the subject centred here but off-centre in the
+        zero-padded clip frame.
+
+        The scale is uniform (`size / max(box)`), mirroring `resize_camera_group`; the box may
+        be non-square, so the frames are padded to `size x size` at load time (see the loader)
+        to keep memory frames from different times stackable.
+
+        Native-2D trials have pixel tracks and no world coordinates, so they enter here
+        directly rather than through a projection.
         """
-        good = torch.isfinite(p2d).all(dim=-1)
-        if not bool(good.any()):
+        if not bool(torch.isfinite(p2d).all(dim=-1).any()):
             return None, None
-        p = p2d[good]
-        cam_size = cam['size'].to(torch.float32)
-        lo = torch.clamp(p.min(dim=0).values - 20, torch.zeros(2), cam_size)
-        hi = torch.clamp(p.max(dim=0).values + 20, torch.zeros(2), cam_size)
-        side = float(torch.clamp(torch.max(hi - lo), min=float(self.min_crop_dim)))
-        side = min(side, float(cam_size.min()))                          # must fit the frame
-        centre = (lo + hi) / 2
-        x1 = float(torch.clamp(centre[0] - side / 2, 0, float(cam_size[0]) - side))
-        y1 = float(torch.clamp(centre[1] - side / 2, 0, float(cam_size[1]) - side))
-        crop = torch.tensor([int(x1), int(y1), int(x1 + side), int(y1 + side)],
-                            dtype=torch.int32)
+        crop = self.crop_box_for_points(p2d, cam['size'])
+        if crop is None:
+            return None, None
 
-        scale = float(size) / float(crop[2] - crop[0])
+        box_w, box_h = int(crop[2] - crop[0]), int(crop[3] - crop[1])
+        scale = float(size) / float(max(box_w, box_h))
         cam_m = dict(cam)
         cam_m['offset'] = (cam['offset'] + crop[:2].to(cam['offset'].dtype)) * scale
-        cam_m['size'] = torch.tensor([size, size], dtype=torch.int32)
+        # CONTENT size, not the padded canvas -- exactly resize_camera_group's convention. The
+        # loader pads the frame out to size x size afterwards, and both QueryEncoder and
+        # MemoryEncoder._query normalize positions by the PADDED canvas (view.shape), so a
+        # memory position and a clip position are then expressed in the same units.
+        cam_m['size'] = torch.tensor([round(box_w * scale), round(box_h * scale)],
+                                     dtype=torch.int32)
         cam_m['mat'] = cam['mat'] * scale
         cam_m['mat'][2, 2] = 1
         return cam_m, crop
