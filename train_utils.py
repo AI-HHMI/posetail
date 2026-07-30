@@ -3,6 +3,7 @@ import json
 import math
 import time
 import toml
+import tomlkit
 import torch
 import yaml
 import random
@@ -127,16 +128,19 @@ def load_config(config_path, easy = True):
 
 
 def save_config(config_path, new_config_path, extra=None):
+    # Use tomlkit so the saved file preserves the original key order, comments,
+    # and formatting rather than re-serializing from a plain dict.
+    with open(config_path, 'r') as f:
+        doc = tomlkit.load(f)
 
-    config = load_config(config_path, easy = False)
-
-    # Merge in runtime-only fields (e.g. wandb run_id/run_dir) under [wandb] so the
-    # saved config.toml records which run produced it.
     if extra:
-        config.setdefault('wandb', {}).update(extra)
+        if 'wandb' not in doc:
+            doc['wandb'] = tomlkit.table()
+        for k, v in extra.items():
+            doc['wandb'][k] = v
 
-    with open(new_config_path, 'w') as toml_file:
-        toml.dump(config, toml_file)
+    with open(new_config_path, 'w') as f:
+        f.write(tomlkit.dumps(doc))
         
         
 def write_json(json_path, results): 

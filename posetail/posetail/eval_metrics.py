@@ -44,9 +44,9 @@ def get_direct_depth_metrics(pred_cams_direct, tri_pred, rays_c, coords_true,
         if vis_true_cams is not None:
             vc = (vis_true_cams[..., 0].to(rays_c.device) > 0.5).permute(3, 0, 1, 2)
         elif cgroup is not None:
-            qflat = ct.reshape(-1, 3)
-            vc = torch.stack([is_point_visible(cam, qflat, margin=2) for cam in cgroup])
-            vc = vc.reshape(n_cams, B, T, N)
+            # keep time explicit (b,t,n,3) so per-frame (moving-cam) extrinsics align
+            # (is_point_visible returns (b,t,n) for both static and per-frame cams)
+            vc = torch.stack([is_point_visible(cam, ct, margin=2) for cam in cgroup])
         else:
             vc = finite[None].expand(n_cams, B, T, N)
         mask = vc & finite[None]

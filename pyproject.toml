@@ -13,6 +13,7 @@ dependencies = [
     "opencv-python==4.9.0.80",
     "pytorch-memlab==0.3.0",
     "toml==0.10.2",
+    "tomlkit>=0.12",
     "wandb==0.19.5",
     "wget==3.2",
     "lightning>=2.5.6,<3",

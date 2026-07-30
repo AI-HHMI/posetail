@@ -314,7 +314,10 @@ class TrackerEncoder(nn.Module):
         # assert self.n_frames == T
 
         if R == 3:
-            cube_scale = get_camera_scale(camera_group, coords)  # (n_cams, B)
+            # one query time per point -> each query point's cube_scale uses the camera at
+            # its query frame (moving cams). query_times may be None here (normalized below);
+            # get_camera_scale treats None as frame 0.
+            cube_scale = get_camera_scale(camera_group, coords, times=query_times)  # (n_cams, B)
         else:
             cube_scale = torch.ones((n_cams, B), device=device)
         if not self.per_camera_cube_scale:

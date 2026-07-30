@@ -422,7 +422,13 @@ class TotalLoss(nn.Module):
                 valid_vis = True
                 vis_true_cams = rearrange(vis_true_cams, 'b t n cams 1 -> cams b t n 1')
 
-            scale = get_camera_scale(cgroup, coords_true.reshape(B, -1, 3))  # (cams, B)
+            # trajectory point (b, t, n) is observed at frame t; pass those times so a
+            # moving camera's cube_scale is sampled per-frame (reshape order matches
+            # coords_true.reshape(B, T*N, 3), i.e. flattened (t n) with t outer).
+            scale_times = (torch.arange(T, device=coords_true.device)
+                           .view(1, T, 1).expand(B, T, N).reshape(B, T * N))
+            scale = get_camera_scale(cgroup, coords_true.reshape(B, -1, 3),
+                                     times=scale_times)  # (cams, B)
             if not self.per_camera_cube_scale:
                 med = scale.median(dim=0).values  # (B,)
                 scale = med[None, :].expand_as(scale).contiguous()

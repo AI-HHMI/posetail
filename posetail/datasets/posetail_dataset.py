@@ -13,7 +13,7 @@ from easydict import EasyDict as edict
 from einops import rearrange
 
 from posetail.datasets.utils import get_dirs, load_yaml, disassemble_extrinsics, format_sample_input
-from posetail.posetail.cube import project_points_torch, is_point_visible
+from posetail.posetail.cube import project_points_torch, is_point_visible, get_camera_scale
 from train_utils import format_camera_group, dict_to_device
 
 from pprint import pprint
@@ -859,12 +859,16 @@ class PosetailDataset(Dataset):
                 fsel = fnums.cpu().numpy()
                 ext_bv = torch.as_tensor(
                     np.stack([moving_ext[n][fsel] for n in sel]), dtype=torch.float)  # (V,T,4,4)
-                if ext_bv.shape[1] == coords.shape[0] and self._should_canonicalize(coords):
+                cgroup_src = cgroup  # keep for (re)formatting after the transform
+                # format once so _should_canonicalize can compute a cube_scale for the
+                # scale-invariant motion threshold; re-format only if we actually transform.
+                cgroup = format_camera_group(cgroup_src, offset_dict, cam_type, device='cpu',
+                                             moving_ext={n: ext_bv[i] for i, n in enumerate(sel)})
+                if ext_bv.shape[1] == coords.shape[0] and self._should_canonicalize(coords, cgroup):
                     ref = int(np.random.randint(len(sel)))
                     coords, ext_bv = canonicalize_world_to_reference(coords, ext_bv, ref)
-                moving_ext_sel = {n: ext_bv[i] for i, n in enumerate(sel)}
-                cgroup = format_camera_group(cgroup, offset_dict, cam_type, device='cpu',
-                                             moving_ext=moving_ext_sel)
+                    cgroup = format_camera_group(cgroup_src, offset_dict, cam_type, device='cpu',
+                                                 moving_ext={n: ext_bv[i] for i, n in enumerate(sel)})
             else:
                 cgroup = format_camera_group(cgroup, offset_dict, cam_type, device='cpu')
 
@@ -1611,16 +1615,40 @@ class PosetailDataset(Dataset):
     #     return scale_dict, res_dict, new_res_dict
 
 
-    def _should_canonicalize(self, coords):
+    def _should_canonicalize(self, coords, cgroup=None):
         """Whether to apply the fix-camera/move-world transform for this clip.
 
         Static scene -> always (the only way to make moving-camera data self-consistent
         under per-frame extrinsics). Dynamic scene -> with prob moving_cam_aug_prob
         (augmentation; entangles real + induced motion so we don't always do it).
         `coords` is (T, N, 3).
+
+        The raw mean per-frame 3D motion is in WORLD units, which are dataset-scale
+        dependent (mm vs m), so the 1e-3 threshold would mean different things per
+        dataset. When `cgroup` (formatted cameras) is given, each frame's world motion
+        is divided by that FRAME's cube_scale (world-units-per-pixel) before averaging,
+        giving motion in ~pixels/frame -- scale-invariant across datasets AND correct
+        when a moving camera makes cube_scale drift within the clip (a single blended
+        scalar would wash that drift out).
         """
-        disp = torch.linalg.norm(coords[1:] - coords[:-1], dim=-1)  # (T-1, N)
-        motion = float(torch.nan_to_num(disp).mean())
+        disp = torch.nan_to_num(torch.linalg.norm(coords[1:] - coords[:-1], dim=-1))  # (T-1,N) world/step
+        motion = float(disp.mean())                                  # fallback: raw world units/frame
+        if cgroup is not None:
+            try:
+                T, N = coords.shape[:2]
+                # per-frame cube_scale: treat each frame as a batch element so
+                # get_camera_scale returns a scale per (cam, frame), each scored with that
+                # frame's camera pose. One call, same cost as a single-scalar reduction.
+                frame_times = torch.arange(T, device=coords.device).view(T, 1).expand(T, N)
+                cs = torch.nanmedian(get_camera_scale(cgroup, coords, times=frame_times),
+                                     dim=0).values                    # (T,) per-frame scale
+                good = torch.isfinite(cs) & (cs > 0)
+                if good.any():
+                    cs = torch.where(good, cs, torch.nanmedian(cs[good]))  # fill bad frames
+                    # normalize each step by its start-frame scale -> pixels/frame, then mean
+                    motion = float((disp / cs[:-1, None].clamp_min(1e-8)).mean())
+            except Exception:
+                pass  # fall back to raw world-unit motion
         if motion < self.moving_cam_static_thresh:
             return True
         return np.random.random() < self.moving_cam_aug_prob

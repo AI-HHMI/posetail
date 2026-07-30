@@ -400,27 +400,52 @@ def fill_nan_with_batch_median(scale):
     return torch.where(finite, scale, per_batch[None, :].expand_as(scale))
 
 
-def get_camera_scale(camera_group, p):
+def get_camera_scale(camera_group, p, times=None):
     """
     Args:
         camera_group: list of camera dicts
-        p: (B, N, 3) 3D points
+        p:     (B, N, 3) 3D points
+        times: (B, N) int frame index for each point — which camera frame the point is
+               observed at, for moving (per-frame) cameras. None -> all zeros, i.e. the
+               frame-0 / static camera (backward-compatible). Each point is scored with
+               the camera sampled at ITS time, so a moving camera gets a time-appropriate
+               world<->pixel scale. Works for both callers:
+                 - network: one query time per query point.
+                 - loss:    the frame time of each trajectory point.
     Returns:
         scale: (n_cams, B) tensor; NaN cells filled with per-batch median
     """
     B, N, _ = p.shape
     n_cams = len(camera_group)
+    if times is None:
+        times = torch.zeros((B, N), dtype=torch.long, device=p.device)
+    else:
+        times = times.to(device=p.device, dtype=torch.long)
+
     sensitivity = p.new_full((n_cams, B), float('nan'))
 
     for ci, cam in enumerate(camera_group):
-        cam = _static_cam(cam)  # per-camera scale uses one representative frame
+        moving = torch.is_tensor(cam.get('ext')) and cam['ext'].ndim == 3
         for b in range(B):
-            visible = is_point_visible(cam, p[b])
-            if torch.sum(visible) > 0:
-                with torch.autocast(device_type=p.device.type, enabled=False):
-                    J = projection_sensitivity(cam, p[b][visible])
-                    s = torch.linalg.svdvals(J.float())[:, 0]
-                sensitivity[ci, b] = torch.median(s)
+            pts = p[b]                                   # (N, 3)
+            # Group points by their camera frame so each is scored with the right pose.
+            # A static camera ignores the frame, so this collapses to a single group and
+            # reproduces the original (frame-0) behavior exactly.
+            tvals = torch.unique(times[b]) if moving else times.new_zeros(1)
+            svals = []
+            for t in tvals:
+                mask = (times[b] == t) if moving else torch.ones(N, dtype=torch.bool, device=p.device)
+                pts_t = pts[mask]
+                if pts_t.shape[0] == 0:
+                    continue
+                cam_t = _static_cam(cam, int(t))         # frame-t pose (or cam if static)
+                visible = is_point_visible(cam_t, pts_t)
+                if torch.sum(visible) > 0:
+                    with torch.autocast(device_type=p.device.type, enabled=False):
+                        J = projection_sensitivity(cam_t, pts_t[visible])
+                        svals.append(torch.linalg.svdvals(J.float())[:, 0])
+            if svals:
+                sensitivity[ci, b] = torch.median(torch.cat(svals))
 
     scale = 1.0 / sensitivity
     return fill_nan_with_batch_median(scale)
