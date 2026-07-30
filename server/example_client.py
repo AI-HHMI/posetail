@@ -24,7 +24,7 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from inference_video import (
+from posetail.inference.inference_utils import (
     build_video_readers, crop_camera_group_to_queries,
     load_camera_group_from_metadata, load_trial,
 )

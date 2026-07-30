@@ -45,7 +45,7 @@ from cotracker.predictor import CoTrackerPredictor
 # -- reuse helpers from your existing pipeline ---------------------------
 from posetail.datasets.utils import get_dirs
 from posetail.posetail.cube import project_points_torch
-from inference_video import (
+from posetail.inference.inference_utils import (
     load_camera_group_from_metadata,   # returns formatted list-of-dicts
     build_video_readers,
     load_multiview_clip,

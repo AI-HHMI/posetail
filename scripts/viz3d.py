@@ -12,7 +12,7 @@ from matplotlib.colors import to_rgb
 
 from aniposelib.cameras import Camera, CameraGroup, FisheyeCamera
 
-from inference_utils import *
+from posetail.inference.inference_utils import *
 from posetail.datasets.utils import get_dirs, load_yaml, disassemble_extrinsics
 
 

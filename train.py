@@ -41,14 +41,12 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from lightning.fabric import Fabric
 
-# from pytorch_memlab import MemReporter, LineProfiler, profile
-
 from posetail.datasets.posetail_dataset import PosetailDataset, custom_collate
 from posetail.posetail.losses import *
 from posetail.posetail.tracker import Tracker
 from posetail.posetail.tracker_encoder import TrackerEncoder
 from posetail.posetail.tracker_tapnext import TrackerTapNext
-from train_utils import *
+from posetail.posetail.train_utils import *
 
 from schedulefree import AdamWScheduleFree
 
@@ -254,7 +252,7 @@ def run(config_path, fabric):
         muon_scale = config.training.optimizer.get('muon_lr_scale', 1.0)
         wd = config.training.optimizer.weight_decay
         dec_substr = ('decoder.cross_attns', 'decoder.mlps', 'decoder.camera_attns',
-                      'decoder.temporal_attns', 'decoder.latent_carry')
+                      'decoder.temporal_attns')
         scene_ids = {id(p) for p in model.scene_encoder.parameters()} \
             if hasattr(model, 'scene_encoder') else set()
         muon_dec, muon_enc, adamw_slow, adamw_base = [], [], [], []

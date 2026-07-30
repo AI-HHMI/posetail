@@ -4,26 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "posetail"
-version = "0.8.0"
+version = "0.1.0"
 dependencies = [
     "aniposelib>=0.7.0",
     "easydict==1.13",
     "einops==0.7.0",
-    "frozendict==2.4.6",
     "opencv-python==4.9.0.80",
-    "pytorch-memlab==0.3.0",
     "toml==0.10.2",
     "tomlkit>=0.12",
     "wandb==0.19.5",
-    "wget==3.2",
     "lightning>=2.5.6,<3",
     "rerun-sdk[notebook]<=0.22.1",
     "numpy==1.26",
     "imgaug", "imagecorruptions",
     "setuptools<81",
-    "hiera-transformer", "timm",
-    "sam-2 @ git+https://github.com/facebookresearch/sam2.git",
-     # "vjepa2 @ git+https://github.com/facebookresearch/vjepa2.git",
     "schedulefree", "decord", "tqdm",
     "fastapi>=0.111", "uvicorn[standard]>=0.29", "python-multipart>=0.0.9",
     "requests>=2.31",
@@ -41,8 +35,17 @@ classifiers = [
 ]
 
 # [project.optional-dependencies]
-# gpu = [
-#   "torch==2.0.1+cu118"
+# Backbones for the legacy Tracker network (posetail.posetail.tracker.Tracker),
+# which is no longer used by the default TrackerEncoder/ScorerEncoder path. Only
+# needed if you build the old sam2/hiera-based feature extractors.
+#
+# Commented out because PyPI forbids direct URL (git) dependencies in uploaded
+# distribution metadata, which would make `twine upload` fail. If you need the
+# legacy path, install sam2 manually:
+#     pip install "hiera-transformer" "sam-2 @ git+https://github.com/facebookresearch/sam2.git"
+# legacy-tracker = [
+#     "sam-2 @ git+https://github.com/facebookresearch/sam2.git",
+#     "hiera-transformer",
 # ]
 
 [tool.pixi.system-requirements]
@@ -52,11 +55,9 @@ libc = { family = "glibc", version = "2.34" }
 Repository = "https://github.com/AllenNeuralDynamics/posetail"
 
 [tool.setuptools]
-# `posetail` (now a real package via posetail/__init__.py) plus its subpackages are picked
-# up by setup.py's find_packages(). These are the top-level helper modules that live at the
-# repo root (outside the package) but are imported bare (e.g. `from train_utils import ...`,
-# `from inference_video import ...`); list them so an install exposes them too.
-py-modules = ["train_utils", "inference_video", "inference_utils"]
+# `posetail` (a real package via posetail/__init__.py) plus its subpackages — including
+# `posetail.posetail` (with train_utils) and `posetail.inference` (with inference_utils) —
+# are discovered by setup.py's find_packages(). No top-level root modules to expose anymore.
 
 
 [tool.pixi.workspace]
@@ -68,7 +69,6 @@ posetail = { path = ".", editable = true }
 torch = { version = "<3", index="https://download.pytorch.org/whl/cu128"}
 torchvision = {version ="*", index="https://download.pytorch.org/whl/cu128"}
 torchaudio = {version ="*", index="https://download.pytorch.org/whl/cu128"}
-vjepa2 = { path = "/groups/karashchuk/home/karashchukl/builds/vjepa2", editable = true }   
 
 [tool.pixi.environments]
 default = { solve-group = "default" }
@@ -86,6 +86,8 @@ setuptools = "<81"
 pip = "*"
 
 [tool.pixi.feature.dev.dependencies]
+python-build = "*"
+twine = "*"
 matplotlib = "*"
 ipython = "*"
 notebook = "*"

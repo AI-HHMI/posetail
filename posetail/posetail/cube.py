@@ -83,9 +83,13 @@ def project_cam(cam, p3d_t, downsample_factor = 1, max_normalized = 3.0):
     # p3d_t = torch.as_tensor(p3d)
     # ext_t = torch.as_tensor(cam.get_extrinsics_mat(), dtype=p3d_t.dtype, device=p3d_t.device)
     # mat_t = torch.as_tensor(cam.get_camera_matrix(), dtype=p3d_t.dtype, device=p3d_t.device)
-    ext_t = cam['ext']
-    mat_t = cam['mat']
-    dist = cam['dist']
+    # float64: the extrinsic matmul forms ~camera-distance (~6.5e5, far rigs like johnson-fly) coords;
+    # reduced-precision float32 matmul ('high'/'medium') rounds away the pixel-scale signal. float64 stays exact.
+    in_dtype = p3d_t.dtype
+    ext_t = cam['ext'].to(torch.float64)
+    mat_t = cam['mat'].to(torch.float64)
+    dist = cam['dist'].to(torch.float64)
+    p3d_t = p3d_t.to(torch.float64)
     cam_type = cam['type'] # pinhole, fisheye # TODO: implement functionality for different camera types
 
     # ext_t is (4,4) for a static camera or (T,4,4) for a moving (per-frame) camera.
@@ -128,14 +132,14 @@ def project_cam(cam, p3d_t, downsample_factor = 1, max_normalized = 3.0):
     # p2d = from_homogeneous(p2d_raw)
 
     # handle camera offset
-    if 'offset' in cam: 
-        offset = cam['offset']
+    if 'offset' in cam:
+        offset = cam['offset'].to(torch.float64)
         p2d = p2d - offset[None, :]
 
     # account for downsampling
     p2d = p2d / downsample_factor
-    
-    return p2d
+
+    return p2d.to(in_dtype)
 
 # @torch.compile
 def project_points_torch(camera_group, coords_3d, downsample_factor = 1):
@@ -222,6 +226,18 @@ def triangulate_simple_batch_reg(points, camera_mats, weights):
     '''
     C, N, _ = points.shape
     per_point = camera_mats.ndim == 4
+
+    # Run the geometry in float64. The recentring below keeps `b` small, but the design-matrix
+    # products (c_world, MtM, Mtb) still multiply ~camera-distance-magnitude quantities (~6.5e5
+    # for far cameras like johnson-fly); under reduced-precision float32 matmul
+    # (set_float32_matmul_precision('medium'/'high'), esp. on Blackwell) those GEMMs round the
+    # signal away and the triangulation collapses (tri error ~1e4). float64 GEMMs have no
+    # bf16/TF32 tensor-core path, so they stay exact regardless of the global setting. Cost is
+    # negligible for a per-point 3x3 solve. See scripts/precision_sim.py.
+    in_dtype = points.dtype
+    points = points.to(torch.float64)
+    camera_mats = camera_mats.to(torch.float64)
+    weights = weights.to(torch.float64)
 
     # Run the geometry in float64. The recentring below keeps `b` small, but the design-matrix
     # products (c_world, MtM, Mtb) still multiply ~camera-distance-magnitude quantities (~6.5e5

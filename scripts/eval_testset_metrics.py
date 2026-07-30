@@ -45,7 +45,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from inference_video import load_model_from_base_folder, run_inference   # noqa: E402
+from posetail.inference.inference_utils import load_model_from_base_folder, run_inference   # noqa: E402
 from posetail.posetail.eval_metrics import get_eval_metrics              # noqa: E402
 
 DEFAULT_WANDB = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260628_134003-39yczenk'
@@ -214,7 +214,7 @@ def main():
                     checkpoint_path=ms['checkpoint_path'], trial_path=w['tp'], start_frame=0,
                     n_frames=args.n_frames, n_overlap=args.n_overlap, per_subject=True,
                     device=ms['device'], max_kpts=w['max_kpts'], n_views=w['n_views'],
-                    view_seed=args.view_seed, outpath=w['npz'], query_first=True,
+                    seed=args.view_seed, outpath=w['npz'], query_first=True,
                     motion_margin=args.motion_margin)
                 torch.cuda.empty_cache()
                 m = eval_outputs(out, cfg['thresholds'], cfg['survival'])

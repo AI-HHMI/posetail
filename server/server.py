@@ -24,11 +24,11 @@ from fastapi.responses import Response
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from inference_video import (load_model_from_base_folder,
+from posetail.inference.inference_utils import (load_model_from_base_folder,
                              resize_camera_group, resolve_config_and_checkpoint)
 from posetail.posetail.scorer_encoder import ScorerEncoder
 from posetail.posetail.tracker_encoder import TrackerEncoder
-from train_utils import load_checkpoint, load_config
+from posetail.posetail.train_utils import load_checkpoint, load_config
 
 _gpu_lock = asyncio.Lock()
 

@@ -15,7 +15,10 @@ from posetail.posetail.networks import HieraFeatureExtractor, SAM2HieraFeatureEx
 from posetail.posetail.utils import get_pos_encoding, get_fourier_encoding, PadToMultiple, count_parameters
 
 from torchvision import transforms
-from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+
+# ImageNet normalization stats (inlined from timm.data.constants to drop the dep).
+IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 
 class Tracker(nn.Module): 

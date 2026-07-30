@@ -35,7 +35,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from inference_video import (
+from posetail.inference.inference_utils import (
     build_video_readers,
     load_camera_group_from_metadata,
 )
@@ -183,7 +183,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def compute_crop_boxes(p2d, conf_pred, conf_threshold, padding=20):
+def compute_crop_boxes(p2d, conf_pred, conf_threshold, padding=20, vis_pred=None):
     """Compute a single crop box per camera across all frames.
 
     Args:
@@ -191,6 +191,10 @@ def compute_crop_boxes(p2d, conf_pred, conf_threshold, padding=20):
         conf_pred: (T, N) confidence values
         conf_threshold: minimum confidence required for a point to influence cropping
         padding: pixels to add around the bounding box
+        vis_pred: optional (T, N) visibility values; a point must also clear
+            conf_threshold here to influence the crop, mirroring the marker gate in
+            `_point_visible`. Keeps occluded points (which the model localizes poorly)
+            from yanking the crop off the still-visible cluster.
 
     Returns:
         List of (x1, y1, x2, y2) tuples, one per camera
@@ -201,6 +205,8 @@ def compute_crop_boxes(p2d, conf_pred, conf_threshold, padding=20):
     for cam_idx in range(n_cams):
         pts = p2d[cam_idx]  # (T, N, 2)
         mask = conf_pred >= conf_threshold  # (T, N)
+        if vis_pred is not None:
+            mask = mask & (vis_pred >= conf_threshold)
         pts_masked = pts.copy()
         pts_masked[~mask] = np.nan
 
@@ -260,7 +266,7 @@ def main():
 
     # Override with trial path if provided (recompute video paths from the trial)
     if args.trial_path is not None:
-        from inference_video import load_trial
+        from posetail.inference.inference_utils import load_trial
         trial = load_trial(args.trial_path, start_frame=start_frame)
         metadata_path = trial['metadata_path']
         video_paths = trial['video_paths']
@@ -326,6 +332,7 @@ def main():
             conf_pred=conf_pred,
             conf_threshold=args.conf_threshold,
             padding=args.crop_padding,
+            vis_pred=vis_pred,
         )
     else:
         crop_boxes = [None] * n_cams

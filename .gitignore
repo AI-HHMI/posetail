@@ -189,8 +189,10 @@ pixi.lock
 
 # local scratch / working dirs
 logs/
-parity_check/
+tests/
 scripts/
 notebooks/
 reports/
 setup_env_vars.sh
+
+plans/

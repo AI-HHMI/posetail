@@ -40,7 +40,7 @@ from posetail.datasets.scorer_corruption import (ScorerTripletDataset, triplet_c
                                                  seed_worker)
 from posetail.posetail.scorer_encoder import ScorerEncoder
 from posetail.posetail.losses_scorer import TripletScorerLoss
-from train_utils import (load_config, save_config, set_seeds, resolve_seed, write_json,
+from posetail.posetail.train_utils import (load_config, save_config, set_seeds, resolve_seed, write_json,
                          build_optimizer_param_groups, load_checkpoint, save_checkpoint,
                          total_to_per_gpu, dict_to_device, get_timestamp,
                          drop_nan_motion_metrics)
@@ -69,7 +69,7 @@ def build_optimizer(model, config, fabric, lr):
         adj = config.training.optimizer.get('muon_adjust_lr_fn', 'match_rms_adamw')
         muon_scale = config.training.optimizer.get('muon_lr_scale', 1.0)
         dec_substr = ('decoder.cross_attns', 'decoder.mlps', 'decoder.camera_attns',
-                      'decoder.temporal_attns', 'decoder.latent_carry')
+                      'decoder.temporal_attns')
         scene_ids = {id(p) for p in model.scene_encoder.parameters()} \
             if hasattr(model, 'scene_encoder') else set()
         muon_dec, muon_enc, adamw_slow, adamw_base = [], [], [], []
@@ -174,7 +174,7 @@ def _build_scorer_dataset(config, split, corruption_cfg):
 
 
 def run(config_path, fabric):
-    torch.set_float32_matmul_precision('medium')
+    torch.set_float32_matmul_precision('high')
     config = load_config(config_path)
     seed = fabric.broadcast(resolve_seed(config.training.seed), src=0)
     set_seeds(seed)

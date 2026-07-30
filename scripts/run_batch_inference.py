@@ -17,11 +17,16 @@ import os
 import subprocess
 import sys
 
+# Reduce CUDA fragmentation on dense point sets (point-odyssey, cmupanoptic) before torch is
+# imported anywhere (main() / pick_inference_caps import it lazily). Mirrors eval_testset_metrics.py.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
 import numpy as np
+import yaml
 
-from inference_video import load_model_from_base_folder, run_inference
+from posetail.inference.inference_utils import load_model_from_base_folder, run_inference
 
-DEFAULT_PREFIX = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v3'
+DEFAULT_PREFIX = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v4'
 DEFAULT_OUT_ROOT = '~/ghome/results/posetail-inference/2026-06-11'
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -33,6 +38,43 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # the low-parallax world axis and injects large anisotropic jitter (~20x GT accel on y). The
 # direct head is both smoother (0.7x GT accel) and more accurate, so it uses the default.
 PRED_KEY_3D_OVERRIDES = {}
+
+# GPU-memory-aware inference caps (dynamic, per-trial -- not hardcoded per dataset).
+MAX_VIEWS = 14
+# Peak decoder memory ~ (views used) * (kpt chunk). Calibrated conservatively so an 80GB GPU
+# reproduces the known-good cmupanoptic_3dgs setting (14 views * 600 kpts ~= 8400).
+KPTVIEW_BUDGET_PER_GB = 100   # -> ~8000 on 80GB, ~4000 on 40GB
+MIN_KPT_CHUNK = 256
+
+
+def count_cameras(trial_dir, is_2d):
+    """Cameras available for a trial, without loading video. 2D trials are single-camera."""
+    if is_2d:
+        return 1
+    with open(os.path.join(trial_dir, 'metadata.yaml')) as f:
+        meta = yaml.safe_load(f)
+    return len(meta.get('intrinsic_matrices', {}))
+
+
+def pick_inference_caps(n_cams_total, n_kpts, device):
+    """Choose (n_views, max_kpts) from GPU memory + this trial's shape.
+
+    - Cameras capped at MAX_VIEWS (the scene-encoder memory lever; the only knob that reduces
+      per-camera scene-encoder cost).
+    - kpt_chunk (decoder point-axis chunking, numerically identical to a single pass) sized so
+      (views_used * kpt_chunk) fits a conservative per-GB budget; returns None (no chunking) when
+      the full keypoint set already fits.
+    """
+    n_views = min(n_cams_total, MAX_VIEWS)
+    if device is None or device.type != 'cuda':
+        return n_views, None
+    import torch
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    mem_gb = torch.cuda.get_device_properties(idx).total_memory / 1024 ** 3
+    budget = KPTVIEW_BUDGET_PER_GB * mem_gb
+    max_kpts = int(budget / max(n_views, 1))
+    max_kpts = max(MIN_KPT_CHUNK, min(max_kpts, n_kpts))
+    return n_views, (None if max_kpts >= n_kpts else max_kpts)
 
 
 def find_trials(dataset_dir, split):
@@ -102,7 +144,7 @@ def pick_trial(trials, n_frames):
     return trial_dir, is_2d, 0, T, score, True
 
 
-def launch_render(tracks_path, vids_path, is_2d, trails=True):
+def launch_render(tracks_path, vids_path, is_2d, trails=False):
     """Start render_video.py as a background subprocess; return the Popen."""
     conf = '0.2' if is_2d else '0.5'
     cmd = [sys.executable, os.path.join(HERE, 'render_video.py'),
@@ -145,10 +187,17 @@ def main():
                     help='disable query-first (default ON): anchor each point at its first '
                          'valid+visible frame (mvtracker/training convention). With this flag, '
                          'all points are anchored at start_frame instead (legacy 3D behavior).')
-    ap.add_argument('--no-trails', dest='trails', action='store_false', default=True,
-                    help='disable motion trails (default ON): trails draw each '
+    ap.add_argument('--trails', action='store_true', default=False,
+                    help='enable motion trails (default OFF): trails draw each '
                          'point\'s recent path so a still frame conveys tracking. '
                          'Uses render_video.py defaults (length 30, thickness 2).')
+    ap.add_argument('--view-seed', type=int, default=0,
+                    help='seed for camera + point subsampling (default 0, reproducible '
+                         'across --force reruns)')
+    ap.add_argument('--max-points', type=int, default=600,
+                    help='cap tracked query points PER SUBJECT (default 600); subjects with '
+                         'more are random-subsampled. Bounds memory/time on dense sets '
+                         '(point-odyssey has ~40k-76k pts/subject). 0 disables the cap.')
     ap.add_argument('--force', action='store_true', default=False,
                     help='re-run inference and re-render even when outputs already '
                          'exist. By default a dataset whose tracks npz + video are both '
@@ -219,6 +268,20 @@ def main():
                 print(f'    mode={mode} start_frame={start} n_frames={n_eff} '
                       f'score={score:.4f} pred_key_3d={pred_key_3d}')
 
+                # Dynamic, GPU-memory-aware caps from this trial's actual shape: cap cameras at
+                # MAX_VIEWS and size the keypoint chunk to fit a conservative memory budget.
+                pose_name = 'pose2d.npz' if is_2d else 'pose3d.npz'
+                n_kpts = int(np.load(os.path.join(trial_dir, pose_name))['pose'].shape[2])
+                # Points are subsampled to max_points/subject before tracking, so size the chunk
+                # to the count actually tracked (n_kpts is per-subject: pose is (S,T,K,R)).
+                if args.max_points:
+                    n_kpts = min(n_kpts, args.max_points)
+                n_cams = count_cameras(trial_dir, is_2d)
+                dev = device if device is not None else next(model.parameters()).device
+                n_views, max_kpts = pick_inference_caps(n_cams, n_kpts, dev)
+                print(f'    n_cams={n_cams} -> n_views={n_views}  '
+                      f'n_kpts={n_kpts} -> max_kpts={max_kpts}')
+
                 # Inference: in-process, sequential on the GPU (model already loaded).
                 run_inference(
                     model=model,
@@ -228,12 +291,18 @@ def main():
                     start_frame=start,
                     n_frames=n_eff,
                     n_overlap=8,
+                    n_views=n_views,
+                    seed=args.view_seed,
+                    max_kpts=max_kpts,
+                    max_points=(args.max_points or None),  # 0 -> None (disable cap)
                     per_subject=True,
                     device=device,
                     outpath=tracks_path,
                     pred_key_3d=pred_key_3d,
                     query_first=args.query_first,
                 )
+                if dev.type == 'cuda':
+                    torch.cuda.empty_cache()
                 score_str = f'{score:.3f}'
             else:
                 # Reuse existing tracks; only (re)render. Recover mode/is_2d from the npz.

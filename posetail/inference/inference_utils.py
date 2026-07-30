@@ -1,39 +1,272 @@
-"""
-Example invocation (trial directory with img/ folder):
-
-    python inference_video.py \
-        --base-folder /path/to/wandb/run-YYYYMMDD_HHMMSS-XXXXXXXX \
-        --trial-path /path/to/session/trial/ \
-        --start-frame 0 \
-        --n-frames 256 \
-        --n-overlap 2 \
-        --checkpoint 10000 \
-        --device cuda:0 \
-        --outpath /path/to/output.npz
-
-The trial directory should contain:
-    - metadata.yaml (camera calibration)
-    - pose3d.npz (3D pose data, used for initial query points)
-    - img/ (per-camera subdirectories of images) or vid/ (per-camera .mp4 files)
-"""
 import os
 import cv2
 import glob
 import json
 import yaml
+
 import torch
-import argparse
+
 import numpy as np
 from tqdm import tqdm
+
+from collections import defaultdict
 
 from decord import VideoReader, cpu
 from aniposelib.cameras import CameraGroup, Camera
 
-from posetail.datasets.utils import disassemble_extrinsics
+from posetail.datasets.utils import get_dirs, disassemble_extrinsics
 from posetail.posetail.cube import project_points_torch
 from posetail.posetail.tracker_encoder import TrackerEncoder
-from train_utils import dict_to_device, load_config, load_checkpoint, format_camera_group
+from posetail.posetail.train_utils import *
 
+
+
+def get_checkpoint(wandb_prefix, run_id, checkpoint = None):
+
+    if checkpoint is not None: 
+        checkpoint_fmt = str(checkpoint).zfill(8)
+        checkpoint_path = os.path.join(
+            wandb_prefix, run_id, 'files', 'checkpoints', 
+            f'checkpoint_{checkpoint_fmt}.pth')
+        
+    else:
+        checkpoints = sorted(glob.glob(
+            os.path.join(wandb_prefix, run_id, 'files', 'checkpoints', '*.pth')))
+        checkpoint_path = checkpoints[-1]
+
+    return checkpoint_path
+
+
+def load_predictions(data_path, device):
+
+    data = np.load(data_path) 
+
+    coords_pred = torch.from_numpy(data['coords_pred']).to(device)
+    vis_pred = torch.from_numpy(data['vis_pred']).to(device)
+    conf_pred = torch.from_numpy(data['conf_pred']).to(device)
+
+    coords_true = torch.from_numpy(data['coords_true']).to(device)
+    vis_true = torch.from_numpy(data['vis_true']).to(device)
+
+    fnums = torch.from_numpy(data['fnums']).to(device)
+    video_path = ''.join(data['video_path'])
+
+    return coords_pred, vis_pred, conf_pred, coords_true, vis_true, fnums, video_path
+
+
+def combine_predictions(prefix): 
+
+    # traverse results for a particular dataset
+    for session in get_dirs(prefix): 
+
+        session_path = os.path.join(prefix, session)
+
+        for trial in get_dirs(session_path): 
+
+            trial_path = os.path.join(session_path, trial)
+
+            # skip if there are no npz prediction files
+            prediction_paths = sorted(glob.glob(os.path.join(trial_path, 'predictions', 'predictions_*.npz')))
+            if len(prediction_paths) == 0:
+                print(f'skipping... no prediction paths found at {trial_path}')
+                continue
+
+            data = [np.load(p) for p in prediction_paths] 
+
+            # extract metadata 
+            keys_to_exclude = ['coords_pred', 'vis_pred', 'conf_pred',
+                               'coords_true', 'vis_true', 'fnums']
+
+            sample_info = {k: data[0][k] for k in data[0].keys() if k not in keys_to_exclude}
+
+            # combine predictions from each consecutive time period
+            coords_pred = np.concatenate([d['coords_pred'] for d in data], axis = 0)
+
+            vis_pred = np.concatenate([d['vis_pred'] for d in data], axis = 0)
+            conf_pred = np.concatenate([d['conf_pred']for d in data], axis = 0)
+            coords_true = np.concatenate([d['coords_true'] for d in data], axis = 0)
+            vis_true = np.concatenate([d['vis_true'] for d in data], axis = 0)
+            fnums = np.concatenate([d['fnums'] for d in data], axis = 0)
+
+            results = {
+                'coords_pred': coords_pred, 
+                'vis_pred': vis_pred, 
+                'conf_pred': conf_pred,
+                'coords_true': coords_true,
+                'vis_true': vis_true,
+                'fnums': fnums, 
+            }
+
+            results.update(sample_info)
+
+            # save combined data 
+            predictions_fname = os.path.join(prefix, session, trial, f'predictions.npz')
+            np.savez(predictions_fname, **results)
+            print(f'predictions saved to {predictions_fname}')
+
+
+def predict_on_dataset_3d(model, dataloader, outpath, device, 
+                          max_kpts = 1000, debug_ix = None):
+
+    torch.set_float32_matmul_precision('high')
+    model.eval()
+
+    for j, batch in enumerate(dataloader):
+
+        if debug_ix and j == debug_ix: 
+            break
+
+        views = [view.to(device) for view in batch.views]
+        coords = batch.coords.to(device)
+        vis = batch.vis
+        fnums = batch.fnums.cpu().numpy()
+        cgroup = batch.cgroup 
+        sample_info = batch.sample_info
+        
+        # fallback if visibilities are not provided
+        if vis is None: 
+            vis = get_vis_true(coords)
+
+        if cgroup: 
+            cgroup = [dict_to_device(cam_dict, device) for cam_dict in cgroup]
+        
+        # can do multiple passes if there are a lot of keypoints to predict 
+        # (helps reduce memory)
+        n_passes = np.ceil(coords.shape[2] / max_kpts).astype(int)
+        coords_pred = []
+        vis_pred = []
+        conf_pred = []
+        coords_true = []
+        vis_true = []
+
+        for i in range(n_passes): 
+
+            coords_subset = coords[:, :, i * max_kpts : i * max_kpts + max_kpts, :]
+            vis_subset = vis[:, :, i * max_kpts : i * max_kpts + max_kpts, :]
+
+             # mask NaNs, don't want to pass in coords that are NaN in the first frame
+            coords_first = coords_subset[:, 0, :, :]  # B, N, R
+            valid_mask = ~torch.isnan(coords_first).any(dim = -1)  # B, N
+            coords_valid = coords_first[:, valid_mask[0], :]  # B, n, R
+
+            # get model predictions given coords in the first frame
+            with torch.no_grad():
+
+                outputs = model(
+                    views = views, 
+                    coords = coords_valid, 
+                    camera_group = cgroup
+                )
+
+                # populate valid predictions in side of coords
+                B, S, N, R = coords_subset.shape
+                output_coords_valid = torch.full((B, S, N, R), float('nan'),
+                    device = coords_subset.device, dtype = coords_subset.dtype)
+                output_vis_valid = torch.full((B, S, N, 1), float('nan'), 
+                    device = coords_subset.device, dtype = coords_subset.dtype)
+                output_conf_valid = torch.full((B, S, N, 1), float('nan'),
+                    device = coords_subset.device, dtype = coords_subset.dtype)
+
+                output_coords_valid[:, :, valid_mask[0], :] = outputs['coords_pred']
+                output_vis_valid[:, :, valid_mask[0], :] = outputs['vis_pred']
+                output_conf_valid[:, :, valid_mask[0], :] = outputs['conf_pred']
+
+                print('true', coords_subset[:, :, 0, :])
+                print('pred', outputs['coords_pred'][:, :, 0, :])
+
+                coords_pred.append(torch.squeeze(outputs['coords_pred'], dim = 0).cpu().numpy())
+                vis_pred.append(torch.squeeze(outputs['vis_pred'], dim = 0).cpu().numpy())
+                conf_pred.append(torch.squeeze(outputs['conf_pred'], dim = 0).cpu().numpy())
+                coords_true.append(torch.squeeze(coords_subset, dim = 0).cpu().numpy())
+                vis_true.append(torch.squeeze(vis_subset, dim = 0).cpu().numpy())
+
+        results = {
+            'coords_pred': np.concatenate(coords_pred, axis = 1), 
+            'vis_pred': np.concatenate(vis_pred, axis = 1), 
+            'conf_pred': np.concatenate(conf_pred, axis = 1),
+            'coords_true': np.concatenate(coords_true, axis = 1),
+            'vis_true': np.concatenate(vis_true, axis = 1),
+        }
+        results.update({'fnums': fnums})
+
+        keys_to_exclude = ['fnums']
+        if sample_info.subject_ids is not None: 
+            results.update({'subject_ids': sample_info.subject_ids})
+        else: 
+            keys_to_exclude.append('subject_ids')
+
+        results.update({k: sample_info[k] for k in sample_info.keys() if k not in keys_to_exclude})
+
+        # save predictions
+        start_ix = str(results['start_ix']).zfill(8)
+        predictions_outpath = os.path.join(
+            outpath, results['session'], results['trial'], 'predictions')
+        os.makedirs(predictions_outpath, exist_ok = True)
+        predictions_fname = os.path.join(predictions_outpath, f'predictions_{start_ix}.npz')
+        np.savez(predictions_fname, **results)
+        print(f'predictions saved to {predictions_fname}')
+
+    return outpath
+
+
+def generate_video_2d(video_path, results_path, outpath, run_id, scale, device): 
+    # NOTE: deprecated for now
+    # TODO: get camera group and project coords
+    (coords_pred, vis_pred, conf_pred, coords_true, 
+    vis_true, fnums, video_path) = load_predictions(results_path, device)
+
+    coords_true = coords_true.cpu().numpy().astype(int)
+    coords_true[..., 0] = coords_true[..., 0] * scale[0]
+    coords_true[..., 1] = coords_true[..., 1] * scale[1]
+
+    coords_pred = coords_pred.cpu().numpy().astype(int)
+    coords_pred[..., 0] = coords_pred[..., 0] * scale[0]
+    coords_pred[..., 1] = coords_pred[..., 1] * scale[1]
+
+    cap = cv2.VideoCapture(video_path)
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = 30.0 # cap.get(cv2.CAP_PROP_FPS)
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    runid = run_id.split('-')[-1]
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    video_outpath = os.path.join(outpath, f'{video_name}_{runid}.mp4')
+    out = cv2.VideoWriter(video_outpath, fourcc, fps, (frame_width, frame_height))
+
+    i = 0
+    j = 0
+    ret = True
+
+    while ret:
+
+        ret, frame = cap.read() 
+
+        if not ret: 
+            break
+        
+        if i not in fnums:
+            out.write(frame)
+
+        else:
+            for coord_true, coord_pred in zip(coords_true[j], coords_pred[j]):
+                cv2.circle(frame, tuple(coord_true), 5, (0, 255, 0), -1)
+                cv2.circle(frame, tuple(coord_pred), 5, (0, 0, 255), -1)
+
+            out.write(frame)
+            j += 1
+
+        i += 1
+
+    cap.release()
+    out.release()
+
+    return video_outpath
+
+
+# ---------------------------------------------------------------------------
+# Video / multi-view inference library (moved from the inference_video.py CLI)
+# ---------------------------------------------------------------------------
 
 class ImageFolderReader:
     """Mimics the VideoReader interface but reads from a folder of images."""
@@ -449,6 +682,9 @@ def run_tracker_encoder_on_videos(
     else:
         qt_abs = start_frame + query_times.to(device=device, dtype=torch.int64).view(-1)
 
+    # Logit written for not-yet-appeared / absent points so sigmoid() -> ~0 (invisible, no conf).
+    LOGIT_INVISIBLE = -30.0
+
     coords_pred_all = []
     vis_pred_all = []
     conf_pred_all = []
@@ -456,10 +692,8 @@ def run_tracker_encoder_on_videos(
     frame_numbers_all = []
     crop_history = []
     is_first_chunk = True
-    # Latent threaded across chunks (cross-chunk carry). For windowed models, feed more
-    # than stride_length frames per forward (clip_len > model.n_frames) so the internal
-    # windowing + latent carry actually engage within each chunk.
-    init_latent = None
+    # Cross-chunk continuity is provided by query re-anchoring (current_queries below):
+    # each chunk re-seeds its query on the previous chunk's prediction.
     clip_len = clip_len if clip_len is not None else model.n_frames
 
     # Cross-chunk crop-robustness state: per-point velocity (world/pixel per frame) and
@@ -592,20 +826,43 @@ def run_tracker_encoder_on_videos(
                     occ_chunk[:, seeded] = (occ_gt_dev[:, seeded] if occ_gt_dev is not None
                                             else -1)
 
+            # Query-first: run the model on ONLY the points that have appeared by this
+            # window (before | seeded). A not-yet-appeared point is neither fed to the model
+            # -- so it cannot perturb the scene encoding / cross-point attention -- nor
+            # stored; it is scattered back below as NaN coords / invisible logits. With every
+            # query_time == 0 (legacy) every point is 'appeared' every window, so active_idx
+            # == arange(N) and this is bit-for-bit identical to feeding the full set.
+            active_idx = appeared.nonzero(as_tuple=True)[0]          # (M,)
+            M = int(active_idx.numel())
+
+            def _scatter(sub, kdim, fill):
+                """Scatter a subset tensor (keypoint axis of length M at kdim) into a full-N
+                tensor, filling the not-yet-appeared points with `fill`."""
+                shape = list(sub.shape)
+                shape[kdim] = N
+                full = sub.new_full(shape, fill)
+                if M > 0:
+                    full.index_copy_(kdim, active_idx, sub)
+                return full
+
+            # Points fed to the model this window: the appeared set, or -- when nothing has
+            # appeared yet (only possible if no point is visible at start_frame) -- a single
+            # dummy point (index 0) so the model still returns correctly-shaped outputs; its
+            # result is discarded by the fill-only scatter below (M==0 -> no index_copy_).
+            run_idx = active_idx if M > 0 else active_idx.new_zeros(1)
             outputs = model(
                 views=views,
-                coords=queries_model,
-                query_times=times_chunk,
+                coords=queries_model[:, run_idx],
+                query_times=times_chunk[:, run_idx],
                 camera_group=camera_group_chunk,
-                init_latent=init_latent,
                 kpt_chunk=max_kpts,
-                occlusion=occ_chunk,
+                occlusion=(occ_chunk[:, run_idx] if occ_chunk is not None else None),
             )
 
             if is_2d:
                 # 2D predictions live in model-input pixel space; map back to the
                 # original full-image frame so outputs and the recurrence stay there.
-                coords_pred = outputs['2d_pred'][0]  # single cam: (b, t, n, 2)
+                coords_pred = outputs['2d_pred'][0]  # single cam: (b, t, m, 2)
                 coords_pred = crop_low + coords_pred / model_scale
                 coords_pred = coords_pred[:, :keep_len]
             else:
@@ -618,6 +875,16 @@ def run_tracker_encoder_on_videos(
 
             if coords_pred.shape[1] == 0:
                 break
+
+            # Scatter the appeared points' outputs back to full N, filling not-yet-appeared
+            # points with NaN coords / invisible logits. Keypoint axis is dim 2 for
+            # coords/vis/conf and dim 3 for the per-camera vis_pred_2d. `_scatter` copies only
+            # when M>0, so the M==0 dummy output is dropped and every point is filled.
+            coords_pred = _scatter(coords_pred, 2, float('nan'))
+            vis_pred = _scatter(vis_pred, 2, LOGIT_INVISIBLE)
+            conf_pred = _scatter(conf_pred, 2, LOGIT_INVISIBLE)
+            if vis_pred_2d is not None:
+                vis_pred_2d = _scatter(vis_pred_2d, 3, LOGIT_INVISIBLE)
 
             # Drop the overlap frames already emitted by the previous chunk (temporal
             # dedup); the first chunk keeps everything from its start.
@@ -646,20 +913,29 @@ def run_tracker_encoder_on_videos(
             # re-anchor query comes from). visible(sigmoid>=0.5)->1, occluded->0 (no -1 from
             # a prediction). Only fed forward when the model uses the occlusion term.
             if getattr(model, 'occlusion_embedding', False) and 'vis_pred_2d' in outputs:
-                vp2d = outputs['vis_pred_2d']                    # (cams, b, t, n) logits
-                vp2d_last = vp2d[:, :, keep_len - 1]             # (cams, b, n)
+                vp2d = outputs['vis_pred_2d']                    # (cams, b, t, M) logits
+                vp2d_last = vp2d[:, :, keep_len - 1]             # (cams, b, M)
                 occ_p = (torch.sigmoid(vp2d_last) >= 0.5).to(torch.int64)
-                occ_pred = occ_p.permute(1, 2, 0).contiguous()  # (cams,b,n) -> (b,n,cams)
+                occ_p = occ_p.permute(1, 2, 0).contiguous()      # (cams,b,M) -> (b,M,cams)
+                # Scatter to full N; not-yet points -> -1 (unknown). They are never read as
+                # active occlusion (a point is 'before' only after its real seed chunk).
+                occ_full = occ_p.new_full((occ_p.shape[0], N, occ_p.shape[2]), -1)
+                if M > 0:
+                    occ_full.index_copy_(1, active_idx, occ_p)
+                occ_pred = occ_full
             else:
                 occ_pred = None
-
-            # Thread the decoder latent into the next chunk so the carry spans the whole
-            # video (not just within a chunk). None for non-windowed models / single-pass.
-            init_latent = outputs.get('final_latent', None)
 
             current_frame += keep_len - n_overlap
             pbar.update(keep_len - discard)
             is_first_chunk = False
+
+            # Release this chunk's GPU tensors before the next window builds its own
+            # full-N outputs; holding them across the next model() call would keep two
+            # full-N sets live and double peak memory (the OOM on dense point sets).
+            del coords_pred, vis_pred, conf_pred, outputs
+            if vis_pred_2d is not None:
+                del vis_pred_2d
 
             # If we've reached or passed the end, stop
             if current_frame + n_overlap >= end_frame:
@@ -689,6 +965,21 @@ def run_tracker_encoder_on_videos(
     if len(vis_pred_2d_all) > 0:
         # (cams, b, t, n) -> concat over the time axis (dim 2)
         result['vis_pred_2d'] = torch.cat(vis_pred_2d_all, dim=2)
+
+    # A point exists only from its query frame forward (query-first). The per-window subselect
+    # above already drops it from windows before it appears, but the window that SEEDS it is
+    # 'appeared' for its whole span, so the frames in that window before the point's actual
+    # query offset survive as backward extrapolation. Mask every frame strictly before each
+    # point's absolute query frame. No-op for the legacy path (qt_abs == start_frame <= every
+    # frame_number), so all-zero-query runs are unchanged.
+    fn = result['frame_numbers']                                  # (T,) absolute, CPU
+    pre = fn[:, None] < qt_abs.cpu()[None, :]                     # (T, N) bool
+    if bool(pre.any()):
+        result['coords_pred'][0][pre] = float('nan')
+        result['vis_pred'][0][pre] = LOGIT_INVISIBLE
+        result['conf_pred'][0][pre] = LOGIT_INVISIBLE
+        if 'vis_pred_2d' in result:
+            result['vis_pred_2d'][:, 0][:, pre] = LOGIT_INVISIBLE
     return result
 
 
@@ -797,7 +1088,8 @@ def occlusion_at_query(vis_used_s, query_time_valid, valid_mask, start_frame):
     return torch.as_tensor(occ, dtype=torch.int64)
 
 
-def load_trial(trial_path, start_frame=0, n_frames=None, query_first=True):
+def load_trial(trial_path, start_frame=0, n_frames=None, query_first=True,
+               max_points=None, seed=0):
     """Load metadata, video/image paths, and query points from a trial directory,
     following the PosetailDataset convention.
 
@@ -807,6 +1099,13 @@ def load_trial(trial_path, start_frame=0, n_frames=None, query_first=True):
 
     query_first (3D only): anchor each point at its first valid+visible frame (mvtracker /
     training convention) instead of all points at start_frame. Returns per-point query_times.
+
+    max_points (per subject): if set and a subject has more than this many valid query points,
+    randomly subsample its valid mask down to max_points (seeded by `seed`). This genuinely
+    shrinks N fed to the tracker -- unlike max_kpts chunking, which retains full-N latent/grid --
+    so it bounds memory/time on dense sets (e.g. point-odyssey, ~40k-76k pts/subject). The cull
+    lands on the valid mask before queries/query_times are built, so every downstream consumer
+    (GT extraction, occlusion_at_query) stays consistent automatically.
 
     Returns a dict with keys: 'mode', 'metadata_path', 'cam_names', 'video_paths',
     'query_points', 'per_subject_queries', 'coords', 'vis_gt', 'valid_flat',
@@ -883,6 +1182,7 @@ def load_trial(trial_path, start_frame=0, n_frames=None, query_first=True):
     per_subject_queries = []
     per_subject_valid_masks = []
     per_subject_query_times = []
+    subsample_rng = np.random.default_rng(seed) if max_points is not None else None
     for s in range(n_subjects):
         if use_query_first:
             qt_s, qc_s, valid = compute_query_first(
@@ -891,6 +1191,13 @@ def load_trial(trial_path, start_frame=0, n_frames=None, query_first=True):
             qc_s = coords[:, start_frame, :, :][s]              # (n_kpts, R)
             valid = np.all(np.isfinite(qc_s), axis=1)
             qt_s = np.zeros(qc_s.shape[0], dtype=np.int32)
+        # Optionally cap this subject's tracked points (random, one shared seeded RNG). Applied
+        # to the valid mask before slicing so queries/query_times/GT all stay aligned.
+        if subsample_rng is not None and int(valid.sum()) > max_points:
+            on = np.flatnonzero(valid)
+            drop = subsample_rng.choice(on, on.size - max_points, replace=False)
+            valid = valid.copy()
+            valid[drop] = False
         per_subject_valid_masks.append(valid)
         per_subject_queries.append(torch.as_tensor(qc_s[valid], dtype=torch.float32))
         per_subject_query_times.append(torch.as_tensor(qt_s[valid], dtype=torch.int32))
@@ -922,46 +1229,6 @@ def load_trial(trial_path, start_frame=0, n_frames=None, query_first=True):
     }
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument('--base-folder', type=str, required=True,
-                        help='Wandb run folder containing files/config.toml and files/checkpoints/')
-    parser.add_argument('--trial-path', type=str, required=True,
-                        help='Path to a trial directory containing metadata.yaml, '
-                             'pose3d.npz, and an img/ or vid/ folder')
-    parser.add_argument('--start-frame', type=int, default=0)
-    parser.add_argument('--n-frames', type=int, default=128)
-    parser.add_argument('--n-overlap', type=int, default=2)
-    parser.add_argument('--n-views', type=int, default=None, help='Evaluate on a random subset of the cameras')
-    parser.add_argument('--view-seed', type=int, default=None, help='Random seed for subsampling cameras')
-    parser.add_argument('--max-kpts', type=int, default=None, help='Max keypoints per model forward pass.')
-    parser.add_argument('--per-subject', action='store_true', default=False,
-                        help='Track each subject independently instead of concatenating all keypoints')
-    parser.add_argument('--no-query-first', dest='query_first', action='store_false', default=True,
-                        help='disable query-first (default ON): with this flag all points are '
-                             'anchored at start_frame instead of their first valid+visible frame')
-    parser.add_argument('--no-motion-margin', dest='motion_margin', action='store_false', default=True,
-                        help='disable the causal motion-margin crop expansion (default ON); with '
-                             'this flag + --no-query-first the path is legacy-identical')
-    parser.add_argument('--checkpoint', type=int, default=None,
-                        help='Optional checkpoint step number; if omitted, use latest checkpoint')
-    parser.add_argument('--device', type=str, default=None)
-    parser.add_argument('--pred-key-3d', type=str, default='coords_pred',
-                        help="Which 3D model output to use as the prediction "
-                             "(e.g. 'coords_pred' or '3d_pred_triangulate')")
-    parser.add_argument('--clip-len', type=int, default=None,
-                        help='Frames fed to the model per forward. Defaults to '
-                             'model.n_frames (= stride_length). For a windowed model set '
-                             'this > stride_length (e.g. 16) so internal windowing + the '
-                             'latent carry engage per chunk; the latent is also threaded '
-                             'across chunks.')
-    parser.add_argument('--outpath', type=str, default=None,
-                        help='Optional output .npz path')
-
-    return parser.parse_args()
-
-
 def run_inference(
     model,
     config_path,
@@ -971,7 +1238,7 @@ def run_inference(
     n_frames=128,
     n_overlap=2,
     n_views=None,
-    view_seed=None,
+    seed=None,
     max_kpts=None,
     per_subject=False,
     device=None,
@@ -980,6 +1247,7 @@ def run_inference(
     clip_len=None,
     query_first=True,
     motion_margin=True,
+    max_points=None,
 ):
     """Run inference on one trial with an already-loaded model.
 
@@ -991,12 +1259,16 @@ def run_inference(
     training convention) within the windowed, per-chunk re-cropping tracker, instead of all
     points at start_frame. motion_margin: expand each chunk's crop by the previous chunk's
     per-point velocity so fast subjects stay in-frame (disable for the legacy-identical path).
+
+    max_points (per subject): random-subsample each subject's tracked points to this cap
+    (seeded by `seed`, shared with camera subsampling) -- bounds memory/time on dense sets.
+    See load_trial for details.
     """
     if device is None:
         device = next(model.parameters()).device
 
     trial = load_trial(trial_path, start_frame=start_frame, n_frames=n_frames,
-                       query_first=query_first)
+                       query_first=query_first, max_points=max_points, seed=seed)
     mode                    = trial['mode']
     metadata_path           = trial['metadata_path']
     cam_names               = trial['cam_names']
@@ -1029,7 +1301,7 @@ def run_inference(
     cam_indices_used = list(range(n_cams_total))
 
     if n_views is not None and n_views < n_cams_total:
-        rng = np.random.default_rng(view_seed)
+        rng = np.random.default_rng(seed)
         cam_indices_used = sorted(rng.choice(n_cams_total, n_views, replace=False).tolist())
         print(f'Subsampling {n_views}/{n_cams_total} cameras: indices {cam_indices_used}')
         camera_group = [camera_group[i] for i in cam_indices_used]
@@ -1276,37 +1548,3 @@ def run_inference(
     return outputs
 
 
-def main():
-    args = parse_args()
-
-    device = torch.device(args.device) if args.device is not None else None
-
-    model, config, config_path, checkpoint_path = load_model_from_base_folder(
-        args.base_folder,
-        checkpoint=args.checkpoint,
-        device=device,
-    )
-
-    run_inference(
-        model=model,
-        config_path=config_path,
-        checkpoint_path=checkpoint_path,
-        trial_path=args.trial_path,
-        start_frame=args.start_frame,
-        n_frames=args.n_frames,
-        n_overlap=args.n_overlap,
-        n_views=args.n_views,
-        view_seed=args.view_seed,
-        max_kpts=args.max_kpts,
-        per_subject=args.per_subject,
-        device=device,
-        outpath=args.outpath,
-        pred_key_3d=args.pred_key_3d,
-        clip_len=args.clip_len,
-        query_first=args.query_first,
-        motion_margin=args.motion_margin,
-    )
-
-
-if __name__ == '__main__':
-    main()
