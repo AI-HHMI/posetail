@@ -173,7 +173,10 @@ finetune = true
 # checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260723_233216-aujvtimm/files/checkpoints/checkpoint_00081920.pth'
 
 # finetuned 5
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260724_100235-w6wzkh0v/files/checkpoints/checkpoint_00010242.pth'
+# checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260724_100235-w6wzkh0v/files/checkpoints/checkpoint_00010242.pth'
+
+# finetuned 6
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260724_111406-3gvz9mto/files/checkpoints/checkpoint_00788634.pth'
 
 
 

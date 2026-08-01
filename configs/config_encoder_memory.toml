@@ -72,8 +72,8 @@ intensity_floor = 0.0
 [dataset.val]
 split_dir = 'val'
 # Memory always on for val, with a FIXED count (not a range like train): a val number that
-# also jittered with M would not be comparable pass to pass. memory_only stays off so val
-# remains comparable to the pre-memory checkpoint this run warm-starts from.
+# also jittered with M would not be comparable pass to pass. memory_only stays off, which now
+# keeps val directly comparable to r16up6ey's val curve rather than to a pre-memory baseline.
 memory_num_context = 8
 memory_prob = 1.0
 n_frames = 24
@@ -101,18 +101,23 @@ device = 'cuda'
 mode_3d = "encoder"
 
 video_encoder_version = 'large'
-# Backbone FROZEN for the memory work. A memory architecture that works should converge
-# without the backbone adapting to it; leaving it trainable lets a backbone change absorb
-# credit that belongs to the memory path, and makes the memory tokens a moving target for
-# the modules learning to read them. It also removes the largest activation consumer in the
-# step (backward over 24 frames x 8 cameras), which is what pays for the raised M below.
-# NOTE: anchored (M=0) metrics are therefore NOT comparable to d90p0599, which kept
-# finetuning the encoder. The M-curve is a within-run comparison and stays valid.
-video_encoder_requires_grad = false
+# Backbone UNFROZEN, last 12 blocks only. The freeze was an attribution choice -- "a memory
+# architecture that works should converge without the backbone adapting to it" -- and that
+# premise has now been tested across three runs. It converges, but only so far: measured on
+# r16up6ey the decoder's memory read is still barely content-selective (attention entropy
+# 0.6428 real vs 0.6394 with each point handed another point's bank at M=2, 0.6796 vs 0.6782
+# at M=8 -- a SMALLER gap than d90p0599's 0.627/0.615). Information reaches the decoder
+# through the entry VALUES, never through which entry is selected. Co-adapting the encoder is
+# the cheap version of "train from scratch with memory": it lets the tokens the read consumes
+# move toward being readable, at one run instead of a full pretrain.
+video_encoder_requires_grad = true
 video_encoder_hierarchical = true
 
-# Inert while the encoder is frozen.
-# video_encoder_finetune_last_n_layers = 12
+# Last 12 of 24 blocks (plus the final norm, if the variant has one -- VJEPA 2.1 does not).
+# Half the backbone keeps the early, generic features fixed so the memory path cannot be
+# credited for a wholesale representation change, and bounds the extra activation cost of
+# backward over 24 frames x 8 cameras, which is what pays for memory_num_context up to 16.
+video_encoder_finetune_last_n_layers = 12
 
 soft_argmax_temperature_learnable = true
 
@@ -130,8 +135,10 @@ memory_read_depth = 3
 # seeds in MemoryQueryEncoder. Measured with a bank of known rank, K makes no difference to
 # the token's effective rank (a single seed's attention already varies per point), so 1.
 memory_pool_seeds = 1
-# Gradient through the memory frames' scene encode. Off: the backbone is shared with the clip
-# path, and a frozen encode is several times cheaper. Inert while the encoder is frozen.
+# Gradient through the memory frames' scene encode. Now LIVE, since the encoder is trainable
+# again -- kept off so the backbone is shaped by the clip path only, and the M<=16 memory
+# frames stay a no-grad encode. Turning it on would put backward over up to 16 extra frames
+# per camera on top of the clip's 24, which is the single largest cost available here.
 memory_encoder_grad = false
 
 # Keep SPATIAL structure in the entry instead of summarizing it away. SAM 2 registers what
@@ -232,10 +239,12 @@ seed = 0
 
 finetune = true
 
-# Warm start from run 3gvz9mto. The memory modules are absent from this checkpoint and load
-# fresh under strict=False; their output projections are zero-init, so the model starts out
-# predicting exactly as this checkpoint does and learns to use memory from there.
-checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260724_111406-3gvz9mto/files/checkpoints/checkpoint_00532584.pth'
+# Warm start from r16up6ey -- the first memory checkpoint this run continues rather than
+# replaces. Every memory module is present and trained, so nothing loads fresh and nothing is
+# zero-init: this run changes exactly one thing against r16up6ey, the trainable backbone. That
+# makes it the clean test of whether co-adaptation is what the memory read has been missing,
+# and it keeps the within-run M-curve comparable to r16up6ey's rather than restarting it.
+checkpoint_path = '/groups/karashchuk/home/karashchukl/results/posetail-memory-v1/wandb/run-20260727_113901-r16up6ey/files/checkpoints/checkpoint_00163840.pth'
 
 
 
@@ -249,8 +258,8 @@ print_freq = 96 # in iterations
 debug_ix = -1 # only works for val
 
 [training.optimizer]
-# Decoder trains from scratch on the frozen backbone -> 5e-4 base LR (6i8ryveg). encoder_lr_scale
-# moot (encoder frozen).
+# Continuing a trained memory model, not starting one, so the base LR stays at the finetune
+# value rather than the 5e-4 used when the decoder trained from scratch (6i8ryveg).
 learning_rate = 1e-4
 muon_schedulefree = true
 weight_decay = 0.002
@@ -259,6 +268,9 @@ muon_warmup_steps = 2000
 beta1 = 0.9
 beta2 = 0.95
 
+# Live again now that the last 12 blocks train: 2.5e-5 on the backbone against 1e-4 elsewhere.
+# The backbone here is already well-trained and the memory modules are the ones that need to
+# move, so the encoder gets the smaller step.
 encoder_lr_scale = 0.25
 
 [training.scheduler]
