@@ -831,26 +831,52 @@ class TotalLoss(nn.Module):
                 feature_loss = torch.tensor(0.0, device=device)
                 bad_feature_loss = torch.tensor(0.0, device=device)
 
-        losses = [
-            coords_loss, occluded_coords_loss,
-            coords_loss_direct,
-            coords_loss_rays,
-            coords_loss_triangulate,
-            coords_loss_direct_reproj,
-            coords_loss_rays_reproj,
-            coords_loss_triangulate_reproj,
-            vis_loss,  # 3D noisy-OR visibility (inert unless vis_loss_3d_weight > 0)
-            vis_loss_cams,
-            conf_loss,
-            conf_loss_2d,
-            coords_loss_2d, coords_loss_depth,
-            coords_softmax_2d, coords_softmax_3d, depth_softmax,
-            smoothness_loss_3d, smoothness_loss_2d,
+        named_losses = [
+            ('coords_loss', coords_loss), ('occluded_coords_loss', occluded_coords_loss),
+            ('coords_loss_direct', coords_loss_direct),
+            ('coords_loss_rays', coords_loss_rays),
+            ('coords_loss_triangulate', coords_loss_triangulate),
+            ('coords_loss_direct_reproj', coords_loss_direct_reproj),
+            ('coords_loss_rays_reproj', coords_loss_rays_reproj),
+            ('coords_loss_triangulate_reproj', coords_loss_triangulate_reproj),
+            # 3D noisy-OR visibility (inert unless vis_loss_3d_weight > 0)
+            ('vis_loss', vis_loss),
+            ('vis_loss_cams', vis_loss_cams),
+            ('conf_loss', conf_loss),
+            ('conf_loss_2d', conf_loss_2d),
+            ('coords_loss_2d', coords_loss_2d), ('coords_loss_depth', coords_loss_depth),
+            ('coords_softmax_2d', coords_softmax_2d),
+            ('coords_softmax_3d', coords_softmax_3d),
+            ('depth_softmax', depth_softmax),
+            ('smoothness_loss_3d', smoothness_loss_3d),
+            ('smoothness_loss_2d', smoothness_loss_2d),
             # occluded_coords_loss_2d, # too crazy
-            feature_loss, bad_feature_loss
+            ('feature_loss', feature_loss), ('bad_feature_loss', bad_feature_loss)
         ]
 
-        losses = torch.stack(losses)
+        # A NON-FINITE TERM THAT IS STILL ATTACHED TO THE GRAPH IS A BUG, NOT AN INERT TERM.
+        #
+        # NaN is this class's deliberate signal for "this term is switched off": every sub-loss
+        # returns `_nan()` when its weight is 0, and the filter below exists to drop those. But
+        # dropping is not detaching -- `losses[isfinite]` is a masked_select, and its backward
+        # hands the dropped element a real 0.0 gradient, which multiplied by the term's own NaN
+        # local derivative gives NaN. So a term that goes non-finite by ACCIDENT is silently
+        # removed from the forward total and silently destroys the backward one.
+        #
+        # The two cases are cleanly distinguishable: an intentionally-inert term is a detached
+        # leaf built by `_nan()`, while a poisoned one carries a grad_fn. Checking
+        # `requires_grad` therefore names the real failure with no false positives on the
+        # switched-off terms.
+        poisoned = [name for name, loss in named_losses
+                    if loss.requires_grad and not torch.isfinite(loss)]
+        if poisoned:
+            raise ValueError(
+                f'sub-loss(es) went non-finite while attached to the autograd graph: '
+                f'{poisoned}. These would be dropped from the forward total and would still '
+                f'return NaN gradients to every upstream parameter. The usual cause is a '
+                f'non-finite TARGET reaching a loss that does not mask its inputs.')
+
+        losses = torch.stack([loss for _, loss in named_losses])
         losses = losses[torch.isfinite(losses)]
         total_loss = losses.sum() / 50.0  # normalize to bring in 0-1 range
 
@@ -896,14 +922,37 @@ class BCELossVis(nn.Module):
         self.gamma = gamma 
         self.weight = weight
 
-    def _compute_loss(self, vis_pred, vis_true): 
+    def _compute_loss(self, vis_pred, vis_true):
 
+        # A NON-FINITE TARGET MEANS "NOT ASSESSED", and it must be masked at the INPUT.
+        #
+        # Letting a NaN reach binary_cross_entropy_with_logits poisons the backward pass even
+        # though TotalLoss drops the non-finite sub-loss from its forward sum (:854): that filter
+        # is a masked_select, whose backward hands the dropped element a real 0.0 gradient, and
+        # BCEWithLogitsBackward then computes 0.0 * (sigmoid(x) - NaN) = NaN. The result is a
+        # healthy-looking loss curve while every upstream parameter receives NaN -- measured as
+        # 36 of 40 training steps skipped on a non-finite gradient, with the printed loss falling
+        # normally the whole time.
+        #
+        # Same hazard the coordinate losses already guard (see WeightedMAELoss._compute_loss and
+        # BCELossConf._compute_loss), and the same substitute-then-mask idiom: the target is
+        # replaced at invalid positions so NaN never enters a differentiable op, and the
+        # reduction divides by the number of assessed entries rather than by all of them.
+        #
+        # This is what lets a three-state visibility annotation (visible / occluded / not
+        # assessed) be expressed to the loss. Without it, callers must collapse "not assessed"
+        # into "not visible" and train the visibility head on targets it was never given.
+        valid = torch.isfinite(vis_true)
+        if not valid.any():
+            return torch.tensor(float('nan'), device = vis_pred.device)
+
+        target = torch.where(valid, vis_true, torch.zeros_like(vis_true)).float()
         loss = F.binary_cross_entropy_with_logits(
-            vis_pred, 
-            vis_true.float(), 
-            reduction = 'mean')
+            vis_pred,
+            target,
+            reduction = 'none')
 
-        return loss 
+        return (loss * valid).sum() / valid.sum()
 
     def forward(self, vis_pred, vis_true, device = None):
 
