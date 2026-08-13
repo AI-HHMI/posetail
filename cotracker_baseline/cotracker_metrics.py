@@ -35,8 +35,8 @@ from posetail.posetail.eval_metrics import get_eval_metrics
 # Explicit --thresholds always overrides these.
 DATASET_THRESHOLDS = {
     'dex_ycb':          [x / 100 for x in [1, 2, 5, 10, 20]],
-    'kubric-multiview': [x / 100 for x in [0.65, 1.3, 2.6, 5.2, 10.4]],
-    'cmupanoptic_3dgs': [x / 13  for x in [5, 10, 20, 40]],
+    'kubric-multiview': [x / 13 for x in [0.65, 1.3, 2.6, 5.2, 10.4]],
+    'cmupanoptic_3dgs': [x / 100  for x in [5, 10, 20, 40]],
 }
 
 
@@ -140,8 +140,12 @@ def run_trial(pred_path, pose_path, thresholds, survival_threshold, prefix):
     coords_pred = torch.from_numpy(
         coords_3d[np.newaxis].astype(np.float32)                       # (1, T, N, 3)
     )
+    # get_eval_metrics expects raw logits (applies sigmoid internally).
+    # Convert bool visibility to large-magnitude logits so sigmoid maps
+    # True → ~1.0 and False → ~0.0 correctly.
+    vis_logits = np.where(visibility, 10.0, -10.0).astype(np.float32)
     vis_pred = torch.from_numpy(
-        visibility[np.newaxis, :, :, np.newaxis].astype(np.float32)    # (1, T, N, 1)
+        vis_logits[np.newaxis, :, :, np.newaxis]                        # (1, T, N, 1)
     )
 
     coords_true_np, vis_true_np = load_ground_truth(pose_path, frame_numbers, valid_mask)

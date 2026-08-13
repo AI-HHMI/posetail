@@ -134,12 +134,12 @@ def find_trials(dataset_root, datasets=None, splits=None, trials=None):
 
 
 def _is_trial_dir(path):
-    """A trial directory contains metadata.yaml + pose3d.npz + img/ or vid/."""
-    return (
-        (path / 'metadata.yaml').exists()
-        and (path / 'pose3d.npz').exists()
-        and ((path / 'img').exists() or (path / 'vid').exists())
-    )
+    """A trial directory contains pose data + img/ or vid/.
+    3D trials have pose3d.npz + metadata.yaml; tapvid2d has pose2d.npz with no metadata."""
+    has_pose = (path / 'pose3d.npz').exists() or (path / 'pose2d.npz').exists()
+    has_video = (path / 'img').exists() or (path / 'vid').exists()
+    has_meta_or_2d = (path / 'metadata.yaml').exists() or (path / 'pose2d.npz').exists()
+    return has_pose and has_video and has_meta_or_2d
 
 
 

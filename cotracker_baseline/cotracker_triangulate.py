@@ -133,8 +133,11 @@ def triangulate_tracks(
 def process_trial(
     trial_path: str,
     output_trial_path: str,
+    inference_trial_path: str = None,
     min_cams: int = 2,
     overwrite: bool = False,
+    n_views: int = None,
+    view_seed: int = 0,
 ):
     os.makedirs(output_trial_path, exist_ok=True)
     out_path = os.path.join(output_trial_path, "cotracker_3d.npz")
@@ -142,7 +145,8 @@ def process_trial(
         print(f"    [skip] already done (--overwrite to redo)")
         return
 
-    cotracker_dir = os.path.join(output_trial_path, "cotracker")
+    infer_path = inference_trial_path if inference_trial_path is not None else output_trial_path
+    cotracker_dir = os.path.join(infer_path, "cotracker")
     metadata_path = os.path.join(trial_path, "metadata.yaml")
 
     if not os.path.isdir(cotracker_dir):
@@ -168,6 +172,14 @@ def process_trial(
 
     # Only keep cameras that are in both the metadata and the predictions
     cam_names_used = [n for n in cam_names_all if n in cam_names_pred]
+
+    # Subsample to n_views cameras if requested
+    if n_views is not None and len(cam_names_used) > n_views:
+        rng = np.random.RandomState(view_seed)
+        indices = sorted(rng.choice(len(cam_names_used), n_views, replace=False))
+        print(f"    Subsampling {n_views}/{len(cam_names_used)} cameras: indices {indices}")
+        cam_names_used = [cam_names_used[i] for i in indices]
+
     if len(cam_names_used) < min_cams:
         print(
             f"    [skip] only {len(cam_names_used)} camera(s) with predictions, "
@@ -244,13 +256,20 @@ def parse_args():
     p.add_argument("--datasets", nargs="+", required=True,
                    help="One or more dataset names (sub-folders of dataset-root)")
     p.add_argument("--output-root", required=True,
-                   help="Root directory where cotracker/ predictions were saved "
-                        "(same value used for inference); cotracker_3d.npz is written here too")
+                   help="Root directory to write cotracker_3d.npz results")
+    p.add_argument("--inference-root", default=None,
+                   help="Root where cotracker/ per-camera predictions live "
+                        "(default: same as --output-root)")
     p.add_argument("--split", default="test",
                    help="Which split to process (default: test)")
     p.add_argument("--min-cams", type=int, default=2,
                    help="Minimum cameras needed to triangulate a point "
                         "(default: 2; set higher for more robust 3D)")
+    p.add_argument("--n-views", type=int, default=None,
+                   help="Randomly subsample this many cameras before triangulation "
+                        "(default: use all available)")
+    p.add_argument("--view-seed", type=int, default=0,
+                   help="RNG seed for camera subsampling (default: 0)")
     p.add_argument("--overwrite", action="store_true",
                    help="Re-triangulate trials that already have cotracker_3d.npz")
     return p.parse_args()
@@ -272,12 +291,19 @@ def main():
                 output_trial_path = os.path.join(
                     args.output_root, dataset_name, args.split, session, trial
                 )
+                infer_root = args.inference_root or args.output_root
+                inference_trial_path = os.path.join(
+                    infer_root, dataset_name, args.split, session, trial
+                )
                 print(f"  {session}/{trial}")
                 process_trial(
                     trial_path=trial_path,
                     output_trial_path=output_trial_path,
+                    inference_trial_path=inference_trial_path,
                     min_cams=args.min_cams,
                     overwrite=args.overwrite,
+                    n_views=args.n_views,
+                    view_seed=args.view_seed,
                 )
 
     print("Done.")

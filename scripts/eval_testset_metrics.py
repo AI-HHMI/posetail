@@ -49,26 +49,33 @@ from posetail.inference.inference_utils import load_model_from_base_folder, run_
 from posetail.posetail.eval_metrics import get_eval_metrics              # noqa: E402
 
 DEFAULT_WANDB = '/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260628_134003-39yczenk'
-ROOT = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v3'
+DEFAULT_ROOT = '/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-pretraining-v5'
 
-# per-dataset run + scoring settings. thresholds/survival are the mvtracker evaluator_3dpt
-# settings; n_views/max_kpts are the inference caps (cmupanoptic_3dgs is dense + many-camera).
+# TAP-Vid default thresholds (δavg over {1,2,4,8,16}) used for any dataset not listed below.
+DEFAULT_SETTINGS = dict(thresholds=[1, 2, 4, 8, 16], survival=50, n_views=None, max_kpts=2500)
+
+# per-dataset overrides. thresholds/survival are dataset-specific world-unit scales;
+# n_views/max_kpts cap inference (cmupanoptic_3dgs is dense + many-camera).
 SETTINGS = {
     'dex_ycb':          dict(thresholds=[0.01, 0.02, 0.05, 0.10, 0.20], survival=0.10,
                              n_views=None, max_kpts=2500),
     'kubric-multiview': dict(thresholds=[0.05, 0.1, 0.2, 0.4, 0.8],     survival=0.50,
                              n_views=None, max_kpts=2500),
     'cmupanoptic_3dgs': dict(thresholds=[0.05, 0.10, 0.20, 0.40],       survival=1.0,
-                             n_views=14, max_kpts=600),
+                             n_views=4, max_kpts=600),
 }
 METRIC_KEYS = ['mte', 'mpjpe', 'delta_x_avg', 'survival_rate', 'occlusion_acc',
                'occlusion_acc_percam', 'avg_jaccard']
 
 
-def find_test_trials(dataset):
-    # glob follows the v3->v2 symlink for cmupanoptic_3dgs
-    trials = sorted(glob.glob(os.path.join(ROOT, dataset, 'test', '*', 'trial')))
-    return [t for t in trials if os.path.exists(os.path.join(t, 'pose3d.npz'))]
+def find_test_trials(dataset, root):
+    # glob follows the v3->v2 symlink for cmupanoptic_3dgs.
+    # Supports old convention (test/<subject>/trial/pose3d.npz) and tapvid layouts
+    # (test/<seq>/<id>/pose3d.npz for tapvid3d, test/<cat>/<name>/pose2d.npz for tapvid2d).
+    base = os.path.join(root, dataset, 'test')
+    pose3d = glob.glob(os.path.join(base, '**', 'pose3d.npz'), recursive=True)
+    pose2d = glob.glob(os.path.join(base, '**', 'pose2d.npz'), recursive=True)
+    return sorted(set(os.path.dirname(p) for p in pose3d + pose2d))
 
 
 def eval_outputs(out, thresholds, survival):
@@ -120,8 +127,9 @@ def write_report(all_summary, out_dir):
           '## Mean over trials', '', table('mean'), '',
           '## Median over trials', '', table('median'), '',
           'Thresholds (world units): '
-          + '; '.join(f'{ds} {SETTINGS[ds]["thresholds"]} surv={SETTINGS[ds]["survival"]}'
-                      for ds in all_summary if ds in SETTINGS)
+          + '; '.join(f'{ds} {SETTINGS.get(ds, DEFAULT_SETTINGS)["thresholds"]} '
+                      f'surv={SETTINGS.get(ds, DEFAULT_SETTINGS)["survival"]}'
+                      for ds in all_summary)
           + '. Per-trial breakdowns in `<dataset>/metrics.json`.']
     with open(os.path.join(out_dir, 'metrics.md'), 'w') as f:
         f.write('\n'.join(md))
@@ -129,10 +137,14 @@ def write_report(all_summary, out_dir):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--datasets', nargs='+', required=True, choices=list(SETTINGS),
-                    help='which datasets to evaluate')
+    ap.add_argument('--datasets', nargs='+', required=True,
+                    help='which datasets to evaluate; unknown datasets use TAP-Vid defaults '
+                         f'(thresholds={DEFAULT_SETTINGS["thresholds"]}, '
+                         f'survival={DEFAULT_SETTINGS["survival"]})')
     ap.add_argument('--out', required=True,
                     help='predictions/output folder: <out>/<dataset>/<trial>.npz (reused if present)')
+    ap.add_argument('--root', default=DEFAULT_ROOT,
+                    help='dataset root: expects <root>/<dataset>/test/.../trial/pose3d.npz')
     ap.add_argument('--wandb-folder', default=DEFAULT_WANDB,
                     help='wandb run dir (files/config.toml + files/checkpoints/); only loaded '
                          'when a trial needs inference')
@@ -174,12 +186,13 @@ def main():
     # which trials are cached (fast) vs need inference (slow).
     work = []
     for ds in args.datasets:
-        cfg = SETTINGS[ds]
+        cfg = SETTINGS.get(ds, DEFAULT_SETTINGS)
         n_views = args.n_views if args.n_views is not None else cfg['n_views']
         max_kpts = args.max_kpts if args.max_kpts is not None else cfg['max_kpts']
         ds_out = os.path.join(args.out, ds); os.makedirs(ds_out, exist_ok=True)
-        for tp in find_test_trials(ds):
-            tid = os.path.basename(os.path.dirname(tp))
+        test_base = os.path.join(args.root, ds, 'test')
+        for tp in find_test_trials(ds, args.root):
+            tid = os.path.relpath(tp, test_base).replace(os.sep, '_')
             npz = os.path.join(ds_out, f'{tid}.npz')
             work.append(dict(ds=ds, cfg=cfg, n_views=n_views, max_kpts=max_kpts, tp=tp,
                              tid=tid, npz=npz, cached=os.path.exists(npz) and not args.force))

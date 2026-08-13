@@ -401,6 +401,7 @@ class PosetailInferenceDataset(Dataset):
         cam_metadata = load_yaml(camera_metadata_path)
         offset_dict = None
         cam_type = 'pinhole'
+        moving = cam_metadata.get('moving_cams', False)
 
         intrinsics_dict = cam_metadata['intrinsic_matrices']
         extrinsics_dict = cam_metadata['extrinsic_matrices']
@@ -408,10 +409,10 @@ class PosetailInferenceDataset(Dataset):
         heights_dict = cam_metadata['camera_heights']
         widths_dict = cam_metadata['camera_widths']
 
-        if 'offset_dict' in cam_metadata: 
+        if 'offset_dict' in cam_metadata:
             offset_dict = cam_metadata['offset_dict']
 
-        if 'cam_type' in cam_metadata: 
+        if 'cam_type' in cam_metadata:
             cam_type = cam_metadata['cam_type']
 
         # sort camera names either numerically or alphabetically
@@ -419,17 +420,23 @@ class PosetailInferenceDataset(Dataset):
 
         if all(cam_name.isdigit() for cam_name in cam_names):
             cam_names = sorted(cam_names, key = int)
-        else: 
-            cam_names = sorted(cam_names) 
+        else:
+            cam_names = sorted(cam_names)
 
         cams = []
 
-        for cam_name in cam_names: 
+        for cam_name in cam_names:
 
-            rvec, tvec = disassemble_extrinsics(extrinsics_dict[cam_name])
+            ext = extrinsics_dict[cam_name]
+            mat = intrinsics_dict[cam_name]
+            if moving:
+                ext = np.asarray(ext, dtype=np.float64)[0]
+                mat_arr = np.asarray(mat, dtype=np.float64)
+                mat = mat_arr[0] if mat_arr.ndim == 3 else mat_arr
+            rvec, tvec = disassemble_extrinsics(ext)
 
             cam = Camera(
-                matrix = intrinsics_dict[cam_name],
+                matrix = mat,
                 dist = distortions_dict[cam_name],
                 rvec = rvec,
                 tvec = tvec,

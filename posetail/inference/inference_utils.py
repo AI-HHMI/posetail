@@ -489,6 +489,7 @@ def load_camera_group_from_metadata(metadata_path, device='cpu'):
 
     offset_dict = cam_metadata.get('offset_dict', None)
     cam_type = cam_metadata.get('cam_type', 'pinhole')
+    moving = cam_metadata.get('moving_cams', False)
 
     intrinsics_dict = cam_metadata['intrinsic_matrices']
     extrinsics_dict = cam_metadata['extrinsic_matrices']
@@ -504,10 +505,16 @@ def load_camera_group_from_metadata(metadata_path, device='cpu'):
 
     cams = []
     for cam_name in cam_names:
-        rvec, tvec = disassemble_extrinsics(extrinsics_dict[cam_name])
+        ext = extrinsics_dict[cam_name]
+        mat = intrinsics_dict[cam_name]
+        if moving:
+            ext = np.asarray(ext, dtype=np.float64)[0]
+            mat_arr = np.asarray(mat, dtype=np.float64)
+            mat = mat_arr[0] if mat_arr.ndim == 3 else mat_arr
+        rvec, tvec = disassemble_extrinsics(ext)
 
         cam = Camera(
-            matrix=intrinsics_dict[cam_name],
+            matrix=mat,
             dist=distortions_dict[cam_name],
             rvec=rvec,
             tvec=tvec,
