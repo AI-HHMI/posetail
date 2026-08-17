@@ -387,12 +387,67 @@ def get_start_ixs_test(coords, n_frames):
     return start_ixs, intervals
 
     
+def crop_box_for_points(p2d, size, min_crop_dim):
+    """Compute the crop box enclosing `p2d`, as a pure value.
+
+    p2d:  (..., 2) pixel coordinates for ONE camera (NaNs ignored).
+    size: (2,) int tensor, that camera's (width, height).
+    min_crop_dim: minimum box side before the image-bounds cap.
+
+    Returns an int32 (4,) tensor [x1, y1, x2, y2].
+
+    Exposed separately from crop_cgroup_to_points (which mutates a camera group and returns it as
+    a side effect) because the box itself is a useful value -- notably as a detector's regression
+    target, where "the crop the pose model was trained on" has to be reproducible exactly.
+    crop_cgroup_to_points* call this, so there is one implementation and no drift.
+    """
+    pflat = p2d.reshape(-1, 2)
+    good = torch.all(torch.isfinite(pflat), dim=1)
+    pflat = pflat[good]
+    low = torch.clamp(torch.min(pflat, dim=0).values - 20, torch.tensor([0, 0]), size).to(torch.int32)
+    high = torch.clamp(torch.max(pflat, dim=0).values + 20, torch.tensor([0, 0]), size).to(torch.int32)
+
+    current_width = high[0] - low[0]
+    current_height = high[1] - low[1]
+
+    # Each axis is capped at the image dimension so the crop never
+    # exceeds image bounds. Without the cap, a wide bbox (e.g. 700 px
+    # on a 540-tall image) forces min_dim=700 > size[1]=540, making
+    # torch.clamp(x, 0, size[1]-min_dim) return a negative max value
+    # and producing a negative cam['offset'] that breaks project_cam.
+    base = max(min_crop_dim, int(current_width), int(current_height))
+    min_dim_x = min(base, int(size[0]))
+    min_dim_y = min(base, int(size[1]))
+
+    if current_width < min_dim_x:
+        center_x = (low[0] + high[0]) // 2
+        low[0] = torch.clamp(center_x - min_dim_x // 2, 0, size[0] - min_dim_x)
+        high[0] = low[0] + min_dim_x
+
+    if current_height < min_dim_y:
+        center_y = (low[1] + high[1]) // 2
+        low[1] = torch.clamp(center_y - min_dim_y // 2, 0, size[1] - min_dim_y)
+        high[1] = low[1] + min_dim_y
+
+    return torch.cat([low, high])
+
+
 def custom_collate(batch):
     ''' 
     custom collate functon to enable returning 
     non-tensor, non-list, etc type objects from 
     the default collate function
     '''
+    # The model takes ONE camera group per batch, and `cgroup = batch[4][0]` below keeps only
+    # item 0's -- every later item would be projected, scaled and triangulated through item 0's
+    # rig, silently, whenever a batch mixes sessions. batch_size is therefore structurally 1;
+    # assert it rather than leaving that to the mixed-2D/3D check below, which guards a
+    # different failure and lets same-dimensionality items from different rigs straight through.
+    assert len(batch) == 1, (
+        f'custom_collate keeps only item 0\'s camera group, so batch_size must be 1 '
+        f'(got {len(batch)}). Every other item would be projected through the wrong rig. '
+        f'Use gradient accumulation, or collate cgroup as a list and have the model iterate.')
+
     batch = list(zip(*batch))
 
     views = [torch.stack(v, dim = 0) for v in zip(*list(batch[0]))]
@@ -744,6 +799,14 @@ class PosetailDataset(Dataset):
             size_tensor = cgroup[0]['size']
             valid_mask = _vis_2d_bounds(coords, size_tensor)
 
+            # WARNING -- KEYPOINT IDENTITY IS NOT ARRAY POSITION AFTER THIS LINE.
+            # Filtering the keypoint axis shrinks N and shifts every downstream index, so which
+            # body part sits at row j depends on which points happened to be labelled in THIS
+            # window. Any consumer that keys a keypoint by position (a per-keypoint embedding
+            # table, a registry, a metric broken out by body part) is silently mis-aligned; the
+            # loss still decreases, because this is a permutation rather than a corruption.
+            # Note this runs whenever query_anytime is set, INDEPENDENT of enable_kpt_filtering
+            # (which gates only filter_keypoints further below). Consumers must key by name.
             if self.query_anytime:
                 mask = valid_mask.sum(dim=0) >= 2
             else:
@@ -901,6 +964,10 @@ class PosetailDataset(Dataset):
                 proxy_vis = rearrange(cam_visible, 'c t n -> t n c').sum(dim=-1) >= self.cam_thresh_for_vis
                 valid_mask = valid_mask & proxy_vis
 
+            # WARNING -- KEYPOINT IDENTITY IS NOT ARRAY POSITION AFTER THIS LINE. See the
+            # matching note in the 2D path above: this shrinks N and renumbers the keypoint axis
+            # per window, so downstream consumers must key by NAME, not by index. Runs whenever
+            # query_anytime is set, independent of enable_kpt_filtering.
             if self.query_anytime:
                 mask = valid_mask.sum(dim=0) >= 2
             else:
@@ -1146,30 +1213,7 @@ class PosetailDataset(Dataset):
         coords stay aligned with the cropped image.
         """
         size = cgroup[0]['size']  # one camera
-        pflat = coords.reshape(-1, 2)
-        good = torch.all(torch.isfinite(pflat), dim=1)
-        pflat = pflat[good]
-        low = torch.clamp(torch.min(pflat, dim=0).values - 20, torch.tensor([0, 0]), size).to(torch.int32)
-        high = torch.clamp(torch.max(pflat, dim=0).values + 20, torch.tensor([0, 0]), size).to(torch.int32)
-
-        current_width = high[0] - low[0]
-        current_height = high[1] - low[1]
-
-        base = max(self.min_crop_dim, int(current_width), int(current_height))
-        min_dim_x = min(base, int(size[0]))
-        min_dim_y = min(base, int(size[1]))
-
-        if current_width < min_dim_x:
-            center_x = (low[0] + high[0]) // 2
-            low[0] = torch.clamp(center_x - min_dim_x // 2, 0, size[0] - min_dim_x)
-            high[0] = low[0] + min_dim_x
-
-        if current_height < min_dim_y:
-            center_y = (low[1] + high[1]) // 2
-            low[1] = torch.clamp(center_y - min_dim_y // 2, 0, size[1] - min_dim_y)
-            high[1] = low[1] + min_dim_y
-
-        crop = torch.cat([low, high])
+        crop = crop_box_for_points(coords, size, self.min_crop_dim)
         x1, y1, x2, y2 = crop
 
         # Match the 3D convention (crop_cgroup_to_points): only `offset` tracks the
@@ -1193,37 +1237,8 @@ class PosetailDataset(Dataset):
         crops = []
 
         for cnum in range(p2d.shape[0]):
-            
-            size = cgroup[cnum]['size']
-            pflat = p2d[cnum].reshape(-1, 2)
-            good = torch.all(torch.isfinite(pflat), dim=1)
-            pflat = pflat[good]
-            low = torch.clamp(torch.min(pflat, dim=0).values - 20, torch.tensor([0,0]), size).to(torch.int32)
-            high = torch.clamp(torch.max(pflat, dim=0).values + 20, torch.tensor([0,0]), size).to(torch.int32)
-
-            current_width = high[0] - low[0]
-            current_height = high[1] - low[1]
-
-            # Each axis is capped at the image dimension so the crop never
-            # exceeds image bounds. Without the cap, a wide bbox (e.g. 700 px
-            # on a 540-tall image) forces min_dim=700 > size[1]=540, making
-            # torch.clamp(x, 0, size[1]-min_dim) return a negative max value
-            # and producing a negative cam['offset'] that breaks project_cam.
-            base = max(self.min_crop_dim, int(current_width), int(current_height))
-            min_dim_x = min(base, int(size[0]))
-            min_dim_y = min(base, int(size[1]))
-
-            if current_width < min_dim_x:
-                center_x = (low[0] + high[0]) // 2
-                low[0] = torch.clamp(center_x - min_dim_x // 2, 0, size[0] - min_dim_x)
-                high[0] = low[0] + min_dim_x
-
-            if current_height < min_dim_y:
-                center_y = (low[1] + high[1]) // 2
-                low[1] = torch.clamp(center_y - min_dim_y // 2, 0, size[1] - min_dim_y)
-                high[1] = low[1] + min_dim_y
-
-            crops.append(torch.cat([low, high]))
+            crops.append(crop_box_for_points(p2d[cnum], cgroup[cnum]['size'],
+                                             self.min_crop_dim))
 
         # camera crops
         camera_group_cropped = []

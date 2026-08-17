@@ -11,14 +11,22 @@ from posetail.posetail.cube import to_homogeneous, from_homogeneous, signed_log1
 from collections import defaultdict
 
 
-def coordinate_softmax_loss(logits, target_xy, vis_mask, pixel_size=256):
+def coordinate_softmax_loss(logits, target_xy, vis_mask, pixel_size=None):
     """Cross-entropy on per-axis 2D position logits vs target pixels — the primary
     2D objective in upstream TAPNext++ (torch_losses.coordinate_softmax). The
     soft-argmax track-head emits ``2*P`` logits = [P x-bins | P y-bins]; we quantize
     the target pixel (minus the 0.5 bin-centre offset the head adds) to a bin index
     and apply masked CE. ``logits`` (..., 2P); ``target_xy`` (..., 2) pixels (x,y);
-    ``vis_mask`` (..., 1). Returns a scalar (unweighted)."""
+    ``vis_mask`` (..., 1). Returns a scalar (unweighted).
+
+    ``pixel_size`` (the clamp bound) DEFAULTS TO P, derived from the logits themselves. It used
+    to default to a hardcoded 256 while every caller omitted it and P is really ``image_size``:
+    above 256 that silently collapsed every target beyond bin 255, and below 256 the clamp could
+    emit an index >= P and crash cross_entropy. Deriving it from the logits makes the two agree
+    by construction. Passing it explicitly is still honoured."""
     P = logits.shape[-1] // 2
+    if pixel_size is None:
+        pixel_size = P
     logits_x, logits_y = logits[..., :P], logits[..., P:]
     finite = torch.isfinite(target_xy).all(dim=-1)
     valid = (vis_mask[..., 0] > 0.5) & finite
@@ -313,12 +321,53 @@ class TotalLoss(nn.Module):
     def reset_history(self):
         self.loss_history = {name: [] for name in list(self.loss_history.keys())}
 
+    def _warn_unconsumed_weights(self, model, outputs):
+        """Warn once for a nonzero loss weight whose gating output the model never emits.
+
+        Both weights below are live, settable constructor arguments that simply never fire with a
+        TrackerEncoder: `coords_pred_iters` survives there only as a commented-out block and
+        `feature_planes_levels` is emitted by the OTHER model class (tracker.py) alone. Without
+        this a user sets feature_loss_weight=0.5, sees no error, watches the loss go down, and
+        concludes the term is doing something.
+        """
+        if getattr(self, '_warned_unconsumed', False):
+            return
+        self._warned_unconsumed = True
+
+        model_name = type(model).__name__
+        for weight, attr, key in (
+            (getattr(self, 'feature_loss_weight', 0), 'feature_loss_weight',
+             'feature_planes_levels'),
+            (getattr(self, 'gamma', 0) if 'coords_pred_iters' not in outputs else 0,
+             'gamma (iteration-decay weights)', 'coords_pred_iters'),
+        ):
+            if weight and key not in outputs:
+                print(f'  [warn] {attr}={weight} is nonzero but {model_name} never emits '
+                      f"'{key}', so the term can never fire. It is silently inert.")
+
 
     def forward(self, model, outputs, coords_true,
                 vis_true, vis_true_cams, cgroup=None, p2d=None, device=None):
 
+        # vis_true / vis_true_cams are BOTH-OR-NEITHER, and the two one-sided cases fail
+        # differently -- one loudly, one silently, which is why this is checked here:
+        #   vis_true given, vis_true_cams None -> rearrange(None, ...) dies inside einops. LOUD.
+        #   vis_true_cams given, vis_true None -> the recompute branch below runs and
+        #       UNCONDITIONALLY OVERWRITES vis_true_cams with is_point_visible, i.e. "inside the
+        #       frustum", silently discarding a real per-camera occlusion channel. SILENT.
+        if (vis_true is None) != (vis_true_cams is None):
+            given, missing = (('vis_true', 'vis_true_cams') if vis_true is not None
+                              else ('vis_true_cams', 'vis_true'))
+            raise ValueError(
+                f'vis_true and vis_true_cams are both-or-neither: got {given} but '
+                f'{missing}=None. Supplying only vis_true_cams silently DISCARDS it (it is '
+                f'recomputed from geometry); supplying only vis_true dies inside einops. Pass '
+                f'both, or neither to derive both from the coordinates.')
+
         B, T, N, R = coords_true.shape
         is_true_2d = (R == 2)
+
+        self._warn_unconsumed_weights(model, outputs)
 
         coords_pred = outputs['coords_pred']
         vis_pred = outputs['vis_pred']
@@ -1133,8 +1182,13 @@ class SmoothnessLoss(nn.Module):
         if self.weight == 0:
             return torch.tensor(float('nan'), device=device)
 
-        k = self.order
         T = coords_true.shape[time_dim]
+        # Degrade to a lower-order difference on short windows rather than raising: `narrow`
+        # below takes length T-k and dies on a negative length, so order=4 (the default) used to
+        # kill any window shorter than 5 frames. A k-th difference needs k+1 samples.
+        if T < 2:
+            return torch.tensor(0.0, device=device)
+        k = min(self.order, T - 1)
 
         # Build per-position validity: visible AND finite GT coord.
         # NaN in vis_true → (NaN > 0.5) is False → excluded automatically.

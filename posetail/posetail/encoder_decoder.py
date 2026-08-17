@@ -22,6 +22,15 @@ from posetail.posetail.vjepa2 import (
 )
 
 
+# Default soft-argmax local-window half-width, as a FRACTION of the head's own bin count K.
+# _grid_softmax serves two heads with different K (3D/depth at head_3d_grid_size, 2D pixels at
+# image_size), so an absolute bin count means different things to each. 0.06 reproduces the
+# swept optimum at K=1024 (61 bins, a 123-bin window; measured best of 10/20/30/45/60/120/inf)
+# and the historical default of 20 at K<=333 via the floor -- so small grids are unchanged.
+_SOFT_ARGMAX_WINDOW_FRAC = 0.06
+_SOFT_ARGMAX_MIN_BINS = 20
+
+
 def sample_feature_cubes_time(feature_planes, camera_group,
                               cube_centers, query_time, cube_interval,
                               corr_radius=1, downsample_ratio=1,
@@ -506,7 +515,19 @@ class QueryEncoder(nn.Module):
                 occ_idx = torch.zeros((B, T_query, n_cams), dtype=torch.long,
                                       device=query_coords.device)
             else:
-                occ_idx = (occlusion.to(torch.long) + 1).clamp_(0, 2)
+                # The channel is a THREE-valued state {-1 unknown, 0 occluded, 1 visible} looked
+                # up in an Embedding(3) as value+1. forward asserts the tensor's SHAPE but not
+                # its value range, so a caller passing keypoint IDS down this channel (as
+                # posetail-pose did) silently clamped every id above 1 to 2. Make the misuse
+                # loud instead: reject values outside {-1, 0, 1}.
+                occ = occlusion.to(torch.long)
+                if (occ < -1).any() or (occ > 1).any():
+                    raise ValueError(
+                        f'occlusion must be the 3-valued state {{-1, 0, 1}}, got values in '
+                        f'[{int(occ.min())}, {int(occ.max())}]. Keypoint ids do not belong in '
+                        f'this channel (they are silently clamped to {{0,1,2}}); pass them as a '
+                        f'separate argument instead of reusing occlusion.')
+                occ_idx = occ + 1
             embed_occ = self.occ_embed(occ_idx)  # [B, T_query, n_cams, embed_dim]
 
         # Gated fusion (shared)
@@ -742,12 +763,25 @@ class SceneRepresentation(nn.Module):
 
         encoded_list = []
         for view in views:
+            # The patch embed is a Conv3d with stride tubelet_size on the time axis, so a clip
+            # shorter than one tubelet produces ZERO temporal slots. Left alone that is a silent
+            # failure in two of the five pos-embed modes ('spatial' repeats to (1,0,D) and adds
+            # cleanly to a zero-token feat; 'none' skips the block entirely) and a confusing
+            # F.interpolate error in a third. Refuse it up front instead.
+            if view.shape[1] < self.tubelet_size:
+                raise ValueError(
+                    f'clip length T={view.shape[1]} is shorter than tubelet_size='
+                    f'{self.tubelet_size}: the patch embed would emit zero temporal slots. '
+                    f'Use T >= {self.tubelet_size} (pad short clips by repeating frames).')
             xr = rearrange(view, 'b t c h w -> b c t h w')
             feat = self.encoder(xr)  # [B, n_tokens, embed_dim]
             if self.pos_embed_mode != 'none':
-                gT = view.shape[1] // self.tubelet_size
                 gH = view.shape[3] // self.patch_size
                 gW = view.shape[4] // self.patch_size
+                # Derive the temporal grid from the tokens the encoder actually produced rather
+                # than recomputing it from the input length -- the two can only disagree by being
+                # wrong, and the token count is the one the pos-embed must match.
+                gT = feat.shape[1] // (gH * gW)
                 if self.pos_embed_mode == 'learned':
                     feat = feat + self._pos_embed_for(gT, gH, gW)
                 elif self.pos_embed_mode == 'spatial':
@@ -930,12 +964,12 @@ class Decoder(nn.Module):
                  image_size=256,
                  f_eff_scale=False,
                  soft_argmax_temperature=0.5,
-                 soft_argmax_threshold=20,
+                 soft_argmax_threshold=None,
                  soft_argmax_temperature_learnable=False,
                  enable_subpixel_refinement=False,
                  subpixel_scale=0.05,
                  subpixel_temperature=10.0,
-                 grid_decode_space="head",
+                 grid_decode_space="warped",
                  learnable_scale=False,
                  learnable_scale_depth=False,
                  scale_init=1.0,
@@ -961,7 +995,14 @@ class Decoder(nn.Module):
         # (temp 0.5, window 20, fixed) reproduce the original hardcoded behavior exactly. The
         # temperature is the soft-argmax sharpness ("beta"); learnable lets it adapt per the data
         # (1 extra scalar param, loaded fresh under strict=False, no effect when not learnable).
-        self.soft_argmax_threshold = int(soft_argmax_threshold)
+        # Soft-argmax local-window half-width. Historically an ABSOLUTE bin count with a single
+        # default, but _grid_softmax is shared by two heads with DIFFERENT K: the 3D/depth heads
+        # use K = head_3d_grid_size while the 2D pixel head uses K = image_size. One constant
+        # therefore means two entirely different things (20 is 4% of a 1024-bin grid and 64% of
+        # a 64-bin one). None -> scale the default with each head's own K at decode time; an
+        # explicit integer still wins and is applied to both heads verbatim.
+        self.soft_argmax_threshold = (
+            None if soft_argmax_threshold is None else int(soft_argmax_threshold))
         self._soft_argmax_temp_fixed = float(soft_argmax_temperature)
         self.log_soft_argmax_temp = (
             nn.Parameter(torch.tensor(math.log(float(soft_argmax_temperature))))
@@ -1257,6 +1298,14 @@ class Decoder(nn.Module):
         if torch.is_tensor(softmax_temperature):
             softmax_temperature = softmax_temperature.clamp(min=1e-2, max=30.0)
         K = logits.shape[-1]
+        if soft_argmax_threshold is None:
+            # Grid-relative default: a fixed FRACTION of this head's own bin count, so the same
+            # setting means the same thing across grid sizes. The floor keeps small grids
+            # effectively untruncated (as the old absolute default was for them). The mask
+            # suppresses spurious far modes -- removing it entirely costs ~38% MPJPE -- so the
+            # window must stay narrow relative to K, not narrow in absolute bins.
+            soft_argmax_threshold = max(_SOFT_ARGMAX_MIN_BINS,
+                                        int(round(_SOFT_ARGMAX_WINDOW_FRAC * K)))
         argmax = logits.argmax(dim=-1, keepdim=True)
         index = torch.arange(K, device=logits.device)
         mask = (torch.abs(argmax - index) <= soft_argmax_threshold).float()

@@ -132,9 +132,34 @@ def project_cam(cam, p3d_t, downsample_factor = 1, max_normalized = 3.0):
     # p2d = from_homogeneous(p2d_raw)
 
     # handle camera offset
-    if 'offset' in cam:
+    # `offset` is (2,) for a static crop or (T,2) for a per-frame (moving) crop. A moving crop --
+    # one that follows the subject per frame instead of standing still over the window -- is
+    # expressible as a per-frame camera offset and nothing else: the crop rule holds the side
+    # constant, so `mat`, `ext` and `dist` are untouched. The (T,2) case is right-aligned so the
+    # time axis meets the time axis at position -3, exactly where the comment above already puts
+    # it for a (T,4,4) `ext`. A 1-D offset takes the original code path bit-for-bit.
+    if 'offset' in cam and cam['offset'] is not None:
         offset = cam['offset'].to(torch.float64)
-        p2d = p2d - offset[None, :]
+        if offset.ndim <= 1:
+            p2d = p2d - offset[None, :]
+        elif offset.ndim == 2:
+            T = offset.shape[0]
+            # A TIME-LESS POINT SET THROUGH A MOVING CAMERA IS A BUG, NOT A BROADCAST. Without
+            # this guard the subtraction happily GROWS a time axis -- (1,n,2) - (T,1,2) ->
+            # (T,n,2) -- and hands the caller a plausible tensor of the wrong rank, which then
+            # fails several frames from its cause (e.g. inside get_camera_scale). Anything
+            # projecting a pose that is not per-frame must collapse the offset to one frame
+            # first; that is exact for offset-invariant quantities (see get_camera_scale).
+            if p2d.ndim < 3 or p2d.shape[-3] != T:
+                raise ValueError(
+                    f'per-frame camera offset {tuple(offset.shape)} against points projecting '
+                    f'to {tuple(p2d.shape)}: axis -3 must be the time axis of length {T}, and '
+                    f'is {"absent" if p2d.ndim < 3 else p2d.shape[-3]}. Either give the points '
+                    'a time axis (..., T, N, 3), or collapse the offset to a single frame.')
+            p2d = p2d - offset[:, None, :]
+        else:
+            raise ValueError(
+                f'camera offset must be (2,) or (T,2), got {tuple(offset.shape)}')
 
     # account for downsampling
     p2d = p2d / downsample_factor
@@ -306,10 +331,47 @@ def triangulate_simple_batch_reg(points, camera_mats, weights):
 
 
 
+def _align_offset(off, points):
+    """Broadcast a per-frame (T,2) camera offset onto `points`, in whichever layout reached us.
+
+    Three layouts carry a time axis through this library, and they are not interchangeable:
+
+      (..., T, N, 2)  time at axis -3 -- the convention project_cam documents for `ext`, and what
+                      tracker_encoder passes (the 2D head's own prediction).
+      (T*N, 2)        flattened in (t n) order -- points_to_rays via tracker_encoder, the order
+                      that file's own comment states and that it already uses to expand a moving
+                      rig's extrinsic over rays.
+      (B, 2)          one row per ray, already resolved per ray by points_to_rays.
+
+    Assuming any one of them alone is wrong, and wrong SILENTLY, so anything ambiguous raises.
+    """
+    T = off.shape[0]
+    if points.ndim >= 3 and points.shape[-3] == T:
+        return off.reshape(*(1,) * (points.ndim - 3), T, 1, 2)
+    if points.ndim == 2 and points.shape[0] % T == 0:
+        return off.repeat_interleave(points.shape[0] // T, dim=0)
+    raise ValueError(
+        f'a per-frame camera offset of {T} frames does not line up with points of '
+        f'{tuple(points.shape)}: expected time at axis -3, or a flat (T*N, 2) in (t n) order.')
+
+
 def undistort_points(cam, points):
     matrix = cam['mat']
     dist = cam['dist']
-    offset = cam['offset']
+    # Guard the offset the way the sibling project_cam already does ('if offset in cam'): a camera
+    # dict without an offset used to raise KeyError here and work there.
+    offset = cam.get('offset')
+    if offset is None:
+        offset = points.new_zeros(2)
+
+    # A per-frame (T,2) offset enters as a PURE PRE-ADD (below, before the distortion iteration
+    # and before anything else), so folding it into the points and zeroing it is EXACT, inherits
+    # the distortion model untouched, and stays vectorised -- unlike a per-frame loop, which
+    # would be up to T python-level calls per camera per forward.
+    if offset.ndim > 1:
+        aligned = _align_offset(offset, points)
+        points = points + aligned.to(points.dtype)
+        offset = points.new_zeros(2)
 
     shape = points.shape
     points = points.reshape(-1, 2)
@@ -437,6 +499,22 @@ def get_camera_scale(camera_group, p, times=None):
         times = torch.zeros((B, N), dtype=torch.long, device=p.device)
     else:
         times = times.to(device=p.device, dtype=torch.long)
+
+    # A per-frame (T,2) offset is IRRELEVANT to this function's answer, so collapse it to frame 0
+    # rather than failing project_cam's time-axis guard below. This is EXACT: the function returns
+    # a projection SENSITIVITY (world units per pixel) via projection_sensitivity + svdvals, i.e.
+    # a Jacobian, and a constant image-plane translation has zero derivative.
+    #
+    # What is NOT exact, stated honestly: the is_point_visible gate further down genuinely does
+    # depend on the offset -- under a moving crop a point can be inside the crop on some frames
+    # and not others -- so that gate becomes "visible in the frame-0 crop". It only selects which
+    # points enter a median over keypoints, and the one caller that matters passes a query anchor
+    # with no time axis, so there is no per-frame answer to give.
+    camera_group = [
+        (dict(cam, offset=cam['offset'][0])
+         if torch.is_tensor(cam.get('offset')) and cam['offset'].ndim > 1 else cam)
+        for cam in camera_group
+    ]
 
     sensitivity = p.new_full((n_cams, B), float('nan'))
 
@@ -687,6 +765,23 @@ def points_to_rays(cam, p2d, cube_scale=1, normalize_t=True,
     B = p2d.shape[0]
     device = p2d.device
     dtype = p2d.dtype
+
+    # Per-frame camera offset: give `offset` the two cases this function's docstring already
+    # promises for `ext` below -- (2,) shared across rays, or per-ray. The one case that cannot
+    # be resolved further down is the ray-local GAUGE FRAME: the caller passes a single crop-centre
+    # point with an explicitly pinned frame-0 `ext`, because the gauge must be one stable frame for
+    # the clip rather than a different one per ray. By the time undistort_points sees a (1,2) point
+    # against a T-frame offset there is nothing left to decide it by, so resolve it HERE.
+    #
+    # Two signs are needed, because one is not enough: an explicitly pinned (4,4) ext says
+    # "shared across rays" outright, but a moving CROP leaves the rig static, so that caller
+    # passes ext=None and a check on `ext` alone misses it entirely. The general statement is
+    # arithmetic -- rays that do not divide evenly by frames cannot be one-per-frame, so they are
+    # one shared ray, and frame 0 is the anchor this function already picks for its own gauge.
+    _off = cam.get('offset')
+    if _off is not None and _off.ndim > 1:
+        if (ext is not None and ext.ndim == 2) or (B % _off.shape[0]):
+            cam = dict(cam, offset=_off[0])
 
     # Undistort and lift to normalized camera coords
     p2d_und = undistort_points(cam, p2d)          # [B, 2]

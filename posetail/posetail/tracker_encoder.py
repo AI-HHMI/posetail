@@ -74,14 +74,15 @@ class TrackerEncoder(nn.Module):
                  depth_log_max = 2.0,
                  f_eff_scale = False,
                  soft_argmax_temperature = 0.5,
-                 soft_argmax_threshold = 20,
+                 soft_argmax_threshold = None,
                  soft_argmax_temperature_learnable = False,
                  enable_subpixel_refinement = False,
                  subpixel_scale = 0.05,
                  subpixel_temperature = 10.0,
-                 grid_decode_space = 'head',
+                 grid_decode_space = 'warped',
                  learnable_scale = False,
                  learnable_scale_depth = False,
+                 rays_conf_normalize = False,
                  scale_init = 1.0,
                  scale_delta = 2.0):
         super().__init__()
@@ -164,6 +165,9 @@ class TrackerEncoder(nn.Module):
         self.use_camera_self_attention = use_camera_self_attention
         self.use_temporal_self_attention = use_temporal_self_attention
         self.output_mode = output_mode
+        # Divide the ray-fusion output by the summed per-camera confidence (see the fusion site
+        # in _decode_from_scene). False = the historical unnormalised weighted sum.
+        self.rays_conf_normalize = bool(rays_conf_normalize)
         self.scene_encoder_proj = scene_encoder_proj
         self.scene_proj_dim = scene_proj_dim
         self.scene_proj_prenorm = scene_proj_prenorm
@@ -188,10 +192,12 @@ class TrackerEncoder(nn.Module):
             'learnable_scale is redundant with gridnorm (it already solves the per-camera gauge)'
 
         # self.transform_norm = transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)
-        self.transform_norm = transforms.Compose([
-            PadToSize(self.image_size),
-            transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
-        ])
+        # Split into pad + normalize (rather than one Compose) so the pad TARGET can vary per
+        # forward: a Compose cannot forward the per-call size that multi-resolution inference
+        # needs. transform_norm is kept as the historical single-argument entry point.
+        self.pad_to_size = PadToSize(self.image_size)
+        self.normalize = transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)
+        self.transform_norm = transforms.Compose([self.pad_to_size, self.normalize])
 
 
         self.scene_encoder = SceneRepresentation(
@@ -280,7 +286,8 @@ class TrackerEncoder(nn.Module):
         print("  decoder params: {:,d}".format(count_parameters(self.decoder)))
         
     def forward(self, views, coords, camera_group, query_times=None,
-                kpt_chunk=None, occlusion=None):
+                kpt_chunk=None, occlusion=None, input_size=None,
+                scene_features=None):
         '''
         B: batch size
         T: number of frames in video
@@ -288,8 +295,28 @@ class TrackerEncoder(nn.Module):
         H: height of image
         W: width of image
         D: latent dimension
+
+        input_size: the pixel extent of the square canvas this forward runs on. None ->
+            self.image_size (the resolution the model was built at), which is the historical
+            behaviour bit-for-bit.
+
+            `image_size` is one constructor argument standing for two unrelated things: a WEIGHT
+            SHAPE (the 2D head emits 2*image_size bins, whose centres are the pix_grid buffer) and
+            the PIXEL EXTENT of the input canvas. Only the second can vary per forward, so
+            `input_size` splits them. The 2D head reports NORMALISED POSITION x image_size -- the
+            convention already frozen in the weights -- so converting its output to the input's
+            real pixels takes exactly one factor, input_size / image_size, applied where head
+            units meet camera geometry.
+
+            It is ASSERTED, NOT TRUSTED: QueryEncoder and sample_patches already derive the canvas
+            from the actual tensor, so a kwarg that disagreed with the pixels would be the same
+            class of silent wrong number this argument exists to remove.
+
+        scene_features: optionally reuse a scene encode from a previous forward over the SAME
+            views (the frozen video encoder is the bulk of the forward, so a two-pass loop that
+            re-queries the same window otherwise encodes twice). None -> encode normally.
         '''
-        
+
         device = coords.device
 
         B, N, R = coords.shape
@@ -367,24 +394,48 @@ class TrackerEncoder(nn.Module):
         assert query_times.shape[0] == B
         assert query_times.shape[1] == N
             
+        # Resolve the canvas this forward runs on. None -> the build-time image_size, i.e. the
+        # historical behaviour bit-for-bit.
+        px = self.image_size if input_size is None else int(input_size)
+        ps = self.scene_encoder.patch_size
+        if px % ps != 0:
+            raise ValueError(
+                f'input_size={px} must be a whole multiple of the encoder patch_size={ps}; a '
+                f'non-multiple silently truncates the token grid (would give '
+                f'{px // ps} patches covering only {(px // ps) * ps} of {px} pixels).')
+
         # normalize frames
         views_norm = []
         for i, frames in enumerate(views): 
             # frames = 2 * (frames / 255.0) - 1
             frames = frames.to(device)
             frames = rearrange(frames, 'b t h w c -> b t c h w')
-            frames = self.transform_norm(frames)
+            frames = self.normalize(self.pad_to_size(frames, px))
             views_norm.append(frames)
+
+        # ASSERT the contract rather than trusting it. QueryEncoder (sizes from view.shape) and
+        # sample_patches already read the canvas off the tensor, so an input_size that disagreed
+        # with the actual pixels would silently desync the 2D-head half of the forward from the
+        # query half -- the exact failure this argument exists to prevent.
+        for i, frames in enumerate(views_norm):
+            vh, vw = frames.shape[-2], frames.shape[-1]
+            if (vh, vw) != (px, px):
+                raise ValueError(
+                    f'input_size={px} disagrees with camera {i}: after padding, views[{i}] is '
+                    f'{vh}x{vw} (HxW), not {px}x{px}. Pass input_size matching the pixels you '
+                    f'supply, and resize the camera group to match (see '
+                    f'inference_dataset.resize_camera_group).')
 
         return self._forward_window(
             views_norm, coords, query_times, camera_group,
             cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
-            kpt_chunk=kpt_chunk, occlusion=occlusion)
+            kpt_chunk=kpt_chunk, occlusion=occlusion, input_size=px,
+            scene_features=scene_features)
 
     def _forward_window(self, views_norm, coords, query_times, camera_group,
                         cube_scale, cube_scale_shared, f_eff,
                         scene_center, scene_radius, kpt_chunk=None,
-                        occlusion=None):
+                        occlusion=None, input_size=None, scene_features=None):
         """Single encoder/decoder pass over the whole clip.
 
         views_norm frames are already normalized ('b t c h w'); coords are the query
@@ -398,9 +449,12 @@ class TrackerEncoder(nn.Module):
         has no cross-point attention and the scene scalars are computed over all N in
         forward(). Disabled for gridnorm, whose per-camera gauge solve couples points.
 
+        scene_features: a precomputed scene encode to reuse (see forward). None -> encode here.
+
         Returns the result dict.
         """
-        scene_features = self.scene_encoder(views_norm)
+        if scene_features is None:
+            scene_features = self.scene_encoder(views_norm)
         N = coords.shape[1]
         if kpt_chunk and N > kpt_chunk and not self.is_gridnorm:
             results = []
@@ -410,7 +464,7 @@ class TrackerEncoder(nn.Module):
                 r = self._decode_from_scene(
                     scene_features, views_norm, coords[:, k0:k1], query_times[:, k0:k1],
                     camera_group, cube_scale, cube_scale_shared, f_eff,
-                    scene_center, scene_radius, occlusion=occ)
+                    scene_center, scene_radius, occlusion=occ, input_size=input_size)
                 # Drop the loss-only grid tensors NOW (not at concat): they carry the huge
                 # per-point P/K grid dim and are unused at inference. Retaining them across the
                 # loop would accumulate all chunks' grids on-GPU (~full-N) and defeat chunking.
@@ -421,7 +475,7 @@ class TrackerEncoder(nn.Module):
         return self._decode_from_scene(
             scene_features, views_norm, coords, query_times, camera_group,
             cube_scale, cube_scale_shared, f_eff, scene_center, scene_radius,
-            occlusion=occlusion)
+            occlusion=occlusion, input_size=input_size)
 
     # Loss-only, per-point grid logits: huge (they carry the P/K grid dim) and unused at
     # inference. kpt_chunk is inference-only, so we DON'T reassemble them to full-N -- that
@@ -446,13 +500,16 @@ class TrackerEncoder(nn.Module):
 
     def _decode_from_scene(self, scene_features, views_norm, coords, query_times, camera_group,
                            cube_scale, cube_scale_shared, f_eff,
-                           scene_center, scene_radius, occlusion=None):
+                           scene_center, scene_radius, occlusion=None, input_size=None):
         """Per-point decode from precomputed scene_features (the body of the forward pass
         after scene encoding). Returns the result dict. See _forward_window."""
         device = coords.device
         B, N, R = coords.shape
         T = views_norm[0].shape[1]
         n_cams = len(views_norm)
+        # Pixel extent of the canvas actually encoded. Equals self.image_size on every forward
+        # that does not ask for a different resolution, so all uses below are then no-ops.
+        px = self.image_size if input_size is None else int(input_size)
 
         # Hey, coords start at 0
         query_coords = repeat(coords, 'b n r -> b (t n) r', t=T).to(torch.float32)
@@ -515,7 +572,12 @@ class TrackerEncoder(nn.Module):
         if self.cross_attn_rope:
             tub, ps = self.scene_encoder.tubelet_size, self.scene_encoder.patch_size
             H, W = views_norm[0].shape[-2], views_norm[0].shape[-1]
-            gT, gH, gW = T // tub, H // ps, W // ps
+            gH, gW = H // ps, W // ps
+            # Derive the temporal slot count from the tokens the encoder ACTUALLY produced, not
+            # by recomputing T // tubelet_size: at T < tubelet_size the latter is 0, which silently
+            # yields zero scene tokens under the 'spatial'/'none' pos-embed modes (and raises only
+            # under 'learned'). The token count cannot disagree with itself.
+            gT = scene_features.shape[-2] // (gH * gW)
             slot = torch.arange(gT * gH * gW, device=query_embeds.device) // (gH * gW)
             scene_frame_pos = slot.float() * tub + (tub - 1) / 2.0   # (N_tokens,)
 
@@ -598,15 +660,22 @@ class TrackerEncoder(nn.Module):
                 depth_pred_scaled = depth_pred_scaled * sdep
 
 
+        # Head units -> INPUT PIXELS. The 2D head reports normalised position x image_size (its
+        # bin centres are the fixed-length pix_grid buffer), so on a canvas of a different extent
+        # its output must be rescaled before it can meet camera geometry. 1.0 when px ==
+        # image_size, i.e. on every forward that does not change resolution.
+        px_scale = px / self.image_size
+
         if self.is_grid:
-            # grid 2D head decodes absolute pixel positions directly (soft-argmax).
-            points_pred_scaled = points_pred
+            # grid 2D head decodes absolute pixel positions directly (soft-argmax), on the
+            # image_size canvas -> scale into the actual input's pixels.
+            points_pred_scaled = points_pred * px_scale
         elif self.output_mode in ('residual', 'resdirect'):
             # Predict offsets instead of absolute bounded coordinates
             points_pred_scaled = p2d_query + points_pred
         elif self.output_mode == 'direct':
             # Predict absolute coordinates
-            points_pred_scaled = points_pred + self.image_size // 2
+            points_pred_scaled = points_pred + px // 2
 
   
       
@@ -634,8 +703,22 @@ class TrackerEncoder(nn.Module):
             cadd = repeat(centers, 'cams r -> cams 1 1 1 r')
         points_3d_all_rays = cadd + einsum(rays_world, depth_pred_scaled,
                                       'cams b t n r, cams b t n -> cams b t n r')
-        points_3d_rays = einsum(points_3d_all_rays, conf_pred_2d[..., 0],
-                                'cams b t n r, cams b t n -> b t n r')
+        # Confidence-weighted fusion over cameras. conf_pred_2d is an unnormalised per-camera
+        # sigmoid in [0,1], so the plain einsum is a weighted SUM: the result is off by a factor
+        # of sum_c conf_c (~C/2 at C cameras, ~0.5 at one, where the "prediction" lands about
+        # halfway from the world origin to the subject). conf_3d a few lines above IS normalised
+        # (softmax), so this is inconsistent within one function.
+        #
+        # Gated rather than fixed outright because trained checkpoints are adapted to the
+        # unnormalised value wherever a rays loss term was live. Default False = historical.
+        if self.rays_conf_normalize:
+            _w = conf_pred_2d[..., 0]
+            points_3d_rays = einsum(points_3d_all_rays, _w,
+                                    'cams b t n r, cams b t n -> b t n r')
+            points_3d_rays = points_3d_rays / _w.sum(0)[..., None].clamp_min(1e-6)
+        else:
+            points_3d_rays = einsum(points_3d_all_rays, conf_pred_2d[..., 0],
+                                    'cams b t n r, cams b t n -> b t n r')
 
 
         # triangulate points
@@ -657,8 +740,12 @@ class TrackerEncoder(nn.Module):
             points_3d_tri = None
 
         
-        # direct residual predictions
-        center = torch.tensor([self.image_size // 2, self.image_size//2],
+        # direct residual predictions.
+        # The gauge anchor is the centre of the canvas the network actually saw (the input is
+        # zero-padded up to a square px x px), which is also the frame the 2D head reports in --
+        # the two are the ends of one residual and must agree. px == image_size unless this
+        # forward asked for a different resolution.
+        center = torch.tensor([px // 2, px // 2],
                               device=device, dtype=torch.float32).reshape(1, 2)
         # ray-local gauge frame: anchor at frame 0 for moving cams (a stable per-clip frame).
         rays_c = torch.stack([
@@ -691,10 +778,14 @@ class TrackerEncoder(nn.Module):
         else:
             p3d_cams = points_3d_raw * rearrange(cube_scale, 'cams b -> cams b 1 1 1')
             if self.output_mode == 'gridresid':
-                # gridresid bins encode motion / (cube * image_size) (~pixels, NO f_eff ->
-                # ortho-safe); map back to metric motion by * image_size (mirror
-                # tracker_tapnext.py:597-600).
-                p3d_cams = p3d_cams * self.image_size
+                # gridresid bins encode motion / (cube * canvas_px) (~pixels, NO f_eff ->
+                # ortho-safe); map back to metric motion by * canvas_px (mirror
+                # tracker_tapnext.py). The normaliser is (world per pixel) x (pixels across) =
+                # the crop's world width, which is resize-invariant ONLY if both factors come
+                # from the same resolution: cube_scale is camera-derived and already scales with
+                # the real extent, so the pixel count must too. The loss forms the inverse from
+                # the 'image_size' this forward publishes below, so it tracks automatically.
+                p3d_cams = p3d_cams * px
             if self.f_eff_scale and not add_residual:
                 # direct 3D output is an absolute ray-local position -> f_eff-scaled.
                 # The residual branch (motion offset) is NOT scaled (handled by scale_3d only).
@@ -794,7 +885,10 @@ class TrackerEncoder(nn.Module):
                 # anchor, normalized by cube*image_size (no f_eff -> ortho-safe).
                 'is_resid': (self.output_mode == 'gridresid'),
                 'anchor_local': query_local.detach() if query_local is not None else None,
-                'image_size': self.image_size,
+                # The canvas extent this forward actually used, NOT the build-time image_size.
+                # losses.py forms the gridresid CE target as cube_scale * this value, so the
+                # training-side inverse of the p3d_cams * px scaling above tracks automatically.
+                'image_size': px,
                 # learnable_scale: the forward multiplied the (residual) output by the decoded
                 # per-track scale s3d [and depth by sdep]. The loss divides the grid CE target
                 # by the DETACHED scale so CE shapes the normalized grid while the metric

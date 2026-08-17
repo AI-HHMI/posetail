@@ -198,6 +198,82 @@ def apply_eval_weights(model, checkpoint, config, device):
         return False
 
 
+# Model-config keys that change NO tensor shape but REINTERPRET the outputs, so a checkpoint
+# loaded under a different value constructs and runs while producing silently wrong numbers.
+# Loading a checkpoint whose recorded value differs from the constructed model is refused.
+#
+# Deliberately EXCLUDED from refusal (still recorded in the checkpoint for reference):
+#   image_size         -- changes weight shapes, and _interp_res_params already interpolates a
+#                         checkpoint across an image_size change (finetune-at-higher-resolution).
+#   head_3d_grid_size  -- changes the 3D/depth head shapes; _filter_shape_mismatch already drops
+#                         and warns on the mismatch (a warm-start, not a silent reinterpretation).
+#   head_3d_grid_radius / depth_log_* / log_3d_eps -- change registered-buffer VALUES, which
+#                         load_state_dict reconciles from the checkpoint itself.
+_ARCH_CRITICAL_KEYS = (
+    'output_mode',
+    'grid_decode_space',
+    'log_3d_output',
+    'f_eff_scale',
+    'rays_conf_normalize',
+)
+
+
+def _plain_config(config):
+    """Recursively convert an EasyDict config to plain dict/list/scalars for torch.save."""
+    if isinstance(config, dict):
+        return {k: _plain_config(v) for k, v in config.items()}
+    if isinstance(config, (list, tuple)):
+        return [_plain_config(v) for v in config]
+    return config
+
+
+def check_config_compatibility(checkpoint, config, strict=True):
+    """Compare a checkpoint's recorded model config against the one being constructed.
+
+    Raises on a mismatch of any _ARCH_CRITICAL_KEYS entry (these reinterpret the outputs without
+    changing a tensor shape, so nothing else would catch it). Other differences warn.
+
+    A checkpoint with NO recorded config -- every checkpoint written before this was added --
+    warns once and is loaded, since there is nothing to check against.
+    """
+    saved = checkpoint.get('config')
+    if saved is None:
+        print('  [warn] checkpoint records no config (written before config recording was '
+              'added); cannot verify that architecture switches such as output_mode match the '
+              'model being built. Verify by hand against the run\'s config.toml.')
+        return
+
+    saved_model = saved.get('model', {}) or {}
+    cur_model = config.get('model', {}) or {}
+
+    mismatches = []
+    for key in _ARCH_CRITICAL_KEYS:
+        if key not in saved_model and key not in cur_model:
+            continue
+        # Absent means "whatever the constructor default was", which we cannot reconstruct
+        # retroactively; only compare when both sides state a value.
+        if key not in saved_model or key not in cur_model:
+            continue
+        if saved_model[key] != cur_model[key]:
+            mismatches.append(f'{key}: checkpoint={saved_model[key]!r} config={cur_model[key]!r}')
+
+    if mismatches and strict:
+        raise ValueError(
+            'checkpoint/config mismatch on architecture switches that change no tensor shape '
+            'but reinterpret every output -- the checkpoint would load cleanly and produce '
+            'silently wrong numbers:\n  ' + '\n  '.join(mismatches) +
+            '\nBuild the model with the recorded values, or pass strict=False if you are '
+            'deliberately reinterpreting these weights.')
+    elif mismatches:
+        print('  [warn] checkpoint/config mismatch (strict=False): ' + '; '.join(mismatches))
+
+    benign = [k for k in set(saved_model) | set(cur_model)
+              if k not in _ARCH_CRITICAL_KEYS
+              and saved_model.get(k) != cur_model.get(k)]
+    if benign:
+        print(f'  [info] model config differs on non-critical keys: {sorted(benign)}')
+
+
 def save_checkpoint(model, optimizer, prefix, i, config = None):
 
     checkpoint_dir = safe_make(os.path.join(prefix, 'checkpoints'))
@@ -213,6 +289,14 @@ def save_checkpoint(model, optimizer, prefix, i, config = None):
         'model_state': model.state_dict(),
         'optimizer_state': optimizer.state_dict(),
     }
+
+    # Record the config that produced these weights. Several architecture switches change NO
+    # tensor shape (output_mode above all) but reinterpret every output, so a checkpoint trained
+    # under one and rebuilt under another constructs cleanly, loads cleanly, runs -- and is
+    # silently wrong. Recording the config lets load_checkpoint refuse that (see
+    # _ARCH_CRITICAL_KEYS). The config is plain TOML scalars, so it pickles safely.
+    if config is not None:
+        state_dict['config'] = _plain_config(config)
 
     # Schedule-free runs -- both AdamW-schedulefree (scheduler_type == 'schedulefree') and
     # muon_schedulefree (DualOptimizer with a ScheduleFreeWrapper'd Muon) -- maintain an averaged
@@ -411,7 +495,8 @@ def _filter_shape_mismatch(param_dict, model):
 
 
 def load_checkpoint(config_path, checkpoint_path, model = None,
-                    optimizer = None, device = None, eval_weights = 'auto'):
+                    optimizer = None, device = None, eval_weights = 'auto',
+                    strict_config = True):
     """Load a checkpoint into a model (and optionally an optimizer for resuming training).
 
     eval_weights controls whether the schedule-free *averaged* (eval) weights are applied
@@ -447,6 +532,11 @@ def load_checkpoint(config_path, checkpoint_path, model = None,
 
     print(f'loading model checkpoint {checkpoint_path}...')
     checkpoint = torch.load(checkpoint_path, map_location = device)
+
+    # Refuse a checkpoint whose recorded architecture switches disagree with the model being
+    # built. These change no tensor shape, so load_state_dict would accept them silently.
+    check_config_compatibility(checkpoint, config, strict=strict_config)
+
     param_dict = checkpoint['model_state']
 
     # convert old nn.MultiheadAttention cross-attn params to the DecoupledCrossAttention split

@@ -484,6 +484,15 @@ def resolve_config_and_checkpoint(base_folder, checkpoint=None):
 
 
 def load_camera_group_from_metadata(metadata_path, device='cpu'):
+    """Build a camera group from a trial's metadata.yaml.
+
+    Honours `moving_cams: true` (per-frame extrinsics), mirroring what the TRAINING loader
+    already does. Without this, a metadata file that says the rig moves trained one way and
+    inferred another from the same file, with no diagnostic: format_camera_group's documented
+    fallback ("cameras absent from the dict fall back to their static extrinsic") is right as a
+    fallback and wrong as a default here, because EVERY camera falls back, the rig is treated as
+    static, and the pose simply does not follow the subject -- which reads as a model problem.
+    """
     with open(metadata_path, 'r') as f:
         cam_metadata = yaml.safe_load(f)
 
@@ -502,13 +511,38 @@ def load_camera_group_from_metadata(metadata_path, device='cpu'):
     else:
         cam_names = sorted(cam_names)
 
+    # Per-frame extrinsics. Intrinsics/distortion are time-invariant, so the aniposelib Camera is
+    # built from the frame-0 pose and the full (T,4,4) stack is passed via moving_ext.
+    moving = bool(cam_metadata.get('moving_cams', False))
+    moving_ext = {} if moving else None
+
     cams = []
     for cam_name in cam_names:
-        rvec, tvec = disassemble_extrinsics(extrinsics_dict[cam_name])
+        mat_raw = intrinsics_dict[cam_name]
+        dist_raw = distortions_dict[cam_name]
+
+        if moving:
+            ext_full = np.asarray(extrinsics_dict[cam_name], dtype=np.float64)  # (T,4,4)
+            if ext_full.ndim != 3 or ext_full.shape[-2:] != (4, 4):
+                # RAISE rather than degrade: silently using a static extrinsic for a rig the
+                # metadata says is moving is exactly the failure this branch exists to prevent.
+                raise ValueError(
+                    f'{metadata_path}: moving_cams=true but extrinsics for {cam_name} have '
+                    f'shape {tuple(ext_full.shape)} (expected (T,4,4)). Refusing to fall back '
+                    f'to a static extrinsic, which would make the pose lag the subject with no '
+                    f'diagnostic.')
+            moving_ext[cam_name] = ext_full
+            rvec, tvec = disassemble_extrinsics(ext_full[0])
+            mat_arr = np.asarray(mat_raw, dtype=np.float64)
+            mat_raw = mat_arr[0] if mat_arr.ndim == 3 else mat_arr
+            dist_arr = np.asarray(dist_raw, dtype=np.float64)
+            dist_raw = dist_arr[0] if dist_arr.ndim == 2 else dist_arr
+        else:
+            rvec, tvec = disassemble_extrinsics(extrinsics_dict[cam_name])
 
         cam = Camera(
-            matrix=intrinsics_dict[cam_name],
-            dist=distortions_dict[cam_name],
+            matrix=mat_raw,
+            dist=dist_raw,
             rvec=rvec,
             tvec=tvec,
             name=cam_name,
@@ -520,7 +554,8 @@ def load_camera_group_from_metadata(metadata_path, device='cpu'):
         cams.append(cam)
 
     camera_group = CameraGroup(cams)
-    camera_group = format_camera_group(camera_group, offset_dict, cam_type, device=device)
+    camera_group = format_camera_group(camera_group, offset_dict, cam_type, device=device,
+                                       moving_ext=moving_ext)
 
     return camera_group
 

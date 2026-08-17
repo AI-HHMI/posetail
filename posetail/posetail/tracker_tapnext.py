@@ -75,12 +75,15 @@ class TrackerTapNext(nn.Module):
                  # already log). Default False keeps the linear behavior bit-identical.
                  log_3d_output=False,
                  log_3d_eps=0.1,
+                 rays_conf_normalize=False,
                  mode_3d='tapnext',
                  **_ignored):
         super().__init__()
 
         self.mode_3d = mode_3d
         self.output_mode = output_mode
+        # See the ray-fusion site below. False = the historical unnormalised weighted sum.
+        self.rays_conf_normalize = bool(rays_conf_normalize)
         # `is_grid`: the 3D/depth heads emit soft-argmax bin logits (vs direct
         # regression). `is_resid`: the 3D head predicts a motion *offset* added to
         # a per-track query anchor (ported from tracker_encoder.py's `residual`
@@ -565,8 +568,18 @@ class TrackerTapNext(nn.Module):
         cadd = repeat(centers, 'cams r -> cams 1 1 1 r')
         points_3d_all_rays = cadd + einsum(rays_world, depth_pred_scaled,
                                            'cams b t n r, cams b t n -> cams b t n r')
-        points_3d_rays = einsum(points_3d_all_rays, conf_pred_2d[..., 0],
-                                'cams b t n r, cams b t n -> b t n r')
+        # Confidence-weighted fusion over cameras. conf_pred_2d is an unnormalised per-camera
+        # sigmoid, so the plain einsum is a weighted SUM and the result is off by sum_c conf_c
+        # (~0.5 at one camera, i.e. roughly halfway from the world origin to the subject).
+        # Same defect and same gate as tracker_encoder; default False = historical behaviour.
+        if self.rays_conf_normalize:
+            _w = conf_pred_2d[..., 0]
+            points_3d_rays = einsum(points_3d_all_rays, _w,
+                                    'cams b t n r, cams b t n -> b t n r')
+            points_3d_rays = points_3d_rays / _w.sum(0)[..., None].clamp_min(1e-6)
+        else:
+            points_3d_rays = einsum(points_3d_all_rays, conf_pred_2d[..., 0],
+                                    'cams b t n r, cams b t n -> b t n r')
 
         # triangulate
         if n_cams > 1:

@@ -136,15 +136,23 @@ class PadToMultiple:
 
 
 class PadToSize:
+    """Bottom-right zero-pad the last two dims up to a square target.
+
+    The target defaults to `size` (set at construction) but may be overridden PER CALL, so one
+    instance can serve a forward that runs at a resolution other than the one the model was built
+    at. Padding to a fixed build-time size is what previously forced the input canvas to equal
+    `image_size` and made the resolution-agnostic video encoder impossible to exploit.
+    """
     def __init__(self, size=256):
         self.size = size
-    
-    def __call__(self, img):
+
+    def __call__(self, img, size=None):
+        target = self.size if size is None else int(size)
         # Works for any shape - assumes last 2 dims are H, W
         original_shape = img.shape
         *batch_dims, c, h, w = original_shape
-        pad_h = max(self.size - h, 0)
-        pad_w = max(self.size - w, 0)
+        pad_h = max(target - h, 0)
+        pad_w = max(target - w, 0)
         
         if pad_h == 0 and pad_w == 0:
             return img

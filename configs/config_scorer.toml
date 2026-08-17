@@ -59,6 +59,11 @@ head_3d_grid_size = 512
 head_3d_grid_radius = 1.5
 log_3d_output = true
 log_3d_eps = 0.01
+# Frozen at the historical default: the library now defaults grid_decode_space="warped"
+# (overshoot-free through the signed-log warp). This config trained under "head";
+# re-running it against the new default would silently change the decode, so it is
+# stated explicitly.
+grid_decode_space = "head"
 enable_subpixel_refinement = false
 depth_log_min = -2.5
 depth_log_max = 2.0
