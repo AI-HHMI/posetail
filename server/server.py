@@ -2,8 +2,11 @@
 """
 FastAPI inference server for TrackerEncoder.
 
-Start with either a wandb run directory or explicit config/checkpoint paths:
+Start with the default Hugging Face model, a Hugging Face repository, a wandb run
+directory, or explicit config/checkpoint paths:
 
+    python server/server.py
+    python server/server.py --hf-repo ai-hhmi/posetail-static --revision 2026-08-24
     python server/server.py --wandb /path/to/wandb/run-YYYYMMDD_HHMMSS-XXXXXXXX
     python server/server.py --config files/config.toml --checkpoint files/checkpoints/checkpoint_00010000.pth
 """
@@ -25,12 +28,14 @@ from fastapi.responses import Response
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from posetail.inference.inference_utils import (load_model_from_base_folder,
-                             resize_camera_group, resolve_config_and_checkpoint)
+                             load_model_from_hub, resize_camera_group,
+                             resolve_config_and_checkpoint)
 from posetail.posetail.scorer_encoder import ScorerEncoder
 from posetail.posetail.tracker_encoder import TrackerEncoder
 from posetail.posetail.train_utils import load_checkpoint, load_config
 
 _gpu_lock = asyncio.Lock()
+DEFAULT_HF_REPO = 'ai-hhmi/posetail-static-animal'
 
 
 def load_scorer_model(*, wandb=None, config=None, checkpoint=None,
@@ -79,7 +84,16 @@ async def lifespan(app: FastAPI):
 
     device_arg = args.device  # string or None
 
-    if args.wandb:
+    if args.hf_repo:
+        model, config = load_model_from_hub(
+            args.hf_repo,
+            revision=args.revision,
+            device=device_arg,
+        )
+        revision_label = args.revision or 'main'
+        config_path = f'hf://{args.hf_repo}/config.toml@{revision_label}'
+        checkpoint_path = f'hf://{args.hf_repo}/model.pth@{revision_label}'
+    elif args.wandb:
         model, config, config_path, checkpoint_path = load_model_from_base_folder(
             args.wandb, checkpoint=args.checkpoint_number, device=device_arg
         )
@@ -107,6 +121,12 @@ async def lifespan(app: FastAPI):
     app.state.device = device
     app.state.config_path = str(config_path)
     app.state.checkpoint_path = str(checkpoint_path)
+    app.state.model_source = (
+        f'huggingface:{args.hf_repo}' if args.hf_repo
+        else f'wandb:{args.wandb}' if args.wandb
+        else 'local'
+    )
+    app.state.model_revision = args.revision if args.hf_repo else None
     app.state.n_frames = model.n_frames
     app.state.image_size = model.image_size
     app.state.mode_3d = config.model.get('mode_3d', 'encoder')
@@ -145,6 +165,8 @@ async def info():
         'device': str(app.state.device),
         'config_path': app.state.config_path,
         'checkpoint_path': app.state.checkpoint_path,
+        'model_source': app.state.model_source,
+        'model_revision': app.state.model_revision,
         'mode_3d': app.state.mode_3d,
         'scorer_loaded': app.state.scorer is not None,
         'scorer_config_path': app.state.scorer_config_path,
@@ -384,7 +406,11 @@ async def score(
 
 def parse_args():
     parser = argparse.ArgumentParser(description='TrackerEncoder inference server')
-    group = parser.add_mutually_exclusive_group(required=True)
+    group = parser.add_mutually_exclusive_group(required=False)
+    group.add_argument(
+        '--hf-repo', type=str,
+        help=f'Hugging Face model repository (default: {DEFAULT_HF_REPO})',
+    )
     group.add_argument(
         '--wandb', type=str,
         help='Path to a wandb run directory (same as --base-folder in inference_video.py)',
@@ -392,6 +418,10 @@ def parse_args():
     group.add_argument(
         '--config', type=str,
         help='Path to config.toml (requires --checkpoint)',
+    )
+    parser.add_argument(
+        '--revision', type=str, default=None,
+        help='Hugging Face branch, commit, or date tag (only with --hf-repo; default: latest)',
     )
     parser.add_argument('--checkpoint', type=str,
                         help='Path to checkpoint .pth (required with --config)')
@@ -425,8 +455,12 @@ def parse_args():
         parser.error('--checkpoint is required when using --config')
     if args.checkpoint and not args.config:
         parser.error('--config is required when using --checkpoint')
+    if args.revision and not args.hf_repo:
+        parser.error('--revision is only valid with --hf-repo')
     if args.checkpoint_number is not None and not args.wandb:
         parser.error('--checkpoint-number is only valid with --wandb')
+    if not args.hf_repo and not args.wandb and not args.config:
+        args.hf_repo = DEFAULT_HF_REPO
     if args.scorer_config and not args.scorer_checkpoint:
         parser.error('--scorer-checkpoint is required when using --scorer-config')
     if args.scorer_checkpoint and not args.scorer_config:

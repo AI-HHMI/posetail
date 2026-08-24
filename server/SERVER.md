@@ -4,7 +4,19 @@ A FastAPI server that loads a single TrackerEncoder checkpoint and serves single
 
 ## Starting the server
 
+With no model-source arguments, the server loads the latest revision of
+`ai-hhmi/posetail-static-animal` from the Hugging Face Hub:
+
 ```bash
+python server/server.py
+```
+
+Other model sources are supported:
+
+```bash
+# A different Hugging Face model or a dated release
+python server/server.py --hf-repo ai-hhmi/posetail-static --revision 2026-08-24
+
 # From a wandb run directory (same as --base-folder in inference_video.py)
 python server/server.py --wandb /path/to/wandb/run-YYYYMMDD_HHMMSS-XXXXXXXX
 
@@ -15,10 +27,11 @@ python server/server.py --wandb /path/to/wandb/run-... --checkpoint-number 10000
 python server/server.py --config /path/to/config.toml --checkpoint /path/to/checkpoint_00010000.pth
 
 # Override device or port
-python server/server.py --wandb /path/to/run --device cuda:1 --port 8080
+python server/server.py --hf-repo ai-hhmi/posetail-static-animal --device cuda:1 --port 8080
 ```
 
-The server prints `n_frames`, `image_size`, and `device` on startup.
+The server prints `n_frames`, `image_size`, and `device` on startup. Hub checkpoints are cached
+by `huggingface_hub`; set `HF_TOKEN` when loading a private repository.
 
 ## Endpoints
 
@@ -35,6 +48,8 @@ Returns model metadata. Useful for clients to discover `n_frames` before sending
   "device": "cuda:0",
   "config_path": "/path/to/config.toml",
   "checkpoint_path": "/path/to/checkpoint_00010000.pth",
+  "model_source": "wandb:/path/to/run",
+  "model_revision": null,
   "mode_3d": "encoder"
 }
 ```
