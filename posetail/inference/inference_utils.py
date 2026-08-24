@@ -8,6 +8,7 @@ import torch
 
 import numpy as np
 from tqdm import tqdm
+from easydict import EasyDict
 
 from collections import defaultdict
 
@@ -622,6 +623,29 @@ def load_model_from_base_folder(base_folder, checkpoint=None, device=None):
     model.eval()
 
     return model, config, config_path, checkpoint_path
+
+
+def load_model_from_hub(repo_id, device=None, revision=None, cache_dir=None):
+    """Load a packaged TrackerEncoder from the Hugging Face Hub.
+
+    Returns ``(model, config)`` where ``config.model`` contains the embedded model
+    constructor configuration. The returned config intentionally has no dataset or
+    training sections because a packaged inference checkpoint does not need them.
+
+    Args:
+        repo_id: Hugging Face repository ID, such as ``ai-hhmi/posetail-static``.
+        device: Device for the model. Defaults to CUDA when available.
+        revision: Hub branch, commit, or date tag such as ``2026-08-24``.
+        cache_dir: Optional Hugging Face cache directory.
+    """
+    model = TrackerEncoder.from_pretrained(
+        repo_id,
+        revision=revision,
+        device=device,
+        cache_dir=cache_dir,
+    )
+    config = EasyDict({"model": model._pretrained_model_config})
+    return model, config
 
 
 def run_tracker_encoder_on_videos(

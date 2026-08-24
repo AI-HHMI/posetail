@@ -190,10 +190,13 @@ pixi.lock
 # local scratch / working dirs
 logs/
 tests/
-scripts/
+scripts/*
+!scripts/package_checkpoint.py
 notebooks/
 reports/
 setup_env_vars.sh
 
 plans/
+dev/
+scratch/
 .pi

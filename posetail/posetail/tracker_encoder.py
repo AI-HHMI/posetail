@@ -36,6 +36,72 @@ _N_AXIS = {k: v + 1 for k, v in _T_AXIS.items()}
 
 class TrackerEncoder(nn.Module):
 
+    @classmethod
+    def from_pretrained(cls, repo_id, revision=None, device=None, cache_dir=None):
+        """Load a packaged TrackerEncoder checkpoint from the Hugging Face Hub.
+
+        The packaged checkpoint contains the inference weights under ``model_state`` and
+        the constructor arguments under ``model_config``.  ``revision`` may be a branch,
+        commit, or date tag such as ``"2026-08-24"``.
+
+        Args:
+            repo_id: Hugging Face model repository, e.g. ``"ai-hhmi/posetail-static"``.
+            revision: Hub revision to download. Defaults to the repository's default branch.
+            device: Device for the model and checkpoint. Defaults to CUDA when available.
+            cache_dir: Optional Hugging Face cache directory.
+
+        Returns:
+            A ``TrackerEncoder`` in evaluation mode on ``device``.
+        """
+        from huggingface_hub import hf_hub_download
+
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            device = torch.device(device)
+
+        checkpoint_path = hf_hub_download(
+            repo_id=repo_id,
+            filename='model.pth',
+            revision=revision,
+            cache_dir=cache_dir,
+        )
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=device,
+            weights_only=False,
+        )
+
+        if not isinstance(checkpoint, dict):
+            raise ValueError(
+                f'Packaged checkpoint from {repo_id!r} must be a dictionary, '
+                f'got {type(checkpoint).__name__}'
+            )
+
+        model_config = checkpoint.get('model_config')
+        if not isinstance(model_config, dict):
+            raise ValueError(
+                f'Packaged checkpoint from {repo_id!r} has no dictionary model_config'
+            )
+
+        state_dict = checkpoint.get('model_state')
+        if state_dict is None:
+            # Accept this spelling for forward compatibility with packages that preserve
+            # the original checkpoint key instead of renaming the eval weights.
+            state_dict = checkpoint.get('model_state_eval')
+        if not isinstance(state_dict, dict):
+            raise ValueError(
+                f'Packaged checkpoint from {repo_id!r} has no model_state dictionary'
+            )
+
+        model = cls(**model_config).to(device)
+        model.load_state_dict(state_dict, strict=True)
+        model._pretrained_model_config = model_config
+        model._pretrained_repo_id = repo_id
+        model._pretrained_revision = revision
+        model.eval()
+        return model
+
     def __init__(self, image_size = 256,
                  stride_length = 16, stride_overlap = None,
                  unroll_windows = False,
