@@ -135,7 +135,7 @@ def sample_patches(images: torch.Tensor, centers: torch.Tensor,
     Args:
         images: [B, T, C, H, W]
         centers: [B, Z, R] pixel coordinates (x, y) of patch centers, R=2
-        query_times: [B, Z] time indices into T
+        query_times: [B, Z] time indices into T (any integer dtype; normalized to int64)
         patch_size: P
     
     Returns:
@@ -160,7 +160,10 @@ def sample_patches(images: torch.Tensor, centers: torch.Tensor,
     grid = (2.0 * px + 1.0) / scales - 1.0  # [B, Z, P, P, 2]
 
     # Gather frames at query times: [B, T, C, H, W] -> [B, Z, C, H, W]
-    t_idx = repeat(query_times, 'b z -> b z c h w', c=C, h=H, w=W)
+    # .long() is the index contract for torch.gather: some PyTorch builds (e.g. the 2.4 line)
+    # reject int32 indices outright. Callers must not have to know this; a no-op when already
+    # int64.
+    t_idx = repeat(query_times.long(), 'b z -> b z c h w', c=C, h=H, w=W)
     frames = torch.gather(images, dim=1, index=t_idx)  # [B, Z, C, H, W]
 
     # Flatten batch and Z dimensions for grid_sample
@@ -356,8 +359,8 @@ class QueryEncoder(nn.Module):
             preprocessed_views: list of [B, T, C, H, W] tensors
             camera_group: list of camera dicts (can be None for 2D mode)
             query_coords: [B, T_query, R] where R=2 (2D) or R=3 (3D)
-            query_time: [B, T_query] time indices
-            target_time: [B, T_query] time indices
+            query_time: [B, T_query] time indices (any integer dtype; normalized to int64)
+            target_time: [B, T_query] time indices (any integer dtype; normalized to int64)
             cube_scale: float for cube sampling (ignored in 2D mode)
             occlusion: [B, T_query, N_cams] per-camera occlusion state {0,1,-1} for the
                 occlusion_embedding term, or None (treated as all-unknown). Only used
@@ -366,6 +369,12 @@ class QueryEncoder(nn.Module):
         Returns:
             [B, T_query, N_cams, decoder_dim]
         """
+        # query_time / target_time are INDICES: normalize the dtype once here rather than at each
+        # consumer (gather in sample_patches is strict about int64; the embedding lookups and the
+        # fourier gap are not). No-op when the caller already passes int64.
+        query_time = query_time.long()
+        target_time = target_time.long()
+
         B, T_query, coord_dim = query_coords.shape
         n_cams = len(preprocessed_views)
 
