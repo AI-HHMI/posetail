@@ -568,20 +568,27 @@ class SceneRepresentation(nn.Module):
                  hierarchical_features=True, decoder_dim=None,
                  proj_prenorm=False, proj_mlp=False,
                  video_encoder_finetune_last_n_layers=None,
-                 pos_embed_mode='learned'):
+                 pos_embed_mode='learned', pretrained=True):
+        """
+        pretrained: load the public VJEPA2 backbone weights (a multi-GB
+            torch.hub.load_state_dict_from_url fetch). Pass False when a full checkpoint is
+            about to overwrite every encoder tensor anyway, or on a host with no network --
+            the architecture is identical either way, only the initialization differs.
+        """
         super().__init__()
 
         # Initialize encoder
         if version == 'base':
-            vjepa_encoder, vjepa_decoder = vjepa2_1_vit_base_384()
+            vjepa_encoder, vjepa_decoder = vjepa2_1_vit_base_384(pretrained=pretrained)
         elif version == 'large':
-            vjepa_encoder, vjepa_decoder = vjepa2_1_vit_large_384()
+            vjepa_encoder, vjepa_decoder = vjepa2_1_vit_large_384(pretrained=pretrained)
         elif version == 'giant':
-            vjepa_encoder, vjepa_decoder = vjepa2_1_vit_giant_384()
+            vjepa_encoder, vjepa_decoder = vjepa2_1_vit_giant_384(pretrained=pretrained)
         elif version == 'gigantic':
-            vjepa_encoder, vjepa_decoder = vjepa2_1_vit_gigantic_384()
+            vjepa_encoder, vjepa_decoder = vjepa2_1_vit_gigantic_384(pretrained=pretrained)
 
         self.encoder = vjepa_encoder
+        self.video_encoder_pretrained = bool(pretrained)
 
         self.encoder.return_hierarchical = hierarchical_features
         self.encoder.use_activation_checkpointing = True # not freeze_encoder

@@ -546,17 +546,17 @@ from posetail.posetail.vjepa2 import (
 
 class VJEPAFeatureExtractor(nn.Module):
     def __init__(self, output_dim=256, version='large',
-                 requires_grad=False):
+                 requires_grad=False, pretrained=True):
         super().__init__()
         
         if version == 'base':
-            vjepa_encoder, vjepa_decoder = vjepa2_1_vit_base_384()
+            vjepa_encoder, vjepa_decoder = vjepa2_1_vit_base_384(pretrained=pretrained)
         elif version == 'large':
-            vjepa_encoder, vjepa_decoder = vjepa2_1_vit_large_384()
+            vjepa_encoder, vjepa_decoder = vjepa2_1_vit_large_384(pretrained=pretrained)
         elif version == 'giant':
-            vjepa_encoder, vjepa_decoder = vjepa2_1_vit_giant_384()
+            vjepa_encoder, vjepa_decoder = vjepa2_1_vit_giant_384(pretrained=pretrained)
         elif version == 'gigantic':
-            vjepa_encoder, vjepa_decoder = vjepa2_1_vit_gigantic_384()
+            vjepa_encoder, vjepa_decoder = vjepa2_1_vit_gigantic_384(pretrained=pretrained)
 
         self.encoder = vjepa_encoder
         # self.encoder.return_hierarchical = True

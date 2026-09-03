@@ -94,7 +94,10 @@ class TrackerEncoder(nn.Module):
                 f'Packaged checkpoint from {repo_id!r} has no model_state dictionary'
             )
 
-        model = cls(**model_config).to(device)
+        # The packaged model_state below is loaded strict=True and covers every encoder tensor,
+        # so fetching the public VJEPA2 weights first would only be thrown away. Override rather
+        # than default so a model_config that happens to record True is not honoured here.
+        model = cls(**{**model_config, 'video_encoder_pretrained': False}).to(device)
         model.load_state_dict(state_dict, strict=True)
         model._pretrained_model_config = model_config
         model._pretrained_repo_id = repo_id
@@ -109,6 +112,7 @@ class TrackerEncoder(nn.Module):
                  video_encoder_requires_grad = False,
                  video_encoder_hierarchical = True,
                  video_encoder_finetune_last_n_layers = None,
+                 video_encoder_pretrained = True,
                  scene_pos_embed_mode = 'learned',
                  rope_base = 100.0,
                  time_embed_mode = 'learned',
@@ -185,6 +189,7 @@ class TrackerEncoder(nn.Module):
         self.video_encoder_version = video_encoder_version
         self.video_encoder_hierarchical = video_encoder_hierarchical
         self.video_encoder_finetune_last_n_layers = video_encoder_finetune_last_n_layers
+        self.video_encoder_pretrained = bool(video_encoder_pretrained)
         # 'rope' is a decoder-level positional scheme, not an additive scene term: it means
         # "no additive scene pos_embed + 1-D temporal RoPE in the decoder cross-attention".
         # So map it to scene pos_embed_mode='none' and flip the decoder rope flag.
@@ -277,6 +282,7 @@ class TrackerEncoder(nn.Module):
             proj_mlp = scene_proj_mlp,
             video_encoder_finetune_last_n_layers = self.video_encoder_finetune_last_n_layers,
             pos_embed_mode = scene_pos_embed_mode_resolved,
+            pretrained = self.video_encoder_pretrained,
         )
         
         self.query_encoder = QueryEncoder(
