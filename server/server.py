@@ -32,7 +32,7 @@ from posetail.inference.inference_utils import (load_model_from_base_folder,
                              resolve_config_and_checkpoint)
 from posetail.posetail.scorer_encoder import ScorerEncoder
 from posetail.posetail.tracker_encoder import TrackerEncoder
-from posetail.posetail.train_utils import load_checkpoint, load_config
+from posetail.posetail.train_utils import load_checkpoint, load_config, _warn_unfilled_video_encoder
 
 _gpu_lock = asyncio.Lock()
 DEFAULT_HF_REPO = 'ai-hhmi/posetail-static-animal'
@@ -60,14 +60,21 @@ def load_scorer_model(*, wandb=None, config=None, checkpoint=None,
             f'Scorer config {config_path} has no [scorer] table — is this a tracker config?'
         )
     sk = dict(cfg.scorer)
+    # load_checkpoint below always loads a full model_state right after construction, so the
+    # public VJEPA2 download would be discarded.
     model = ScorerEncoder(
         pool_num_heads=sk.get('pool_num_heads', 8),
         score_hidden=sk.get('score_hidden', 64),
         use_precision=sk.get('use_precision', True),
-        **cfg.model,
+        **{**cfg.model, 'video_encoder_pretrained': False},
     )
     model.to(device)
-    model = load_checkpoint(config_path, checkpoint_path, model=model, device=device)['model']
+    checkpoint_dict = load_checkpoint(config_path, checkpoint_path, model=model, device=device)
+    model = checkpoint_dict['model']
+    # load_checkpoint was passed an already-built model, so its own built_here guard is a
+    # no-op; check video-encoder coverage explicitly using the keys it returns.
+    _warn_unfilled_video_encoder(checkpoint_dict.get('missing_keys', []),
+                                 checkpoint_dict.get('dropped_keys', []))
     if not isinstance(model, ScorerEncoder):
         raise RuntimeError(f'Scorer must be a ScorerEncoder, got {type(model).__name__}')
     model.eval()

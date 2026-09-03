@@ -19,6 +19,7 @@ from posetail.datasets.utils import get_dirs, disassemble_extrinsics
 from posetail.posetail.cube import project_points_torch
 from posetail.posetail.tracker_encoder import TrackerEncoder
 from posetail.posetail.train_utils import *
+from posetail.posetail.train_utils import _warn_unfilled_video_encoder
 
 
 
@@ -1047,12 +1048,18 @@ def load_tracker_encoder_checkpoint(checkpoint_path, model_kwargs, device=None,
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    model = TrackerEncoder(**model_kwargs).to(device)
+    # Both branches below load a full checkpoint into this model right after construction, so
+    # the public VJEPA2 download would be discarded; override rather than trust model_kwargs.
+    model = TrackerEncoder(**{**model_kwargs, 'video_encoder_pretrained': False}).to(device)
 
     # When a config is available, route through load_checkpoint so schedule-free runs get the
     # averaged EVAL weights (eval_weights defaults to 'auto' -> swaps since optimizer is None).
     if config_path is not None:
-        load_checkpoint(config_path, checkpoint_path, model=model, device=device)
+        # load_checkpoint was passed an already-built model, so its own built_here guard is a
+        # no-op; check coverage here instead using the missing/dropped keys it returns.
+        checkpoint_dict = load_checkpoint(config_path, checkpoint_path, model=model, device=device)
+        _warn_unfilled_video_encoder(checkpoint_dict.get('missing_keys', []),
+                                     checkpoint_dict.get('dropped_keys', []))
         model.eval()
         return model
 
@@ -1061,7 +1068,8 @@ def load_tracker_encoder_checkpoint(checkpoint_path, model_kwargs, device=None,
           '(schedule-free averaged eval weights will NOT be applied)')
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint.get('model_state', checkpoint)
-    model.load_state_dict(state_dict, strict=False)
+    missing_keys, _ = model.load_state_dict(state_dict, strict=False)
+    _warn_unfilled_video_encoder(missing_keys, [])
     model.eval()
 
     return model

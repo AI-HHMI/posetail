@@ -47,6 +47,7 @@ from posetail.posetail.tracker import Tracker
 from posetail.posetail.tracker_encoder import TrackerEncoder
 from posetail.posetail.tracker_tapnext import TrackerTapNext
 from posetail.posetail.train_utils import *
+from posetail.posetail.train_utils import _warn_unfilled_video_encoder
 
 from schedulefree import AdamWScheduleFree
 
@@ -213,9 +214,18 @@ def run(config_path, fabric):
                     extra={'run_id': run_id, 'run_dir': run_dir} if run_id else None)
         wandb.save(wandb_config_path, base_path = exp_dir)
 
+    # Read the warm-start/finetune checkpoint BEFORE constructing: both branches at the load
+    # site below replace every model_state tensor, so the multi-GB VJEPA2 fetch would be
+    # discarded. A genuine from-scratch run has nothing else to initialize the backbone and
+    # must keep it.
+    checkpoint_path = config.training.get('checkpoint_path', None)
+    finetune = config.training.get('finetune', False)
+
     # device = torch.device(config.devices.device)
     if config.model['mode_3d'] == 'encoder':
-        model = TrackerEncoder(**config.model)
+        model_kwargs = ({**config.model, 'video_encoder_pretrained': False} if checkpoint_path
+                        else config.model)
+        model = TrackerEncoder(**model_kwargs)
     elif config.model['mode_3d'] == 'tapnext':
         model = TrackerTapNext(**config.model)
     else:
@@ -338,9 +348,7 @@ def run(config_path, fabric):
     if not hasattr(optimizer, '_opts'):
         optimizer = fabric.setup_optimizers(optimizer)
 
-    # optionally load a model checkpoint 
-    checkpoint_path = config.training.get('checkpoint_path', None)
-    finetune = config.training.get('finetune', False)
+    # optionally load a model checkpoint (checkpoint_path / finetune read above, before construction)
     start_iteration = 0
 
     if checkpoint_path:
@@ -359,6 +367,12 @@ def run(config_path, fabric):
             model = checkpoint_dict['model']
             optimizer = checkpoint_dict['optimizer']
             start_iteration = checkpoint_dict['iteration']
+
+        # load_checkpoint was passed an already-built model (its own built_here guard is a
+        # no-op here), so check video-encoder coverage explicitly -- a warm start across a
+        # video_encoder_version change is exactly the case this guards against.
+        _warn_unfilled_video_encoder(checkpoint_dict.get('missing_keys', []),
+                                     checkpoint_dict.get('dropped_keys', []))
 
     # compile the model
     # model.cnn.compile()

@@ -43,7 +43,7 @@ from posetail.posetail.losses_scorer import TripletScorerLoss
 from posetail.posetail.train_utils import (load_config, save_config, set_seeds, resolve_seed, write_json,
                          build_optimizer_param_groups, load_checkpoint, save_checkpoint,
                          total_to_per_gpu, dict_to_device, get_timestamp,
-                         drop_nan_motion_metrics)
+                         drop_nan_motion_metrics, _warn_unfilled_video_encoder)
 
 
 def parse_args():
@@ -228,10 +228,16 @@ def run(config_path, fabric):
     # --- model (frozen backbone via config) ---
     scorer_kwargs = dict(config.scorer)
     scorer_kwargs.pop('corruption', None)      # corruption_cfg already built above for the datasets
+
+    # Read the warm-start checkpoint BEFORE constructing: when set, it loads a full model_state
+    # right below and would discard the public VJEPA2 download.
+    checkpoint_path = config.training.get('checkpoint_path', None)
+    model_config = ({**config.model, 'video_encoder_pretrained': False} if checkpoint_path
+                    else config.model)
     model = ScorerEncoder(pool_num_heads=scorer_kwargs.get('pool_num_heads', 8),
                           score_hidden=scorer_kwargs.get('score_hidden', 64),
                           use_precision=scorer_kwargs.get('use_precision', True),
-                          **config.model)
+                          **model_config)
     model = fabric.setup(model)
     # one marked forward method that scores the whole triplet -> DDP sees a single
     # forward per iteration (avoids the multi-forward reducer pitfall).
@@ -242,11 +248,14 @@ def run(config_path, fabric):
     lr = base_lr * (fabric.world_size ** 0.5)
     optimizer = build_optimizer(model, config, fabric, lr)
 
-    # warm-start from the trained tracker checkpoint (new heads stay at init via strict=False)
-    checkpoint_path = config.training.get('checkpoint_path', None)
+    # warm-start from the trained tracker checkpoint (new heads stay at init via strict=False;
+    # checkpoint_path itself was read above, before construction)
     if checkpoint_path:
         ckpt = load_checkpoint(config_path, checkpoint_path, model=model, device='cpu')
         model = ckpt['model']
+        # load_checkpoint was passed an already-built model, so its own built_here guard is a
+        # no-op; check video-encoder coverage explicitly using the keys it returns.
+        _warn_unfilled_video_encoder(ckpt.get('missing_keys', []), ckpt.get('dropped_keys', []))
 
     train_loss = TripletScorerLoss(margin=scorer_kwargs.get('triplet_margin', 0.5),
                                    precision_reg_weight=scorer_kwargs.get('precision_reg_weight', 0.01),
