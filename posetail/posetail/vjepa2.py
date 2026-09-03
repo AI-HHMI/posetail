@@ -337,9 +337,13 @@ class RoPEAttention(nn.Module):
             k = torch.cat([kd, kh, kw], dim=-1)
 
         if self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
-                x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal)
-                attn = None
+            # No sdp_kernel/sdpa_kernel context: the historical `torch.backends.cuda.sdp_kernel()`
+            # here took no arguments, so it enabled every backend -- identical to the ambient
+            # default, but deprecated and warning on every call. Dropping it also lets a caller's
+            # own torch.nn.attention.sdpa_kernel(...) selection apply, which the old context
+            # silently overrode.
+            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal)
+            attn = None
         else:
             attn = (q @ k.transpose(-2, -1)) * self.scale
             attn = attn.softmax(dim=-1)
@@ -374,9 +378,10 @@ class Attention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         if self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
-                x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal)
-                attn = None
+            # See RoPEAttention.forward above: no sdp_kernel/sdpa_kernel context needed, the
+            # historical no-arg call already enabled every backend.
+            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal)
+            attn = None
         else:
             attn = (q @ k.transpose(-2, -1)) * self.scale
             attn = attn.softmax(dim=-1)
